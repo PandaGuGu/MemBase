@@ -13,7 +13,7 @@ fn main() {
             res.set("FileDescription", "MemBase - 开机内存基准线工具");
             res.set("CompanyName", "MemBase");
             res.set("LegalCopyright", "MIT");
-            res.set("OriginalFilename", "membase.exe");
+            res.set("OriginalFilename", "membase-ui.exe");
             if let Err(e) = res.compile() {
                 println!("cargo:warning=资源编译失败（图标会缺省）: {e}");
             }

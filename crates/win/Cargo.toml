@@ -1,0 +1,11 @@
+[package]
+name = "membase-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemBase 平台层：Win32 进程/服务/计划任务封装（unsafe 只允许出现在这里）"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "allow"

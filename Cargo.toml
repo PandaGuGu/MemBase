@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+# 默认构建只含可移植部分：Linux/容器里 `cargo build` 也能过；
+# GUI 是 Windows 专用，用 `cargo build --workspace` 或 `-p membase-gui` 显式构建。
+default-members = ["crates/*", "apps/cli"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+membase-core = { path = "crates/core" }
+membase-win = { path = "crates/win" }
+eframe = { version = "0.37.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+rfd = "0.17"
+
+# 和 PhotoCraft 同样的思路：库禁 unsafe，平台层单独放行
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,17 @@
+[package]
+name = "membase-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemBase 命令行：每个原子操作一个子命令，全部支持 --json"
+
+[[bin]]
+name = "membase"
+path = "src/main.rs"
+
+[dependencies]
+membase-core.workspace = true
+membase-win.workspace = true
+
+[lints]
+workspace = true

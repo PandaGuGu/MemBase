@@ -1,0 +1,23 @@
+[package]
+name = "membase-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemBase 桌面界面（egui）：线外清单 + 勾选保护 + 一键恢复基准"
+build = "build.rs"
+
+[[bin]]
+name = "membase-ui"
+path = "src/main.rs"
+
+[dependencies]
+membase-core.workspace = true
+membase-win.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[lints]
+workspace = true

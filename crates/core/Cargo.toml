@@ -1,0 +1,11 @@
+[package]
+name = "membase-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemBase 纯逻辑层：分级、CSV、diff、线外计划、基准线打包（零平台依赖，零 unsafe）"
+
+[dependencies]
+
+[lints]
+workspace = true

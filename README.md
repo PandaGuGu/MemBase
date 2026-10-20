@@ -9,7 +9,7 @@ Boot-time memory baseline for Windows: snapshot once at boot, diff against it an
 ![语言](https://img.shields.io/badge/language-Rust-orange)
 ![许可](https://img.shields.io/badge/license-MIT-green)
 
-![界面截图](docs/screenshot-0.4.0.png)
+![界面截图](docs/screenshot-0.6.0.png)
 
 ---
 

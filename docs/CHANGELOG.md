@@ -2,9 +2,19 @@
 
 版本号遵循「功能 + 格式变更才进位」：补丁版只修 bug，次版本号动了快照格式、命令参数或默认行为时进位。
 
-## 未发布
+## v0.5.1（2026-10-20）
 
-- 暂无
+- 修复 `collect --self-destruct` 删不掉程序副本：`cmd /c` 的参数转义让 `del` 收到坏路径，
+  改用 `/S /C` + `raw_arg` 原样传命令行；任务已删、exe 却残留的问题不再出现
+- 补齐快照里空着的字段（列不变，只填值）：
+  - `UserName`：`OpenProcessToken` + `GetTokenInformation(TokenUser)` + `LookupAccountSidW`
+  - `CpuSeconds`：`GetProcessTimes` 的内核 + 用户时间
+  - `PagedSystemMB`：`QuotaPagedPoolUsage`；`VirtualMB`：`PagefileUsage`（提交大小）
+  - `system.json` 的 `OsCaption` / `OsVersion` / `OsBuild`：读
+    `CurrentVersion` 注册表，`CurrentBuildNumber` + `UBR` 拼成完整 build
+- `PrivateMB` 改用 `PrivateUsage`（`PROCESS_MEMORY_COUNTERS_EX` 的私有提交）。
+  之前的 `PagefileUsage` 包含共享页，数值偏大；同一台机器上老基准与新快照的
+  `PrivateMB` 会有几个到几十 MB 的差异，属于口径修正，不是内存真的变了
 
 ## v0.5.0
 

@@ -47,6 +47,13 @@ pub const START_TYPE_DISABLED: u32 = 4;
 pub const ERROR_MORE_DATA: u32 = 234;
 pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
+pub const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_USER_CLASS: u32 = 1;
+
+const HKEY_LOCAL_MACHINE: HANDLE = 0x8000_0002isize as HANDLE;
+const KEY_READ: u32 = 0x0002_0019;
+const REG_DWORD: u32 = 4;
+
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 关窗口用的消息：和用户点标题栏那个 ✕ 是同一条
@@ -151,6 +158,21 @@ pub struct PROCESS_MEMORY_COUNTERS {
     pub QuotaNonPagedPoolUsage: SIZE_T,
     pub PagefileUsage: SIZE_T,
     pub PeakPagefileUsage: SIZE_T,
+    /// PROCESS_MEMORY_COUNTERS_EX 的私有提交；cb 传整个结构大小时系统才填这一项
+    pub PrivateUsage: SIZE_T,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SID_AND_ATTRIBUTES {
+    pub Sid: *mut c_void,
+    pub Attributes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TOKEN_USER {
+    pub User: SID_AND_ATTRIBUTES,
 }
 
 #[repr(C)]
@@ -303,6 +325,43 @@ extern "system" {
         lpServiceArgVectors: *const *const u16,
     ) -> BOOL;
     fn CloseServiceHandle(hSCObject: HANDLE) -> BOOL;
+    fn OpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: u32,
+        TokenHandle: *mut HANDLE,
+    ) -> BOOL;
+    fn GetTokenInformation(
+        TokenHandle: HANDLE,
+        TokenInformationClass: u32,
+        TokenInformation: *mut c_void,
+        TokenInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> BOOL;
+    fn LookupAccountSidW(
+        lpSystemName: *const u16,
+        Sid: *mut c_void,
+        Name: *mut u16,
+        cchName: *mut u32,
+        ReferencedDomainName: *mut u16,
+        cchReferencedDomainName: *mut u32,
+        peUse: *mut u32,
+    ) -> BOOL;
+    fn RegOpenKeyExW(
+        hKey: HANDLE,
+        lpSubKey: *const u16,
+        ulOptions: u32,
+        samDesired: u32,
+        phkResult: *mut HANDLE,
+    ) -> i32;
+    fn RegQueryValueExW(
+        hKey: HANDLE,
+        lpValueName: *const u16,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(hKey: HANDLE) -> i32;
 }
 
 #[link(name = "user32")]
@@ -552,6 +611,99 @@ pub fn session_id(pid: u32) -> u32 {
         ProcessIdToSessionId(pid, &mut sid);
     }
     sid
+}
+
+/// 进程累计 CPU 秒数（内核 + 用户）。FILETIME 单位是 100ns。
+pub fn process_cpu_seconds(h: HANDLE) -> f64 {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut c, mut e, mut k, mut u) = (zero, zero, zero, zero);
+    let ok = unsafe { GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        0.0
+    } else {
+        (k.to_u64() + u.to_u64()) as f64 / 10_000_000.0
+    }
+}
+
+/// 进程所属账户，形如 `NT AUTHORITY\SYSTEM` / `DESKTOP\alice`。
+/// 打不开令牌（受保护进程、权限不足）时返回空串。
+pub fn process_user(h: HANDLE) -> String {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(h, TOKEN_QUERY, &mut token) } == 0 {
+        return String::new();
+    }
+
+    let mut len: u32 = 0;
+    unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut len,
+        );
+    }
+    if len == 0 {
+        unsafe {
+            CloseHandle(token);
+        }
+        return String::new();
+    }
+
+    // 按 usize 对齐分配，避免把 TOKEN_USER 读在未对齐地址上
+    let words = (len as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut buf: Vec<usize> = vec![0; words];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr() as *mut c_void,
+            len,
+            &mut len,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    if ok == 0 {
+        return String::new();
+    }
+
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    if sid.is_null() {
+        return String::new();
+    }
+
+    let mut name = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain = [0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut sid_type: u32 = 0;
+    let ok = unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut sid_type,
+        )
+    };
+    if ok == 0 {
+        return String::new();
+    }
+
+    let n = from_wide_buf(&name[..(name_len as usize).min(name.len())]);
+    let d = from_wide_buf(&domain[..(domain_len as usize).min(domain.len())]);
+    if d.is_empty() {
+        n
+    } else {
+        format!("{d}\\{n}")
+    }
 }
 
 pub fn terminate_process(pid: u32) -> Result<(), String> {
@@ -938,6 +1090,131 @@ pub fn console_utf8() {
     unsafe {
         SetConsoleOutputCP(65001);
         SetConsoleCP(65001);
+    }
+}
+
+pub struct OsInfo {
+    pub caption: String,
+    pub version: String,
+    pub build: String,
+}
+
+fn reg_string(key: &str, name: &str) -> Option<String> {
+    let key_w = wide(key);
+    let name_w = wide(name);
+    let mut hkey: HANDLE = std::ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_w.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
+        return None;
+    }
+    let mut len: u32 = 0;
+    let mut typ: u32 = 0;
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            name_w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut typ,
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    if r != 0 || len == 0 {
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0; (len as usize + 1) / 2 + 1];
+    let mut got = (buf.len() * 2) as u32;
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            name_w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut typ,
+            buf.as_mut_ptr() as *mut u8,
+            &mut got,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    if r != 0 {
+        return None;
+    }
+    let s = from_wide_buf(&buf[..(got as usize / 2).min(buf.len())]);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn reg_dword(key: &str, name: &str) -> Option<u32> {
+    let key_w = wide(key);
+    let name_w = wide(name);
+    let mut hkey: HANDLE = std::ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_w.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
+        return None;
+    }
+    let mut val: u32 = 0;
+    let mut len: u32 = 4;
+    let mut typ: u32 = 0;
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            name_w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut typ,
+            &mut val as *mut u32 as *mut u8,
+            &mut len,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    if r == 0 && typ == REG_DWORD {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// Win11 的注册表 ProductName 仍常写「Windows 10」，按 build 号纠正一次。
+fn caption_for(product: &str, build: u32) -> String {
+    if build >= 22000 {
+        product.replacen("Windows 10", "Windows 11", 1)
+    } else {
+        product.to_string()
+    }
+}
+
+/// 读注册表里的系统版本信息。读不到的项返回空串。
+pub fn os_info() -> OsInfo {
+    const KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let product = reg_string(KEY, "ProductName").unwrap_or_default();
+    let display = reg_string(KEY, "DisplayVersion").unwrap_or_default();
+    let build_no = reg_string(KEY, "CurrentBuildNumber")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let ubr = reg_dword(KEY, "UBR").unwrap_or(0);
+
+    OsInfo {
+        caption: caption_for(&product, build_no),
+        version: if display.is_empty() {
+            if build_no > 0 {
+                format!("10.0.{build_no}")
+            } else {
+                String::new()
+            }
+        } else {
+            display
+        },
+        build: match (build_no, ubr) {
+            (0, _) => String::new(),
+            (b, 0) => b.to_string(),
+            (b, u) => format!("{b}.{u}"),
+        },
     }
 }
 

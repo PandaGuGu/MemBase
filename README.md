@@ -4,7 +4,7 @@
 
 Boot-time memory baseline for Windows: snapshot once at boot, diff against it any time, and trim whatever wasn't there.
 
-![版本](https://img.shields.io/badge/version-0.5.0-blue)
+![版本](https://img.shields.io/badge/version-0.5.1-blue)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![语言](https://img.shields.io/badge/language-Rust-orange)
 ![许可](https://img.shields.io/badge/license-MIT-green)
@@ -246,13 +246,20 @@ cargo test --workspace              # 全部测试（CI 在 Windows 上跑的也
 - **无窗口进程没有「礼貌」一说**：只对有可见窗口的进程发 `WM_CLOSE`；
   控制台脚本（`python train.py`）也算无窗口，会被直接终止 —— 勾选前看清楚
 - **窗口判定偏保守**：只看「可见 + 有标题的顶层窗口」，托盘程序和部分 UWP 子窗口会被当成无窗口进程
-- 部分字段为空：`UserName`、`CommandLine`、`VirtualMB`、`CpuSeconds`（需要读目标进程 PEB / 令牌）
-- `OsCaption` / 页面文件峰值暂未填充
+- `CommandLine` 仍为空（要读目标进程的 PEB，跨位数/受保护进程还会失败）；
+  `Manufacturer` / `Model` / `PhysicalProcessors` / 页面文件三项仍为 `null`（需要 WMI 或性能计数器）
+- `PagedSystemMB` 是进程的分页池配额（`QuotaPagedPoolUsage`），`VirtualMB` 是提交大小
+  （`PagefileUsage`），都不等于「虚拟地址空间」；`CpuSeconds` 是进程启动至今的累计 CPU 时间，
+  不是「开机后用了多少」
+- 打不开令牌 / 句柄的进程（受保护进程、跨会话的高权限进程）`UserName`、`CpuSeconds`、
+  内存三项会是空值或 0，不是采集出错
 - GUI 仅 Windows；CLI 的采集与清理能力也仅 Windows（`baseline` / `config` / `commands` 跨平台）
 
 ## 变更记录
 
-当前 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
+当前 **0.5.1**：修复 `--self-destruct` 残留程序副本；补齐快照里的 `UserName` / `CpuSeconds` /
+`PagedSystemMB` / `VirtualMB` / `OsCaption` / `OsVersion` / `OsBuild`。
+上一版 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
 完整历史与格式 / 接口变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
 
 ## License

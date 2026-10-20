@@ -1620,10 +1620,13 @@ fn cmd_collect(args: &[String]) {
             .status();
         if let Ok(exe) = std::env::current_exe() {
             let p = exe.to_string_lossy().to_string();
-            let line = format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"", p);
+            // 自己删不掉自己：等两秒再让 cmd 动手。
+            // 这里必须用 raw_arg：`.arg(line)` 会把内层引号转义成 \"，
+            // 而 cmd 不认这种转义，del 收到的是坏路径（报“文件名、目录名或卷标语法不正确”）。
+            // /S 让 cmd 只剥掉最外层引号，路径两侧的引号原样留给 del。
+            let line = format!("/S /C \"ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"\"", p);
             let _ = Command::new("cmd")
-                .arg("/c")
-                .arg(line)
+                .raw_arg(line)
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn();
         }

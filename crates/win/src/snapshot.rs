@@ -14,12 +14,16 @@ pub struct ProcRow {
     pub session: u32,
     pub ws_mb: f64,
     pub priv_mb: f64,
+    pub paged_sys_mb: f64,
     pub peak_ws_mb: f64,
+    pub virtual_mb: f64,
+    pub cpu_seconds: f64,
     pub handles: u32,
     pub threads: u32,
     pub start_time: String,
     /// 创建时间（FILETIME 100ns）：和 PID 一起作为进程身份，防止 PID 复用误伤
     pub created: u64,
+    pub user: String,
     pub path: String,
 }
 
@@ -51,6 +55,9 @@ pub struct Snapshot {
     pub computer: String,
     pub user: String,
     pub drive: String,
+    pub os_caption: String,
+    pub os_version: String,
+    pub os_build: String,
     /// 枚举进程/服务本身花了多少毫秒（不含落盘）
     pub collect_ms: u64,
     pub procs: Vec<ProcRow>,
@@ -93,6 +100,10 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
         let mut ws_mb = 0.0f64;
         let mut priv_mb = 0.0f64;
         let mut peak_ws_mb = 0.0f64;
+        let mut paged_sys_mb = 0.0f64;
+        let mut virtual_mb = 0.0f64;
+        let mut cpu_seconds = 0.0f64;
+        let mut user = String::new();
 
         if let Some(h) = win::open_process(
             pid,
@@ -102,10 +113,14 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             start_time = win::process_start_time(h.0);
             created = win::process_created(h.0).unwrap_or(0);
             handles = win::process_handle_count(h.0);
+            user = win::process_user(h.0);
+            cpu_seconds = win::process_cpu_seconds(h.0);
             if let Some(pmc) = win::process_memory(h.0) {
                 ws_mb = mb(pmc.WorkingSetSize as u64);
-                priv_mb = mb(pmc.PagefileUsage as u64);
+                priv_mb = mb(pmc.PrivateUsage as u64);
                 peak_ws_mb = mb(pmc.PeakWorkingSetSize as u64);
+                paged_sys_mb = mb(pmc.QuotaPagedPoolUsage as u64);
+                virtual_mb = mb(pmc.PagefileUsage as u64);
             }
         } else if let Some(h) = win::open_process(pid, win::PROCESS_QUERY_LIMITED_INFORMATION) {
             // 提权进程只拿得到路径和线程数
@@ -113,6 +128,8 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             start_time = win::process_start_time(h.0);
             created = win::process_created(h.0).unwrap_or(0);
             handles = win::process_handle_count(h.0);
+            user = win::process_user(h.0);
+            cpu_seconds = win::process_cpu_seconds(h.0);
         }
 
         procs.push(ProcRow {
@@ -122,11 +139,15 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             session: win::session_id(pid),
             ws_mb,
             priv_mb,
+            paged_sys_mb,
             peak_ws_mb,
+            virtual_mb,
+            cpu_seconds,
             handles,
             threads: pe.cntThreads,
             start_time,
             created,
+            user,
             path,
         });
     }
@@ -177,6 +198,8 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let os = win::os_info();
+
     Snapshot {
         captured_local: win::now_local_string(),
         captured_utc: win::now_utc_string(),
@@ -192,6 +215,9 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
         computer: win::computer_name(),
         user: win::user_name(),
         drive: win::system_drive(),
+        os_caption: os.caption,
+        os_version: os.version,
+        os_build: os.build,
         collect_ms: started.elapsed().as_millis() as u64,
         procs,
         svcs,
@@ -240,9 +266,9 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         ("UptimeSeconds".into(), snap.uptime_s.to_string()),
         ("CollectMs".into(), snap.collect_ms.to_string()),
         ("ComputerName".into(), jstr(&snap.computer)),
-        ("OsCaption".into(), jstr(&String::new())),
-        ("OsVersion".into(), jstr(&String::new())),
-        ("OsBuild".into(), jstr(&String::new())),
+        ("OsCaption".into(), jstr(&snap.os_caption)),
+        ("OsVersion".into(), jstr(&snap.os_version)),
+        ("OsBuild".into(), jstr(&snap.os_build)),
         ("Manufacturer".into(), jstr(&String::new())),
         ("Model".into(), jstr(&String::new())),
         ("TotalPhysicalMemoryMB".into(), snap.total_phys_mb.to_string()),
@@ -274,21 +300,21 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     );
     for p in &snap.procs {
         c.push_str(&format!(
-            "{},{},{},{},{:.2},{:.2},{},{:.2},{},{},{},{},{},{},{},{}\r\n",
+            "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{}\r\n",
             csv_escape(&snap.captured_local),
             csv_escape(&p.name),
             p.pid,
             p.session,
             p.ws_mb,
             p.priv_mb,
-            0,
+            p.paged_sys_mb,
             p.peak_ws_mb,
-            0,
-            "",
+            p.virtual_mb,
+            p.cpu_seconds,
             p.handles,
             p.threads,
             csv_escape(&p.start_time),
-            "",
+            csv_escape(&p.user),
             csv_escape(&p.path),
             ""
         ));

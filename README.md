@@ -9,7 +9,7 @@ Boot-time memory baseline for Windows: snapshot once at boot, diff against it an
 ![语言](https://img.shields.io/badge/language-Rust-orange)
 ![许可](https://img.shields.io/badge/license-MIT-green)
 
-![界面截图](docs/screenshot.png)
+![界面截图](docs/screenshot-0.4.0.png)
 
 ---
 
@@ -157,7 +157,7 @@ membase trim --execute --yes --max 5 --json
 - 保护优先于「恢复」勾选：被保护的行勾选框置灰，统计与执行都会跳过
 - 保存只重写「当前列表覆盖到的条目」，通配规则、此刻没在跑的旧项不会被顺手抹掉
 
-![通配保护：名单里写 进程:Steam++*，两项都被识别为「通配保护」，恢复勾选框置灰](docs/protect-demo.png)
+![通配保护：名单里写 进程:Steam++*，两项都被识别为「通配保护」，恢复勾选框置灰](docs/protect-wildcard-0.4.0.png)
 
 ## 基准包（.mbz）
 

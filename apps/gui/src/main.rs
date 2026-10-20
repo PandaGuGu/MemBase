@@ -1795,6 +1795,8 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 顶栏的内存占用需要持续刷新，否则只有操作时才更新
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
         if self.themed_for != Some(self.dark) {
             apply_theme(&ctx, self.dark);
             self.themed_for = Some(self.dark);
@@ -1880,6 +1882,28 @@ impl eframe::App for App {
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 当前整机内存占用：百分比 + 已用 / 总可用
+                    let mem = win::memory_status();
+                    let total_gb = mem.ullTotalPhys as f64 / 1024.0 / 1024.0 / 1024.0;
+                    let used_gb =
+                        mem.ullTotalPhys.saturating_sub(mem.ullAvailPhys) as f64
+                            / 1024.0
+                            / 1024.0
+                            / 1024.0;
+                    let pct = if total_gb > 0.0 {
+                        used_gb / total_gb * 100.0
+                    } else {
+                        0.0
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "内存 {:.0}% · 已用 {:.1}/{:.1} GB",
+                            pct, used_gb, total_gb
+                        ))
+                        .size(11.5)
+                        .color(if pct >= 85.0 { pal().amber } else { pal().muted }),
+                    );
+                    ui.add_space(12.0);
                     if self.is_admin {
                         ui.label(
                             egui::RichText::new(format!(

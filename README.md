@@ -4,7 +4,7 @@
 
 Boot-time memory baseline for Windows: snapshot once at boot, diff against it any time, and trim whatever wasn't there.
 
-![版本](https://img.shields.io/badge/version-0.5.1-blue)
+![版本](https://img.shields.io/badge/version-0.5.2-blue)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![语言](https://img.shields.io/badge/language-Rust-orange)
 ![许可](https://img.shields.io/badge/license-MIT-green)
@@ -257,9 +257,10 @@ cargo test --workspace              # 全部测试（CI 在 Windows 上跑的也
 
 ## 变更记录
 
-当前 **0.5.1**：修复 `--self-destruct` 残留程序副本；补齐快照里的 `UserName` / `CpuSeconds` /
+当前 **0.5.2**：顶栏新增整机内存占用（百分比 + 已用 / 总可用），每秒刷新。
+上一版 **0.5.1**：修复 `--self-destruct` 残留程序副本；补齐快照里的 `UserName` / `CpuSeconds` /
 `PagedSystemMB` / `VirtualMB` / `OsCaption` / `OsVersion` / `OsBuild`。
-上一版 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
+更早 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
 完整历史与格式 / 接口变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
 
 ## License

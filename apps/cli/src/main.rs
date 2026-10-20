@@ -729,7 +729,7 @@ fn filter_plan(
 fn item_json(it: &core::PlanItem, include_caution: bool) -> String {
     let pids: Vec<String> = it.pids.iter().map(|p| p.to_string()).collect();
     format!(
-        "{{\"kind\":\"{}\",\"name\":{},\"pids\":[{}],\"instances\":{},\"mem_mb\":{:.1},\"tier\":\"{}\",\"protect\":{},\"actionable\":{},\"start_mode\":{},\"reason\":{},\"path\":{}}}",
+        "{{\"kind\":\"{}\",\"name\":{},\"pids\":[{}],\"instances\":{},\"mem_mb\":{:.1},\"tier\":\"{}\",\"protect\":{},\"protect_by\":{},\"actionable\":{},\"start_mode\":{},\"reason\":{},\"path\":{}}}",
         core::kind_name(it.kind),
         jstr(&it.name),
         pids.join(","),
@@ -737,6 +737,7 @@ fn item_json(it: &core::PlanItem, include_caution: bool) -> String {
         it.mem_mb,
         core::tier_name(it.tier),
         it.protect,
+        jstr(&it.protect_by),
         it.actionable(include_caution),
         jstr(&it.start_mode),
         jstr(&it.reason),
@@ -1499,20 +1500,24 @@ fn cmd_collect(args: &[String]) {
     let snap = snapshot::snapshot_now(include_self);
     let run_dir = snapshot::new_run_dir(&out);
     let sub = run_dir.join(format!("T+{}s", at));
+    let write_started = std::time::Instant::now();
     if let Err(e) = snapshot::write_snapshot(&sub, &snap) {
         eprintln!("[x] 写盘失败: {}（保留计划任务，下次开机重试）", e);
         std::process::exit(EXIT_IO);
     }
+    let write_ms = write_started.elapsed().as_millis() as u64;
 
     if json {
         println!(
-            "{{\"ok\":true,\"dir\":{},\"uptime_sec\":{},\"process_count\":{},\"service_count\":{},\"used_mb\":{},\"load_pct\":{}}}",
+            "{{\"ok\":true,\"dir\":{},\"uptime_sec\":{},\"process_count\":{},\"service_count\":{},\"used_mb\":{},\"load_pct\":{},\"collect_ms\":{},\"write_ms\":{}}}",
             jstr(&sub.to_string_lossy()),
             snap.uptime_s,
             snap.procs.len(),
             snap.svcs.len(),
             snap.used_phys_mb,
-            snap.load_pct
+            snap.load_pct,
+            snap.collect_ms,
+            write_ms
         );
     } else {
         println!(
@@ -1525,6 +1530,10 @@ fn cmd_collect(args: &[String]) {
         println!(
             "     已用内存 {} MB / 占用率 {} %",
             snap.used_phys_mb, snap.load_pct
+        );
+        println!(
+            "     采集耗时 {} 毫秒（落盘另计 {} 毫秒）",
+            snap.collect_ms, write_ms
         );
     }
 
@@ -1612,6 +1621,8 @@ fn cmd_compare(args: &[String]) {
     );
 }
 
+/// 注册开机采集任务。XML、拷 exe、调 schtasks 都在 membase-win::task 里，
+/// GUI 的按钮走的是同一份实现。
 #[cfg(windows)]
 fn cmd_install(args: &[String]) {
     let out = root_arg(args);
@@ -1619,92 +1630,20 @@ fn cmd_install(args: &[String]) {
     let task = task_arg(args);
     let json = want_json(args);
 
-    if let Err(e) = fs::create_dir_all(&out) {
-        eprintln!("[x] 建目录失败: {}", e);
-        std::process::exit(EXIT_IO);
-    }
-
     let cur = std::env::current_exe().expect("取不到自身路径");
-    let target = out.join("membase.exe");
-    if cur != target {
-        if let Err(e) = fs::copy(&cur, &target) {
-            eprintln!("[x] 复制 exe 失败: {}", e);
-            std::process::exit(EXIT_IO);
-        }
-    }
+    let res = membase_win::task::install(&cur, &out, at, &task);
+    let ok = res.is_ok();
+    let target = res
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
 
-    let exe_s = xml_escape(&target.to_string_lossy());
-    let args_s = xml_escape(&format!(
-        "collect --out \"{}\" --at {} --self-destruct --task {} --json",
-        out.display(),
-        at,
-        task
-    ));
-
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>开机第 {at} 秒采集一次内存/进程/服务基准线，采集完成后自毁（membase）</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <BootTrigger><Enabled>true</Enabled></BootTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>S-1-5-18</UserId>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT20M</ExecutionTimeLimit>
-    <Enabled>true</Enabled>
-  </Settings>
-  <Actions Context="Author">
-    <Exec><Command>{exe}</Command><Arguments>{args}</Arguments></Exec>
-  </Actions>
-</Task>
-"#,
-        at = at,
-        exe = exe_s,
-        args = args_s
-    );
-
-    let tmp = std::env::temp_dir().join(format!("membase_task_{}.xml", std::process::id()));
-    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
-    for u in xml.encode_utf16() {
-        bytes.extend_from_slice(&u.to_le_bytes());
-    }
-    if let Err(e) = fs::write(&tmp, &bytes) {
-        eprintln!("[x] 写 XML 失败: {}", e);
-        std::process::exit(EXIT_IO);
-    }
-
-    let st = Command::new("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            &task,
-            "/XML",
-            &tmp.to_string_lossy(),
-            "/F",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    let _ = fs::remove_file(&tmp);
-
-    let ok = matches!(&st, Ok(s) if s.success());
     if json {
         println!(
             "{{\"ok\":{},\"task\":{},\"exe\":{},\"at_sec\":{},\"out\":{}}}",
             ok,
             jstr(&task),
-            jstr(&target.to_string_lossy()),
+            jstr(&target),
             at,
             jstr(&out.to_string_lossy())
         );
@@ -1712,7 +1651,7 @@ fn cmd_install(args: &[String]) {
         println!("[OK] 计划任务已注册：{}（开机触发，SYSTEM，无窗口）", task);
         println!("     下次开机会自动采集一次，随后任务和 exe 自动消失");
     } else {
-        eprintln!("[x] 注册失败（需要管理员权限）");
+        eprintln!("[x] {}", res.unwrap_err());
     }
     if !ok {
         std::process::exit(EXIT_REFUSED);
@@ -1723,25 +1662,15 @@ fn cmd_install(args: &[String]) {
 fn cmd_uninstall(args: &[String]) {
     let task = task_arg(args);
     let json = want_json(args);
-    let st = Command::new("schtasks")
-        .args(["/Delete", "/TN", &task, "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    let ok = matches!(&st, Ok(s) if s.success());
+    let res = membase_win::task::uninstall(&task);
+    let ok = res.is_ok();
     if json {
         println!("{{\"ok\":{},\"task\":{}}}", ok, jstr(&task));
-    } else if ok {
-        println!("[OK] 已删除计划任务：{}", task);
+    } else if let Err(e) = &res {
+        eprintln!("[x] 删除失败：{}", e);
     } else {
-        eprintln!("[x] 删除失败（任务可能不存在）");
+        println!("[OK] 已删除计划任务：{}", task);
     }
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 // ---------------- 入口 ----------------

@@ -6,6 +6,7 @@
 use eframe::egui;
 use membase_core as core;
 use membase_core::{Kind, Tier};
+use membase_win::task::{self as boot, TaskInfo};
 use membase_win::{snapshot, win};
 use std::path::PathBuf;
 
@@ -31,7 +32,12 @@ struct Row {
     path: String,
     tier: Tier,
     reason: String,
+    /// 记进保护名单：永不处理
     protect: bool,
+    /// 命中的保护条目（`进程:MuMu*` 这类通配也能命中）
+    protect_by: String,
+    /// 本次要恢复（终止/停止）—— 行右侧的勾选框
+    pick: bool,
 }
 
 struct App {
@@ -45,6 +51,14 @@ struct App {
     include_caution: bool,
     confirm: bool,
     confirm_capture: bool,
+    confirm_boot: bool,
+    /// 开机第几秒采集，对应计划任务里的 --at
+    boot_at: u64,
+    /// 最近一次采集实际花了多少毫秒（来自基准的 system.json）
+    collect_ms: Option<u64>,
+    /// 上面这个数是基准里记录的（true）还是本次刷新时实测的（false）
+    collect_from_base: bool,
+    boot: TaskInfo,
     is_admin: bool,
     protect_file: PathBuf,
     frames: u32,
@@ -107,10 +121,40 @@ fn elide(s: &str, max_chars: usize) -> String {
     format!("{}…", head)
 }
 
-fn fmt_mb(mb: f64) -> String {    if mb >= 1024.0 {
+/// 这一行是否允许被勾选处理：已保护 / 禁止处理 / 没放开的系统组件都不算
+fn can_pick(r: &Row, include_caution: bool) -> bool {
+    if r.protect || r.tier == Tier::Blocked {
+        return false;
+    }
+    if r.tier == Tier::Caution && !include_caution {
+        return false;
+    }
+    true
+}
+
+fn fmt_mb(mb: f64) -> String {
+    if mb >= 1024.0 {
         format!("{:.2} GB", mb / 1024.0)
     } else {
         format!("{:.0} MB", mb)
+    }
+}
+
+/// 采集耗时：小于 1 秒就报毫秒，免得全显示成「0.0 秒」
+fn fmt_dur(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{} 毫秒", ms)
+    } else {
+        format!("{:.1} 秒", ms as f64 / 1000.0)
+    }
+}
+
+/// 说「多久之后完成」：不足 1 秒就不硬凑成「第 61 秒」
+fn finish_hint(ms: u64) -> String {
+    if ms < 1000 {
+        "不到 1 秒就".to_string()
+    } else {
+        format!("约 {:.1} 秒后", ms as f64 / 1000.0)
     }
 }
 
@@ -119,6 +163,13 @@ impl App {
         setup_fonts(&cc.egui_ctx);
         let root = PathBuf::from(membase_core::config::data_root(None));
         let protect_file = root.join("protect.txt");
+        let boot = boot::query(core::DEFAULT_TASK);
+        // 已经安排过就沿用当时的秒数，免得重新注册时手滑改掉
+        let boot_at = if boot.installed && boot.at_sec >= 5 {
+            boot.at_sec
+        } else {
+            60
+        };
         let mut app = App {
             root,
             base_line: String::from("（没有找到基准快照）"),
@@ -130,6 +181,11 @@ impl App {
             include_caution: false,
             confirm: false,
             confirm_capture: false,
+            confirm_boot: false,
+            boot_at,
+            collect_ms: None,
+            collect_from_base: false,
+            boot,
             is_admin: win::is_admin(),
             protect_file,
             frames: 0,
@@ -147,12 +203,23 @@ impl App {
     }
 
     fn save_whitelist(&self) {
-        let items: Vec<String> = self
+        // 只重写「当前列表覆盖到的条目」，其余原样保留：
+        // 通配规则（进程:MuMu*）、当前没在跑的旧进程、别的机器带过来的项都不该被这次保存抹掉
+        let mut items = self.whitelist();
+        let shown: Vec<String> = self
             .rows
             .iter()
-            .filter(|r| r.protect)
+            .chain(self.skipped.iter())
             .map(|r| core::protect_key(r.kind, &r.name))
             .collect();
+        items.retain(|w| !shown.contains(w));
+        for r in self.rows.iter().chain(self.skipped.iter()) {
+            if r.protect {
+                items.push(core::protect_key(r.kind, &r.name));
+            }
+        }
+        items.sort();
+        items.dedup();
         let _ = std::fs::write(&self.protect_file, core::serialize_whitelist(&items));
     }
 
@@ -172,11 +239,24 @@ impl App {
         let load = json_num(&sysj, "MemoryLoadPercent").unwrap_or(0.0);
         let captured = json_num(&sysj, "CapturedAtLocal").unwrap_or(0.0);
         let _ = captured;
+        let collect_ms = json_num(&sysj, "CollectMs").unwrap_or(0.0);
+        self.collect_ms = if collect_ms > 0.0 {
+            Some(collect_ms as u64)
+        } else {
+            None
+        };
+        self.collect_from_base = self.collect_ms.is_some();
         let cap_text = extract_captured(&sysj);
+        // 把来源目录名也显示出来：这几个数字全部读自它的 system.json，改文件界面就会跟着变
+        let run_name = base_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| base_dir.display().to_string());
         self.base_line = format!("基准快照：{}", cap_text);
         self.base_meta = format!(
-            "开机第 {} 秒采集 · 已用 {:.0} MB · 占用率 {:.0}%",
-            bn as u64, used, load
+            "采集于开机第 {} 秒 · 已用 {:.0} MB · 占用率 {:.0}% · {}",
+            bn as u64, used, load, run_name
         );
 
         let base_procs = core::parse_by_name(
@@ -187,6 +267,11 @@ impl App {
         );
 
         let snap = snapshot::snapshot_now(true);
+        // 老基准（PS 版或本版之前的快照）没记 CollectMs，就用这次刷新的实测值兜底
+        if self.collect_ms.is_none() {
+            self.collect_ms = Some(snap.collect_ms);
+            self.collect_from_base = false;
+        }
         let protected = win::protected_pids();
         let wl = self.whitelist();
 
@@ -238,6 +323,9 @@ impl App {
                 tier: it.tier,
                 reason: it.reason,
                 protect: it.protect,
+                protect_by: it.protect_by,
+                // 建议处理项默认勾上；系统组件默认不勾，勾了「包含系统组件」才连带选上
+                pick: it.tier == Tier::Suggested && !it.protect,
             };
             if row.tier == Tier::Blocked {
                 skipped.push(row);
@@ -269,19 +357,51 @@ impl App {
     }
 
     fn selected_count(&self) -> (usize, f64) {
-        let mut n = 0;
-        let mut mb = 0.0;
-        for r in &self.rows {
-            if r.protect || r.tier == Tier::Blocked {
-                continue;
+        let inc = self.include_caution;
+        self.rows
+            .iter()
+            .filter(|r| r.pick && can_pick(r, inc))
+            .fold((0usize, 0.0f64), |(n, mb), r| (n + 1, mb + r.mem_mb))
+    }
+
+    /// (可勾选行数, 已勾选行数)
+    fn pick_stats(&self) -> (usize, usize) {
+        let inc = self.include_caution;
+        self.rows
+            .iter()
+            .filter(|r| can_pick(r, inc))
+            .fold((0usize, 0usize), |(all, on), r| {
+                (all + 1, on + usize::from(r.pick))
+            })
+    }
+
+    fn protected_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.protect).count()
+    }
+
+    fn set_all_pick(&mut self, on: bool) {
+        let inc = self.include_caution;
+        for r in self.rows.iter_mut() {
+            if can_pick(r, inc) {
+                r.pick = on;
+            } else if r.protect {
+                r.pick = false;
             }
-            if r.tier == Tier::Caution && !self.include_caution {
-                continue;
-            }
-            n += 1;
-            mb += r.mem_mb;
         }
-        (n, mb)
+    }
+
+    /// 一次写全名单；关掉时只把「原本被保护」的行恢复默认勾选，不动别人
+    fn set_all_protect(&mut self, on: bool) {
+        for r in self.rows.iter_mut() {
+            if on {
+                r.protect = true;
+                r.pick = false;
+            } else if r.protect {
+                r.protect = false;
+                r.pick = r.tier == Tier::Suggested;
+            }
+        }
+        self.save_whitelist();
     }
 
     fn execute(&mut self) {
@@ -291,10 +411,7 @@ impl App {
         let mut details: Vec<String> = Vec::new();
 
         for r in &self.rows {
-            if r.protect || r.tier == Tier::Blocked {
-                continue;
-            }
-            if r.tier == Tier::Caution && !self.include_caution {
+            if !r.pick || !can_pick(r, self.include_caution) {
                 continue;
             }
             match r.kind {
@@ -378,15 +495,72 @@ impl App {
         match snapshot::write_snapshot(&sub, &snap) {
             Ok(()) => {
                 self.status = format!(
-                    "已把当前状态设为基准：{} 进程 / {} MB / 占用率 {}%",
+                    "已把当前状态设为基准：{} 进程 / {} MB / 占用率 {}% · 采集耗时 {}",
                     snap.procs.len(),
                     snap.used_phys_mb,
-                    snap.load_pct
+                    snap.load_pct,
+                    fmt_dur(snap.collect_ms)
                 );
                 self.reload();
             }
             Err(e) => self.status = format!("设基准失败：{e}"),
         }
+    }
+
+    /// 计划任务执行的是 CLI（参数 `collect ...`），所以优先找同目录的 CLI。
+    /// 注意 Windows 文件名不区分大小写：`MemBase.exe` 和 `membase.exe` 是同一个文件，
+    /// 所以分发时命令行版叫 `membase-cli.exe`；`membase.exe` 也认（放在别的目录时）。
+    fn cli_exe(&self) -> Option<PathBuf> {
+        let mut cands: Vec<PathBuf> = Vec::new();
+        if let Ok(cur) = std::env::current_exe() {
+            let named_cli = cur
+                .file_name()
+                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("membase.exe"))
+                .unwrap_or(false);
+            if named_cli {
+                cands.push(cur.clone());
+            }
+            if let Some(dir) = cur.parent() {
+                cands.push(dir.join("membase.exe"));
+                cands.push(dir.join("membase-cli.exe"));
+            }
+        }
+        cands.push(self.root.join("membase.exe"));
+        cands
+            .into_iter()
+            .find(|p| p.is_file() && !boot::is_gui_exe(p))
+    }
+
+    /// 注册开机采集任务：拷一份 CLI 到数据目录，再挂计划任务
+    fn install_boot(&mut self) {
+        let src = match self.cli_exe() {
+            Some(p) => p,
+            None => {
+                self.status =
+                    "找不到命令行版 membase.exe：请把 CLI 和界面版放在同一目录".to_string();
+                return;
+            }
+        };
+        match boot::install(&src, &self.root, self.boot_at, core::DEFAULT_TASK) {
+            Ok(target) => {
+                self.boot = boot::query(core::DEFAULT_TASK);
+                self.status = format!(
+                    "已安排：下次开机第 {} 秒采集一次（程序 {}）",
+                    self.boot_at,
+                    target.display()
+                );
+            }
+            Err(e) => self.status = format!("安排失败：{}", e),
+        }
+    }
+
+    fn remove_boot(&mut self) {
+        let res = boot::uninstall(core::DEFAULT_TASK);
+        self.boot = boot::query(core::DEFAULT_TASK);
+        self.status = match res {
+            Ok(()) => "已取消开机采集任务".to_string(),
+            Err(e) => format!("取消失败：{}", e),
+        };
     }
 
     fn export_baseline(&mut self) {
@@ -560,7 +734,8 @@ impl eframe::App for App {
             self.themed = true;
         }
         if let Some(path) = self.shot_path.clone() {
-            if self.frames == 3 {
+            // 等 30 帧再截：弹窗有淡入动画，早截会拍到半透明的中间态
+            if self.frames == 30 {
                 ctx.request_screenshot(move |img| {
                     let _ = save_bmp(&img, &path);
                     std::process::exit(0);
@@ -569,9 +744,13 @@ impl eframe::App for App {
             self.frames += 1;
             ctx.request_repaint();
         }
-        // 调试：截图时顺便把确认弹窗打开，方便验证弹窗样式
-        if self.frames == 2 && std::env::var("MEMBASE_SHOT_MODAL").is_ok() {
-            self.confirm = true;
+        // 调试：截图时顺便把确认弹窗打开，方便验证弹窗样式（boot = 开机采集弹窗）
+        if self.frames == 2 {
+            match std::env::var("MEMBASE_SHOT_MODAL").as_deref() {
+                Ok("boot") => self.confirm_boot = true,
+                Ok(_) => self.confirm = true,
+                Err(_) => {}
+            }
         }
         // ---------- 品牌栏（全部用 painter 画，避免嵌套布局错位）----------
         egui::Panel::top("brand")
@@ -634,31 +813,109 @@ impl eframe::App for App {
                     self.reload();
                     self.status = format!("已刷新：线外 {} 项", self.rows.len());
                 }
+                ui.separator();
+
+                // ---- 批量操作只保留两个按钮：文字写的永远是「点下去会发生什么」 ----
+                let (pickable, picked) = self.pick_stats();
+                let all_picked = pickable > 0 && picked == pickable;
+                let pick_label = if pickable == 0 {
+                    "无可勾选项".to_string()
+                } else if all_picked {
+                    "清空勾选".to_string()
+                } else {
+                    format!("全选 {} 项", pickable)
+                };
+                let pick_btn = egui::Button::new(egui::RichText::new(pick_label).size(13.0))
+                    .min_size(egui::vec2(88.0, 32.0));
                 if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("全部保护").size(13.5))
-                            .min_size(egui::vec2(84.0, 32.0)),
-                    )
+                    .add_enabled(pickable > 0, pick_btn)
+                    .on_hover_text(if all_picked {
+                        "取消所有勾选：这一轮什么都不恢复"
+                    } else {
+                        "勾选所有可处理项；已保护的和系统组件不受影响"
+                    })
                     .clicked()
                 {
-                    for r in self.rows.iter_mut() {
-                        r.protect = true;
-                    }
-                    self.save_whitelist();
+                    self.set_all_pick(!all_picked);
                 }
+
                 if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("全部取消").size(13.5))
-                            .min_size(egui::vec2(84.0, 32.0)),
+                    .checkbox(&mut self.include_caution, "含系统组件")
+                    .on_hover_text("放开「谨慎处理」那一栏，让它们也能被勾选；单行仍可自己改")
+                    .changed()
+                {
+                    let on = self.include_caution;
+                    for r in self.rows.iter_mut() {
+                        if r.tier == Tier::Caution && !r.protect {
+                            r.pick = on;
+                        }
+                    }
+                }
+
+                ui.separator();
+
+                let protected_n = self.protected_count();
+                let all_protected = !self.rows.is_empty() && protected_n == self.rows.len();
+                let (p_label, p_hint, p_color) = if protected_n == 0 {
+                    (
+                        "全部保护".to_string(),
+                        "把列表里的项全部记进保护名单，以后永不处理（同时取消勾选）",
+                        TEXT,
                     )
+                } else if all_protected {
+                    (
+                        "取消全部保护".to_string(),
+                        "把这些项从保护名单里去掉，恢复默认勾选；通配规则不受影响",
+                        TEXT,
+                    )
+                } else {
+                    (
+                        "全部保护".to_string(),
+                        "把剩下的也记进保护名单；想只清掉已有的保护，点旁边那个「已保护 N」",
+                        TEXT,
+                    )
+                };
+                let p_btn = egui::Button::new(egui::RichText::new(p_label).size(13.0).color(p_color))
+                    .fill(if protected_n > 0 { CARD_HL } else { CARD })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if protected_n > 0 { GREEN } else { LINE },
+                    ))
+                    .min_size(egui::vec2(104.0, 32.0));
+                if ui
+                    .add_enabled(!self.rows.is_empty(), p_btn)
+                    .on_hover_text(p_hint)
                     .clicked()
                 {
-                    for r in self.rows.iter_mut() {
-                        r.protect = false;
-                    }
-                    self.save_whitelist();
+                    self.set_all_protect(!all_protected);
+                    self.status = if all_protected {
+                        "已取消全部保护".to_string()
+                    } else {
+                        format!("已把 {} 项记为保护", self.rows.len())
+                    };
                 }
-                ui.checkbox(&mut self.include_caution, "包含系统组件");
+
+                // 已有保护但没保护全：给一个看得见出口的小按钮，点一下清空这几位
+                if protected_n > 0 && !all_protected {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(format!("已保护 {} · 清空", protected_n))
+                                    .size(11.5)
+                                    .color(GREEN),
+                            )
+                            .fill(PANEL)
+                            .stroke(egui::Stroke::new(1.0, LINE))
+                            .min_size(egui::vec2(0.0, 26.0)),
+                        )
+                        .on_hover_text("把这 %d 项从保护名单里去掉".replace("%d", &protected_n.to_string()))
+                        .clicked()
+                    {
+                        self.set_all_protect(false);
+                        self.status = "已取消全部保护".to_string();
+                    }
+                }
+
                 ui.separator();
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
@@ -669,14 +926,27 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (n, mb) = self.selected_count();
                     let enabled = n > 0 && self.is_admin;
+                    let text = if n == 0 {
+                        "未勾选任何项".to_string()
+                    } else {
+                        format!("恢复选中 {} 项 · {}", n, fmt_mb(mb))
+                    };
                     let btn = egui::Button::new(
-                        egui::RichText::new(format!("恢复基准（{} 项 · {}）", n, fmt_mb(mb)))
-                            .size(14.0)
+                        egui::RichText::new(text)
+                            .size(13.5)
                             .color(egui::Color32::WHITE),
                     )
                     .fill(if enabled { RED } else { CARD })
-                    .min_size(egui::vec2(210.0, 34.0));
-                    if ui.add_enabled(enabled, btn).clicked() {
+                    .min_size(egui::vec2(196.0, 34.0));
+                    let resp = ui.add_enabled(enabled, btn);
+                    let resp = if enabled {
+                        resp.on_hover_text("只会处理右边勾了「恢复」的行")
+                    } else if n == 0 {
+                        resp.on_hover_text("先在列表里勾上要恢复的项")
+                    } else {
+                        resp.on_hover_text("需要以管理员身份运行")
+                    };
+                    if resp.clicked() {
                         self.confirm = true;
                     }
                 });
@@ -740,6 +1010,114 @@ impl eframe::App for App {
                     win::open_folder(&self.root.to_string_lossy());
                 }
             });
+
+            // 第三行：开机采集 —— 把 `membase install --at 60` 做成按钮
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("开机采集")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.boot_at)
+                        .range(5..=600)
+                        .speed(5.0)
+                        .prefix("开机第 ")
+                        .suffix(" 秒"),
+                )
+                .on_hover_text("开机后等多久再快照；太早桌面的启动项还没起来");
+
+                // 采集耗时：优先用基准里记的 CollectMs，老基准则用本次刷新的实测值
+                let cost_text = match self.collect_ms {
+                    Some(ms) => format!("采集约 {}", fmt_dur(ms)),
+                    None => "采集耗时未知".to_string(),
+                };
+                ui.label(egui::RichText::new(cost_text).size(11.0).color(MUTED))
+                    .on_hover_text(match self.collect_ms {
+                        Some(ms) => format!(
+                            "枚举全部进程与服务约 {} 毫秒，写盘另计（通常 1–3 毫秒）。\n数据来源：{}\n开机第 {} 秒开始，{}完成，任务随即自毁。",
+                            ms,
+                            if self.collect_from_base {
+                                "基准快照里的记录"
+                            } else {
+                                "本次刷新实测（这份基准采集时还没记录耗时）"
+                            },
+                            self.boot_at,
+                            finish_hint(ms)
+                        ),
+                        None => "还没有可用的耗时记录".to_string(),
+                    });
+
+                let can = self.is_admin;
+                let label = if self.boot.installed {
+                    "重新安排"
+                } else {
+                    "安排下次开机采集"
+                };
+                let btn = egui::Button::new(
+                    egui::RichText::new(label)
+                        .size(12.5)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(if can { ACCENT } else { CARD })
+                .min_size(egui::vec2(136.0, 30.0));
+                let resp = ui.add_enabled(can, btn);
+                let resp = if can {
+                    resp.on_hover_text("注册一个 SYSTEM 权限的开机任务，采完自动销毁")
+                } else {
+                    resp.on_hover_text("需要以管理员身份运行才能挂开机任务")
+                };
+                if resp.clicked() {
+                    self.confirm_boot = true;
+                }
+
+                if self.boot.installed
+                    && ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("取消安排").size(12.5),
+                            )
+                            .min_size(egui::vec2(84.0, 30.0)),
+                        )
+                        .clicked()
+                {
+                    self.remove_boot();
+                }
+
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if self.boot.installed {
+                            let at = if self.boot.at_sec >= 5 {
+                                self.boot.at_sec
+                            } else {
+                                self.boot_at
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "已安排：下次开机第 {} 秒采集",
+                                    at
+                                ))
+                                .size(11.0)
+                                .color(GREEN),
+                            )
+                            .on_hover_text(format!(
+                                "采完自动移除任务与程序副本\n任务程序：{}",
+                                self.boot.exe
+                            ));
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "未安排：基准来自手动采集或上一次开机",
+                                )
+                                .size(11.0)
+                                .color(GREY),
+                            );
+                        }
+                    },
+                );
+            });
             ui.add_space(6.0);
         });
 
@@ -747,13 +1125,15 @@ impl eframe::App for App {
         egui::Panel::bottom("status").exact_size(34.0).show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let (n, mb) = self.selected_count();
-                let protected_n = self.rows.iter().filter(|r| r.protect).count();
+                let (_, mb) = self.selected_count();
+                let (pickable, picked) = self.pick_stats();
+                let protected_n = self.protected_count();
                 ui.label(
                     egui::RichText::new(format!(
-                        "线外 {} 项 · 将处理 {} · 已保护 {} · 系统关键 {}",
+                        "线外 {} 项 · 已勾选 {}/{} · 已保护 {} · 系统关键 {}",
                         self.rows.len(),
-                        n,
+                        picked,
+                        pickable,
                         protected_n,
                         self.skipped.len()
                     ))
@@ -779,6 +1159,7 @@ impl eframe::App for App {
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let rows = std::mem::take(&mut self.rows);
             let mut toggled: Vec<(usize, bool)> = Vec::new();
+            let mut picks: Vec<(usize, bool)> = Vec::new();
             let search = self.search.to_lowercase();
 
             egui::ScrollArea::vertical()
@@ -802,7 +1183,13 @@ impl eframe::App for App {
                         }
 
                         let dim = r.tier == Tier::Caution && !self.include_caution;
-                        let fill = if r.protect { CARD_HL } else { CARD };
+                        let fill = if r.protect {
+                            BG
+                        } else if r.pick {
+                            CARD_HL
+                        } else {
+                            CARD
+                        };
                         egui::Frame::new()
                             .fill(fill)
                             .stroke(egui::Stroke::new(1.0, LINE))
@@ -811,25 +1198,42 @@ impl eframe::App for App {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let mut p = r.protect;
-                                    if ui.checkbox(&mut p, "").changed() {
+                                    if ui
+                                        .checkbox(&mut p, "保护")
+                                        .on_hover_text("勾上 = 永不处理，并写进保护名单")
+                                        .changed()
+                                    {
                                         toggled.push((i, p));
                                     }
                                     let tag = if r.kind == Kind::Process { "进程" } else { "服务" };
                                     ui.label(egui::RichText::new(tag).size(11.0).color(MUTED));
+                                    let name_color = if r.protect || !r.pick { MUTED } else { TEXT };
                                     ui.label(
                                         egui::RichText::new(&r.name)
                                             .size(14.0)
                                             .strong()
-                                            .color(if r.protect { MUTED } else { TEXT }),
+                                            .color(name_color),
                                     );
                                     if r.protect {
+                                        let glob = r.protect_by
+                                            != core::protect_key(r.kind, &r.name);
                                         ui.label(
-                                            egui::RichText::new("已保护").size(10.5).color(GREEN),
-                                        );
+                                            egui::RichText::new(if glob {
+                                                "通配保护"
+                                            } else {
+                                                "已保护"
+                                            })
+                                            .size(10.5)
+                                            .color(GREEN),
+                                        )
+                                        .on_hover_text(format!(
+                                            "保护名单条目：{}",
+                                            r.protect_by
+                                        ));
                                     }
                                     if dim {
                                         ui.label(
-                                            egui::RichText::new("需勾选「包含系统组件」")
+                                            egui::RichText::new("系统组件 · 默认不选")
                                                 .size(10.5)
                                                 .color(GREY),
                                         );
@@ -837,10 +1241,30 @@ impl eframe::App for App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            // 右侧勾选框：勾上 = 本次恢复（终止进程 / 停止服务）
+                                            let mut pick = r.pick;
+                                            let resp = ui.add_enabled(
+                                                can_pick(r, self.include_caution),
+                                                egui::Checkbox::new(&mut pick, "恢复"),
+                                            );
+                                            if resp.changed() {
+                                                picks.push((i, pick));
+                                            }
+                                            resp.on_hover_text(if r.protect {
+                                                "已保护的项目不会被处理"
+                                            } else if dim {
+                                                "系统组件：先勾上工具栏的「含系统组件」"
+                                            } else {
+                                                "勾上 = 本次恢复时终止它"
+                                            });
                                             ui.label(
                                                 egui::RichText::new(fmt_mb(r.mem_mb))
                                                     .size(13.0)
-                                                    .color(if r.mem_mb > 200.0 { RED } else { MUTED }),
+                                                    .color(if r.mem_mb > 200.0 && r.pick {
+                                                        RED
+                                                    } else {
+                                                        MUTED
+                                                    }),
                                             );
                                             if r.instances > 1 {
                                                 ui.label(
@@ -899,9 +1323,17 @@ impl eframe::App for App {
                 for (i, v) in toggled {
                     if let Some(r) = self.rows.get_mut(i) {
                         r.protect = v;
+                        if v {
+                            r.pick = false;
+                        }
                     }
                 }
                 self.save_whitelist();
+            }
+            for (i, v) in picks {
+                if let Some(r) = self.rows.get_mut(i) {
+                    r.pick = v && !r.protect;
+                }
             }
         });
 
@@ -934,7 +1366,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "将终止 {} 项基线之外的进程/服务，预计释放 {}。",
+                            "将终止你勾选的 {} 项进程/服务，预计释放 {}。",
                             n,
                             fmt_mb(mb)
                         ))
@@ -952,10 +1384,7 @@ impl eframe::App for App {
                         if shown >= 10 {
                             break;
                         }
-                        if r.protect || r.tier == Tier::Blocked {
-                            continue;
-                        }
-                        if r.tier == Tier::Caution && !self.include_caution {
+                        if !r.pick || !can_pick(r, self.include_caution) {
                             continue;
                         }
                         ui.label(
@@ -1073,6 +1502,96 @@ impl eframe::App for App {
             if do_it {
                 self.confirm_capture = false;
                 self.capture_now();
+            }
+        }
+
+        // ---------- 开机采集确认 ----------
+        if self.confirm_boot {
+            let mut do_it = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("boot_modal"))
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 18)))
+                .show(&ctx, |ui| {
+                    let bg = ui.max_rect().expand2(egui::vec2(20.0, 18.0));
+                    ui.painter()
+                        .rect_filled(bg, egui::CornerRadius::same(10), PANEL);
+                    painter_outline(ui, bg);
+                    ui.set_width(450.0);
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("安排下次开机采集？")
+                            .size(17.0)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "开机第 {} 秒会以 SYSTEM 权限自动快照一次，存成新基准并立刻生效。",
+                            self.boot_at
+                        ))
+                        .size(12.5),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "采集完成后任务和程序副本会自动删除，不会常驻后台。",
+                        )
+                        .size(11.5)
+                        .color(MUTED),
+                    );
+                    if let Some(ms) = self.collect_ms {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "采集本身约 {}，开机第 {} 秒开始，{}完成。",
+                                fmt_dur(ms),
+                                self.boot_at,
+                                finish_hint(ms)
+                            ))
+                            .size(11.5)
+                            .color(MUTED),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "现在开着的程序不会算进这份基准 —— 那才是「干净开机」的样子。",
+                        )
+                        .size(11.5)
+                        .color(AMBER),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("取消").size(13.5))
+                                    .min_size(egui::vec2(90.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("立即安排")
+                                        .size(13.5)
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(ACCENT)
+                                .min_size(egui::vec2(120.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            do_it = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+            if cancel {
+                self.confirm_boot = false;
+            }
+            if do_it {
+                self.confirm_boot = false;
+                self.install_boot();
             }
         }
     }

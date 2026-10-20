@@ -473,6 +473,41 @@ pub fn protect_key(kind: Kind, name: &str) -> String {
     }
 }
 
+/// 命中保护名单的**具体条目**（用于界面显示"被哪条规则保护"）。
+///
+/// 三种写法都认：
+/// - `进程:chrome`    精确
+/// - `进程:MuMu*`     同类型通配（`*` `?`）
+/// - `MuMu*`          不带前缀的裸名，两种类型都参与匹配
+pub fn protect_pattern(whitelist: &[String], kind: Kind, name: &str) -> Option<String> {
+    let exact = protect_key(kind, name);
+    if whitelist.iter().any(|w| w == &exact) {
+        return Some(exact);
+    }
+    let (prefix, other) = match kind {
+        Kind::Process => ("进程:", "服务:"),
+        Kind::Service => ("服务:", "进程:"),
+    };
+    for w in whitelist {
+        if let Some(pat) = w.strip_prefix(prefix) {
+            if pat.contains('*') || pat.contains('?') {
+                if wildcard_match(name, pat) {
+                    return Some(w.clone());
+                }
+            }
+        } else if !w.starts_with(other) && wildcard_match(name, w) {
+            // 裸名字：不区分进程/服务，没有通配符时等价于忽略大小写的精确比较
+            return Some(w.clone());
+        }
+    }
+    None
+}
+
+/// 便捷判断：只要布尔值。
+pub fn is_protected(whitelist: &[String], kind: Kind, name: &str) -> bool {
+    protect_pattern(whitelist, kind, name).is_some()
+}
+
 // ---------------- 线外清单（GUI 和 CLI 共用同一套判定） ----------------
 
 #[derive(Clone, Debug)]
@@ -505,6 +540,8 @@ pub struct PlanItem {
     pub tier: Tier,
     pub reason: String,
     pub protect: bool,
+    /// 命中的保护条目原文（空串 = 没被保护）；形如 `进程:MuMu*`
+    pub protect_by: String,
     pub start_mode: String,
 }
 
@@ -558,6 +595,7 @@ pub fn build_plan(
         if tier == Tier::Suggested && ws < min_mb {
             continue;
         }
+        let by = protect_pattern(whitelist, Kind::Process, &name).unwrap_or_default();
         out.push(PlanItem {
             kind: Kind::Process,
             name: name.clone(),
@@ -567,7 +605,8 @@ pub fn build_plan(
             path,
             tier,
             reason: "基准里没有这个进程".to_string(),
-            protect: whitelist.contains(&protect_key(Kind::Process, &name)),
+            protect: !by.is_empty(),
+            protect_by: by,
             start_mode: String::new(),
         });
     }
@@ -583,6 +622,7 @@ pub fn build_plan(
         if tier != Tier::Blocked && s.start_mode != "Manual" {
             tier = Tier::Caution;
         }
+        let by = protect_pattern(whitelist, Kind::Service, &s.name).unwrap_or_default();
         out.push(PlanItem {
             kind: Kind::Service,
             name: s.name.clone(),
@@ -592,7 +632,8 @@ pub fn build_plan(
             path: s.path.clone(),
             tier,
             reason: format!("开机时未运行 · 启动方式 {}", s.start_mode),
-            protect: whitelist.contains(&protect_key(Kind::Service, &s.name)),
+            protect: !by.is_empty(),
+            protect_by: by,
             start_mode: s.start_mode.clone(),
         });
     }
@@ -818,8 +859,28 @@ mod tests {
     }
 
     #[test]
-    fn plan_aggregates_instances() {
-        let live = vec![
+    fn 通配保护能命中且不串类型() {
+        let wl = vec!["进程:MuMu*".to_string(), "服务:DPS".to_string()];
+        assert!(is_protected(&wl, Kind::Process, "MuMuRemoteBackend"));
+        assert_eq!(
+            protect_pattern(&wl, Kind::Process, "MuMuPlayer").as_deref(),
+            Some("进程:MuMu*")
+        );
+        // 进程规则不该顺手把同名服务也保护掉
+        assert!(!is_protected(&wl, Kind::Process, "DPS"));
+        assert!(is_protected(&wl, Kind::Service, "DPS"));
+    }
+
+    #[test]
+    fn 裸名字和问号也认() {
+        let wl = vec!["sandbox-*-gc".to_string(), "a?b".to_string()];
+        assert!(is_protected(&wl, Kind::Process, "sandbox-cli-gc"));
+        assert!(is_protected(&wl, Kind::Service, "a1b"));
+        assert!(!is_protected(&wl, Kind::Process, "sandbox-cli"));
+    }
+
+    #[test]
+    fn plan_aggregates_instances() {        let live = vec![
             lp("chrome", 1, 100.0, "C:\\Program Files\\chrome.exe"),
             lp("chrome", 2, 50.0, "C:\\Program Files\\chrome.exe"),
         ];

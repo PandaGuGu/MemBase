@@ -49,6 +49,8 @@ pub struct Snapshot {
     pub computer: String,
     pub user: String,
     pub drive: String,
+    /// 枚举进程/服务本身花了多少毫秒（不含落盘）
+    pub collect_ms: u64,
     pub procs: Vec<ProcRow>,
     pub svcs: Vec<SvcRow>,
 }
@@ -60,6 +62,7 @@ fn mb(bytes: u64) -> f64 {
 }
 
 pub fn snapshot_now(exclude_self: bool) -> Snapshot {
+    let started = std::time::Instant::now();
     let mem = win::memory_status();
     let uptime = win::uptime_secs();
     let my_pid = std::process::id();
@@ -183,6 +186,7 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
         computer: win::computer_name(),
         user: win::user_name(),
         drive: win::system_drive(),
+        collect_ms: started.elapsed().as_millis() as u64,
         procs,
         svcs,
     }
@@ -228,6 +232,7 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         ("CapturedAtUtc".into(), jstr(&snap.captured_utc)),
         ("LastBootTime".into(), jstr(&snap.boot_time)),
         ("UptimeSeconds".into(), snap.uptime_s.to_string()),
+        ("CollectMs".into(), snap.collect_ms.to_string()),
         ("ComputerName".into(), jstr(&snap.computer)),
         ("OsCaption".into(), jstr(&String::new())),
         ("OsVersion".into(), jstr(&String::new())),
@@ -357,6 +362,7 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         "- 上次开机：{}（采集时已运行 {} 秒）\n",
         snap.boot_time, snap.uptime_s
     ));
+    m.push_str(&format!("- 采集耗时：{} 毫秒\n", snap.collect_ms));
     m.push_str(&format!("- 机器：{}\n\n", snap.computer));
     m.push_str("## 整机内存\n\n| 指标 | 数值 |\n| --- | ---: |\n");
     m.push_str(&format!("| 物理内存总量 | {} MB |\n", snap.total_phys_mb));

@@ -7,4 +7,5 @@
 
 pub mod compare;
 pub mod snapshot;
+pub mod task;
 pub mod win;

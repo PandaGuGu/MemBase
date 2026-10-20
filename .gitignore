@@ -17,3 +17,6 @@ desktop.ini
 .idea/
 .vscode/
 *.swp
+
+# 本地工作目录（记忆、临时截图等，不入库）
+.workbuddy/

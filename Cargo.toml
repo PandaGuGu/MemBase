@@ -6,7 +6,7 @@ members = ["crates/*", "apps/*"]
 default-members = ["crates/*", "apps/cli"]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
@@ -14,6 +14,7 @@ rust-version = "1.75"
 [workspace.dependencies]
 membase-core = { path = "crates/core" }
 membase-win = { path = "crates/win" }
+membase-cli = { path = "apps/cli" }
 eframe = { version = "0.37.0", default-features = false, features = [
     "glow",
     "default_fonts",

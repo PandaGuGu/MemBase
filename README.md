@@ -4,7 +4,7 @@
 
 Boot-time memory baseline for Windows: snapshot once at boot, diff against it any time, and trim whatever wasn't there.
 
-![版本](https://img.shields.io/badge/version-0.5.2-blue)
+![版本](https://img.shields.io/badge/version-0.6.0-blue)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![语言](https://img.shields.io/badge/language-Rust-orange)
 ![许可](https://img.shields.io/badge/license-MIT-green)
@@ -38,8 +38,8 @@ MemBase 把「开机第 N 秒」那一刻的进程与服务完整记成**基准�
 ```powershell
 # 1) 构建
 cargo build --workspace --release
-#   target\release\membase.exe      命令行版
-#   target\release\membase-ui.exe   界面版
+#   target\release\membase-ui.exe   界面版（带参数即命令行）
+#   target\release\membase.exe      独立命令行版（脚本 / CI 用，可选）
 
 # 2) 挂一次开机采集任务（SYSTEM 权限、无窗口），采完自动销毁任务和程序副本
 membase.exe install --at 60
@@ -53,10 +53,17 @@ membase.exe trim --execute --yes    # 关掉线外项，回到基线状态（先
 membase.exe baseline capture
 ```
 
+Release 版只有一个 `MemBase.exe`：双击开界面，带参数就是命令行，语法完全一样：
+
+```powershell
+.\MemBase.exe install --at 60
+.\MemBase.exe list
+```
+
 采集的两种方式等价，用哪个都行：
 
 - **界面**：第三行「开机采集」→ 拖动秒数 → 点「安排下次开机采集」（需要管理员权限）
-- **命令行**：`membase install --at 60` / `membase uninstall`
+- **命令行**：`MemBase.exe install --at 60` / `MemBase.exe uninstall`（源码构建用 `membase.exe`）
 
 > 计划任务由 `crates/win/src/task.rs` 生成并注册：SYSTEM 账户、开机触发、20 分钟上限、
 > 电池下也执行、错过则补跑；采完写快照，然后删任务、删程序副本，不留常驻进程。
@@ -138,7 +145,7 @@ membase trim --execute --yes --max 5 --json
 
 ```
 <数据目录>\
-├─ membase.exe                      install 自动拷贝的命令行副本（开机任务执行它）
+├─ membase.exe                      install 自动拷贝的自身副本（开机任务执行它）
 ├─ protect.txt                      保护名单
 ├─ run_YYYYMMDD_HHMMSS\<标签>\      快照：system.json / processes.csv / services.csv / summary.md …
 └─ exports\baseline_<时间>.mbz      基准包
@@ -223,11 +230,13 @@ membase baseline import D:\bk\boot.mbz --label imported --force
 │                                 零平台依赖、零 unsafe，可在 Linux/容器里跑测试
 ├── crates/win/    membase-win    Win32 FFI：进程 / 服务 / 快照 / 计划任务 / 关闭编排
 │                                 整个工程唯一允许 unsafe 的地方
-├── apps/cli/      membase-cli    → membase.exe（命令行）
-└── apps/gui/      membase-gui    → membase-ui.exe（egui）
+├── apps/cli/      membase-cli    命令行逻辑库 → 薄壳 membase.exe（控制台）
+└── apps/gui/      membase-gui    → membase-ui.exe（egui，同一个 exe 也跑命令行）
 ```
 
 `unsafe_code` 在 workspace 级别 `forbid`，只有 `membase-win` 单独放开。界面与命令行都调用 `core::build_plan()`，判定规则只有一份；开机任务的定义也只有 `win::task` 一份，界面按钮与 `install` / `uninstall` 共用。
+
+命令行逻辑放在 `membase-cli` 库里：独立构建的 `membase.exe` 是它的薄壳，界面版带参数启动时也直接调用同一份逻辑，所以两边行为完全一致。
 
 ## 构建与测试
 
@@ -257,8 +266,9 @@ cargo test --workspace              # 全部测试（CI 在 Windows 上跑的也
 
 ## 变更记录
 
-当前 **0.5.2**：顶栏新增整机内存占用（百分比 + 已用 / 总可用），每秒刷新。
-上一版 **0.5.1**：修复 `--self-destruct` 残留程序副本；补齐快照里的 `UserName` / `CpuSeconds` /
+当前 **0.6.0**：界面与命令行合并为单文件，开机采集不再需要额外的 CLI。
+上一版 **0.5.2**：顶栏新增整机内存占用（百分比 + 已用 / 总可用），每秒刷新。
+更早 **0.5.1**：修复 `--self-destruct` 残留程序副本；补齐快照里的 `UserName` / `CpuSeconds` /
 `PagedSystemMB` / `VirtualMB` / `OsCaption` / `OsVersion` / `OsBuild`。
 更早 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
 完整历史与格式 / 接口变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。

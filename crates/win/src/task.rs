@@ -83,42 +83,10 @@ fn task_xml(exe: &Path, out: &Path, at_sec: u64, task: &str) -> String {
     )
 }
 
-/// 读 PE 头的 Subsystem 字段：2 = 图形界面，3 = 控制台。
-///
-/// 开机任务执行的是 CLI（参数 `collect ...`）。要是误把界面版拷成 `membase.exe`，
-/// 每次开机就会弹个窗口而不是采集 —— 所以在拷贝前先看一眼子系统。
-fn pe_subsystem(path: &Path) -> Option<u16> {
-    let b = fs::read(path).ok()?;
-    if b.len() < 0x40 {
-        return None;
-    }
-    let e = u32::from_le_bytes([b[0x3c], b[0x3d], b[0x3e], b[0x3f]]) as usize;
-    let sig = b.get(e..e.checked_add(4)?)?;
-    if !sig.starts_with(b"PE\0\0") {
-        return None;
-    }
-    let opt = e + 24;
-    let magic = u16::from_le_bytes([*b.get(opt)?, *b.get(opt + 1)?]);
-    if magic != 0x10b && magic != 0x20b {
-        return None;
-    }
-    // PE32 与 PE32+ 的 Subsystem 都在可选头偏移 68
-    Some(u16::from_le_bytes([
-        *b.get(opt + 68)?,
-        *b.get(opt + 69)?,
-    ]))
-}
-
-/// 目标是不是图形界面程序（PE Subsystem = 2）。
-///
-/// 读不到 PE 头（不是合法 exe）时返回 false —— 那种情况交给 `install` 的其它校验。
-pub fn is_gui_exe(path: &Path) -> bool {
-    pe_subsystem(path) == Some(2)
-}
-
 /// 注册开机采集任务，并把 `src_exe` 复制成 `<out>\membase.exe`。
 ///
-/// 必须传 **CLI** 的 exe：任务参数是 `collect ...`，GUI 不认这些参数。
+/// 界面版和命令行版是同一个程序（带参数走命令行、无参数开界面），
+/// 所以这里不需要再区分 PE 子系统：任务参数 `collect ...` 不会开窗口。
 pub fn install(
     src_exe: &Path,
     out: &Path,
@@ -132,12 +100,6 @@ pub fn install(
     };
     if !src_exe.is_file() {
         return Err(format!("找不到可执行文件：{}", src_exe.display()));
-    }
-    if pe_subsystem(src_exe) == Some(2) {
-        return Err(
-            "这不是命令行版：开机任务要跑 membase.exe，请把 membase.exe 和界面版放在同一目录"
-                .into(),
-        );
     }
     fs::create_dir_all(out).map_err(|e| format!("建目录失败: {e}"))?;
     let target = out.join("membase.exe");
@@ -270,17 +232,6 @@ pub fn query(task: &str) -> TaskInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn 测试二进制自己是控制台程序() {
-        let exe = std::env::current_exe().expect("取不到测试程序路径");
-        assert_eq!(pe_subsystem(&exe), Some(3));
-    }
-
-    #[test]
-    fn 路径不存在时返回_none() {
-        assert_eq!(pe_subsystem(Path::new(r"C:\nope\none.exe")), None);
-    }
 
     #[test]
     fn 从任务参数里抠出开机秒数() {

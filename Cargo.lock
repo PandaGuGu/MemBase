@@ -928,7 +928,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "membase-cli"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "membase-core",
  "membase-win",
@@ -936,13 +936,14 @@ dependencies = [
 
 [[package]]
 name = "membase-core"
-version = "0.5.2"
+version = "0.6.0"
 
 [[package]]
 name = "membase-gui"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "eframe",
+ "membase-cli",
  "membase-core",
  "membase-win",
  "rfd",
@@ -951,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "membase-win"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "membase-core",
 ]

@@ -1093,6 +1093,72 @@ pub fn console_utf8() {
     }
 }
 
+/// 界面版带参数启动时，把标准输入输出接回调用它的控制台。
+///
+/// GUI 子系统进程默认没有控制台；`AttachConsole` 之后标准句柄未必可用，
+/// 所以显式打开 `CONOUT$` / `CONIN$` 再 `SetStdHandle`。
+/// 双击启动（没有父控制台）时静默返回，不影响界面。
+pub fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> BOOL;
+        fn GetStdHandle(nStdHandle: u32) -> HANDLE;
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: HANDLE,
+        ) -> HANDLE;
+        fn SetStdHandle(nStdHandle: u32, nHandle: HANDLE) -> BOOL;
+    }
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let valid = |h: HANDLE| !h.is_null() && h != INVALID_HANDLE_VALUE;
+        let open = |name: &str| {
+            let w = wide(name);
+            CreateFileW(
+                w.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        // 已经有有效的标准句柄（重定向到文件 / 管道）就别动，否则会把输出抢回控制台
+        if !valid(GetStdHandle(STD_OUTPUT_HANDLE)) {
+            let out = open("CONOUT$");
+            if valid(out) {
+                SetStdHandle(STD_OUTPUT_HANDLE, out);
+                SetStdHandle(STD_ERROR_HANDLE, out);
+            }
+        }
+        if !valid(GetStdHandle(STD_INPUT_HANDLE)) {
+            let inp = open("CONIN$");
+            if valid(inp) {
+                SetStdHandle(STD_INPUT_HANDLE, inp);
+            }
+        }
+    }
+}
+
 pub struct OsInfo {
     pub caption: String,
     pub version: String,

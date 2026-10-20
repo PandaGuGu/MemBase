@@ -672,37 +672,13 @@ impl App {
         }
     }
 
-    /// 计划任务执行的是 CLI（参数 `collect ...`），所以优先找同目录的 CLI。
-    /// 注意 Windows 文件名不区分大小写：`MemBase.exe` 和 `membase.exe` 是同一个文件，
-    /// 所以分发时命令行版叫 `membase-cli.exe`；`membase.exe` 也认（放在别的目录时）。
-    fn cli_exe(&self) -> Option<PathBuf> {
-        let mut cands: Vec<PathBuf> = Vec::new();
-        if let Ok(cur) = std::env::current_exe() {
-            let named_cli = cur
-                .file_name()
-                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("membase.exe"))
-                .unwrap_or(false);
-            if named_cli {
-                cands.push(cur.clone());
-            }
-            if let Some(dir) = cur.parent() {
-                cands.push(dir.join("membase.exe"));
-                cands.push(dir.join("membase-cli.exe"));
-            }
-        }
-        cands.push(self.root.join("membase.exe"));
-        cands
-            .into_iter()
-            .find(|p| p.is_file() && !boot::is_gui_exe(p))
-    }
-
-    /// 注册开机采集任务：拷一份 CLI 到数据目录，再挂计划任务
+    /// 注册开机采集任务：把「自己」拷到数据目录，再挂计划任务。
+    /// 同一个 exe 带参数就是命令行版，不需要额外的 membase-cli.exe。
     fn install_boot(&mut self) {
-        let src = match self.cli_exe() {
-            Some(p) => p,
-            None => {
-                self.status =
-                    "找不到命令行版 membase.exe：请把 CLI 和界面版放在同一目录".to_string();
+        let src = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("取不到当前程序路径：{e}");
                 return;
             }
         };
@@ -2261,6 +2237,24 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    // 同一个 exe 两种身份：带参数 = 命令行模式，双击（无参数）= 界面。
+    // 命令行模式不初始化 egui，所以计划任务不会闪窗口。
+    if std::env::args_os().len() > 1 {
+        win::attach_parent_console();
+        // PowerShell 不会等待 GUI 子系统进程，可能提前关掉输出管道；
+        // 这时 println! 会 panic，属于调用方行为，安静退出即可。
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.to_string().contains("failed printing to std") {
+                default_hook(info);
+            }
+        }));
+        let code = match std::panic::catch_unwind(membase_cli::run) {
+            Ok(()) => 0,
+            Err(_) => 3,
+        };
+        std::process::exit(code);
+    }
     let icon = egui::IconData {
         rgba: include_bytes!("../../../assets/icon_256.rgba").to_vec(),
         width: 256,

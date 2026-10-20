@@ -68,3 +68,10 @@ jobs:
           echo "$out" | grep -q '"commands"'
           echo "$out" | grep -q '"exit_codes"'
           ./target/release/membase.exe version
+
+      - name: 界面版也能当命令行用（单文件分发）
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/membase-ui.exe version
+          ./target/release/membase-ui.exe commands --json | grep -q '"commands"'

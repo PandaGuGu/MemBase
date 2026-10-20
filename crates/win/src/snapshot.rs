@@ -18,6 +18,8 @@ pub struct ProcRow {
     pub handles: u32,
     pub threads: u32,
     pub start_time: String,
+    /// 创建时间（FILETIME 100ns）：和 PID 一起作为进程身份，防止 PID 复用误伤
+    pub created: u64,
     pub path: String,
 }
 
@@ -86,6 +88,7 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
 
         let mut path = String::new();
         let mut start_time = String::new();
+        let mut created = 0u64;
         let mut handles = 0u32;
         let mut ws_mb = 0.0f64;
         let mut priv_mb = 0.0f64;
@@ -97,6 +100,7 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
         ) {
             path = win::process_image_path(h.0);
             start_time = win::process_start_time(h.0);
+            created = win::process_created(h.0).unwrap_or(0);
             handles = win::process_handle_count(h.0);
             if let Some(pmc) = win::process_memory(h.0) {
                 ws_mb = mb(pmc.WorkingSetSize as u64);
@@ -107,6 +111,7 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             // 提权进程只拿得到路径和线程数
             path = win::process_image_path(h.0);
             start_time = win::process_start_time(h.0);
+            created = win::process_created(h.0).unwrap_or(0);
             handles = win::process_handle_count(h.0);
         }
 
@@ -121,6 +126,7 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             handles,
             threads: pe.cntThreads,
             start_time,
+            created,
             path,
         });
     }

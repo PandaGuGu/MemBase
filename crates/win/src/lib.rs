@@ -5,6 +5,7 @@
 //! 这是整个工程唯一允许出现 `unsafe` 的地方。
 #![cfg(windows)]
 
+pub mod close;
 pub mod compare;
 pub mod snapshot;
 pub mod task;

@@ -4,7 +4,7 @@
 
 Boot-time memory baseline for Windows: snapshot once at boot, diff against it any time, and trim whatever wasn't there.
 
-![版本](https://img.shields.io/badge/version-0.4.0-blue)
+![版本](https://img.shields.io/badge/version-0.5.0-blue)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![语言](https://img.shields.io/badge/language-Rust-orange)
 ![许可](https://img.shields.io/badge/license-MIT-green)
@@ -29,7 +29,7 @@ MemBase 把「开机第 N 秒」那一刻的进程与服务完整记成**基准�
 |---|---|
 | **基准线（baseline）** | 一份快照目录：`system.json` + 进程表 + 服务表 + 可读报告 |
 | **线外清单（plan）** | 相对基准线多出来的进程/服务，分三档：建议 / 谨慎 / 禁止 |
-| **恢复基准（trim）** | 关掉线外项。**默认 dry-run**，必须显式 `--execute` 才动手 |
+| **恢复基准（trim）** | 关掉线外项。**默认 dry-run**，必须显式 `--execute` 才动手；动手时**先礼后兵** |
 
 ## 快速开始
 
@@ -47,7 +47,7 @@ membase.exe install --at 60
 # 3) 之后不用等到下次开机也能对比
 membase.exe compare                 # 与基准线做 diff
 membase.exe list                    # 列出线外项（只读）
-membase.exe trim --execute --yes    # 关掉线外项，回到基线状态
+membase.exe trim --execute --yes    # 关掉线外项，回到基线状态（先礼后兵，见下）
 
 # 4) 不想等到下次开机？直接拿当前状态当基准
 membase.exe baseline capture
@@ -63,14 +63,18 @@ membase.exe baseline capture
 
 ## 界面
 
-三行工具栏，各管一件事：
+左侧导航分五页，顶部是全局搜索，底部是实时统计：
 
 ```
-品牌栏  基准快照时间 · 采集于开机第 N 秒 · 已用内存 · 占用率 · 数据来源目录
-第一行  刷新对比 · 批量勾选 · 保护 · 搜索 ······ 恢复选中 N 项（主操作）
-第二行  扫描当前状态设为基准 · 导出基准 · 导入基准 · 数据目录 · 更改 · 打开
-第三行  开机采集 · 开机第 N 秒 · 采集约 N 毫秒 · 安排下次开机采集 · 取消安排
+进程        线外清单表格（名称 / 类型 / 分级 / 内存 / 保护 / 恢复），内存列按用量热力着色
+基准        基准快照时间 · 采集于开机第 N 秒 · 已用内存 · 占用率 · 数据来源目录 · 导出/导入
+保护名单    protect.txt 的全部规则，可整份清空
+开机采集    开机第 N 秒 · 采集耗时 · 计划任务状态 · 安排/取消
+设置        数据目录 · 运行身份 · 外观（浅色/深色）· 三档分级与先礼后兵的说明
 ```
+
+「进程」页顶部的按钮：刷新对比 · 含系统组件（全选范围开关）· 全部保护 / 取消全部保护 ·
+全选 N 项 / 清空勾选 · 恢复选中 N 项（主操作，蓝色实心）。
 
 **每行两个勾选框，含义不同：**
 
@@ -100,8 +104,8 @@ membase.exe baseline capture
 | `status` | 基准线信息 + 当前内存 + 线外计数 |
 | `list` | 列出线外进程/服务（`--all` 含关键项） |
 | `plan` | 只生成计划，可 `--to` 写 CSV |
-| `trim` | 恢复基准：`--execute` 才动手，`--max` 限制数量 |
-| `kill <名\|PID>` | 原子操作：终止指定进程 |
+| `trim` | 恢复基准：`--execute` 才动手，`--max` 限制数量，`--grace-wait` / `--force` / `--no-force` 控制关闭方式 |
+| `kill <名\|PID>` | 原子操作：终止指定进程，同样走先礼后兵（`--grace-wait` / `--force` / `--no-force`） |
 | `svc stop\|start <服务>` | 原子操作：启停单个服务 |
 | `protect list\|add\|remove\|clear` | 保护名单，支持 `MuMu*` 通配 |
 | `collect` | 采集快照（`--at` 指定开机后第几秒） |
@@ -173,15 +177,39 @@ membase baseline import D:\bk\boot.mbz --label imported --force
 - `import` 先校验文件清单与 crc32，坏包不落地；解开成 `run_<采集时间>_import\` 并成为最新基准
 - 包是 store 方式的 zip（不压缩），只保证与自身互操作
 
+## 关闭是怎么发生的（先礼后兵）
+
+`trim --execute` 和界面「恢复选中」都不是上来就砍，顺序固定：
+
+1. **身份复核** —— 用 `(PID, 创建时间)` 重新打开每个目标；PID 已被系统回收复用就跳过，
+   不会打在刚启动的新进程上；
+2. **有可见窗口的** 发 `WM_CLOSE` —— 和你点标题栏那个 ✕ 是同一条消息，程序可以弹「是否保存」；
+3. **没有窗口的**（后台常驻、更新器）没有 UI 可等，直接终止；
+4. **宽限期**（默认 3 秒）到点还没退的，才在身份校验下强杀；
+5. 结果分类上报：`礼貌关闭 / 强制 / 已退出 / 跳过 / 仍未退出`，不再只报一个「成功」。
+
+| 用法 | 行为 |
+|---|---|
+| 默认 | WM_CLOSE → 等 3 秒 → 强杀 |
+| `--grace-wait 10` | 多给点时间（正在编译、正在写文档） |
+| `--no-force` | 只礼不兵：关不掉就留着，报告里写「仍未退出」 |
+| `--force` | 跳过 WM_CLOSE 直接终止（旧行为，脚本想快就用它） |
+
+界面和命令行共用 `crates/win/src/close.rs` 这一份编排；多组一起关时**共用一个宽限期**，
+不是每组各等 3 秒（20 项也不会卡一分钟）。
+
 ## 安全模型
 
 这是个会终止进程的工具，所以护栏比功能重要：
 
 1. **三档分级** —— 建议（第三方程序）/ 谨慎（Windows 组件，需显式勾选）/ 禁止（csrss、lsass、svchost、dwm、MsMpEng 等，永不触碰）
 2. **自身保护** —— 不杀自己、启动自己的进程树，以及所有 `membase` 实例
-3. **执行前二次校验** —— 即使计划文件被改写，关键组件依然拒绝执行
-4. **默认 dry-run** —— 不加 `--execute` 只出计划；非交互环境必须显式 `--yes`；超过 `--max`（默认 20）直接拒绝
-5. **服务不级联** —— 只用 `Stop-Service`（无 `-Force`），有依赖在跑就报错跳过
+3. **身份而不是 PID** —— 目标以 `(PID, 创建时间)` 记录，动手前在同一句柄上复核，
+   PID 被复用、进程已退出都会让这一项被跳过而不是误伤
+4. **执行前二次校验** —— 即使计划文件被改写，关键组件依然拒绝执行
+5. **默认 dry-run** —— 不加 `--execute` 只出计划；非交互环境必须显式 `--yes`；超过 `--max`（默认 20）直接拒绝
+6. **先礼后兵** —— 有窗口的先 `WM_CLOSE`（等同点 ✕），宽限期后才强杀；无窗口进程才直接终止
+7. **服务不级联** —— 只用 `Stop-Service`（无 `-Force`），有依赖在跑就报错跳过
 
 > 杀进程只做「对照实验」用。真正省内存的做法是排查出元凶后卸载它、或禁掉它的自启项；被系统判定为必需的东西杀了也会自己回来。
 
@@ -193,7 +221,7 @@ membase baseline import D:\bk\boot.mbz --label imported --force
 .
 ├── crates/core/   membase-core   分级、CSV、diff、线外计划、基准打包、配置
 │                                 零平台依赖、零 unsafe，可在 Linux/容器里跑测试
-├── crates/win/    membase-win    Win32 FFI：进程 / 服务 / 快照 / 计划任务
+├── crates/win/    membase-win    Win32 FFI：进程 / 服务 / 快照 / 计划任务 / 关闭编排
 │                                 整个工程唯一允许 unsafe 的地方
 ├── apps/cli/      membase-cli    → membase.exe（命令行）
 └── apps/gui/      membase-gui    → membase-ui.exe（egui）
@@ -204,40 +232,28 @@ membase baseline import D:\bk\boot.mbz --label imported --force
 ## 构建与测试
 
 ```powershell
-cargo build --workspace --release   # 完整构建（含 GUI）
-cargo build -p membase-cli --release
-cargo test -p membase-core          # 纯逻辑，任何平台都能跑
-cargo test -p membase-win           # Win32 层：PE 子系统校验、任务参数解析
+cargo build --workspace --release   # 完整构建（CLI + 界面）
+cargo test --workspace              # 全部测试（CI 在 Windows 上跑的也是这条）
 ```
 
-Linux / 容器里验证（不需要 Windows）：
-
-```bash
-cargo test -p membase-core     # 分级、CSV、diff、计划、打包、配置、保护名单通配
-cargo build -p membase-cli     # 平台层在非 Windows 上是空 crate，CLI 仍可编译
-```
+测试标准（分层原则、判定门槛、CI 闸门、发版前人工验收清单、哪些东西**不**测）见
+[docs/TESTING.md](docs/TESTING.md)。
 
 ## 已知限制
 
-- **只按进程名判定**：同一个程序多开的实例不视为「线外」，也不会被清理
+- **按进程名归组**：同一程序的多开实例算一项，恢复时整组处理；
+  实例身份按 `(PID, 创建时间)` 记录，能防 PID 复用误伤，但不区分「哪几个实例是线外的」
+- **无窗口进程没有「礼貌」一说**：只对有可见窗口的进程发 `WM_CLOSE`；
+  控制台脚本（`python train.py`）也算无窗口，会被直接终止 —— 勾选前看清楚
+- **窗口判定偏保守**：只看「可见 + 有标题的顶层窗口」，托盘程序和部分 UWP 子窗口会被当成无窗口进程
 - 部分字段为空：`UserName`、`CommandLine`、`VirtualMB`、`CpuSeconds`（需要读目标进程 PEB / 令牌）
 - `OsCaption` / 页面文件峰值暂未填充
 - GUI 仅 Windows；CLI 的采集与清理能力也仅 Windows（`baseline` / `config` / `commands` 跨平台）
 
 ## 变更记录
 
-### v0.4.0
-
-- **开机采集进了界面**：秒数可调（5–600，默认 60），按钮直接注册 / 取消计划任务；任务逻辑统一到 `crates/win/src/task.rs`，界面与命令行共用一份
-- **采集耗时可见**：`snapshot_now()` 内部计时，写进 `system.json` 的 `CollectMs` 与 `summary.md`，界面显示「采集约 N 毫秒」
-- **勾选语义理顺**：右侧「恢复」决定这一轮处理谁，左侧「保护」永久免处理；批量操作合并为两个随状态翻转的按钮
-- **保护名单修 bug**：通配条目（`进程:MuMu*`）此前永远匹配不上；界面保存会抹掉名单里此刻没在跑的条目
-- **分发安全**：注册任务前做 PE 子系统校验，拒绝把界面版当作命令行版拷进数据目录
-
-### v0.3.x
-
-- 0.3.0 — 首个 Rust 版：分层架构、三档分级、dry-run 护栏、基准打包、JSON 输出
-- 0.3.1 / 0.3.2 — 品牌图标与版本资源修正
+当前 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
+完整历史与格式 / 接口变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
 
 ## License
 

@@ -517,6 +517,26 @@ pub struct LiveProc {
     pub ws_mb: f64,
     pub priv_mb: f64,
     pub path: String,
+    /// 创建时间（FILETIME 100ns）。0 = 未知：只按 PID 判定，和旧版行为一致。
+    pub created: u64,
+}
+
+/// 一个进程实例的身份：PID + 创建时间。
+///
+/// PID 会被系统回收再分配，单独用它做「等会儿关掉这个」的凭据是不安全的：
+/// 快照里的 PID 在动手时可能已经属于另一个刚启动的进程。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Instance {
+    pub pid: u32,
+    pub created: u64,
+}
+
+/// 复核身份：`expected == 0` 表示没有创建时间可用，退回只看 PID。
+pub fn identity_matches(expected: u64, current: Option<u64>) -> bool {
+    match current {
+        None => false,
+        Some(now) => expected == 0 || now == expected,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -533,7 +553,8 @@ pub struct LiveSvc {
 pub struct PlanItem {
     pub kind: Kind,
     pub name: String,
-    pub pids: Vec<u32>,
+    /// 属于这一项的所有进程实例（进程）或宿主进程（服务）
+    pub members: Vec<Instance>,
     pub instances: u32,
     pub mem_mb: f64,
     pub path: String,
@@ -546,6 +567,11 @@ pub struct PlanItem {
 }
 
 impl PlanItem {
+    /// 只给展示 / 计划文件用的纯 PID 列表
+    pub fn pids(&self) -> Vec<u32> {
+        self.members.iter().map(|m| m.pid).collect()
+    }
+
     pub fn actionable(&self, include_caution: bool) -> bool {
         if self.protect || self.tier == Tier::Blocked {
             return false;
@@ -569,14 +595,17 @@ pub fn build_plan(
     whitelist: &[String],
     min_mb: f64,
 ) -> Vec<PlanItem> {
-    let mut agg: BTreeMap<String, (u32, f64, Vec<u32>, String)> = BTreeMap::new();
+    let mut agg: BTreeMap<String, (u32, f64, Vec<Instance>, String)> = BTreeMap::new();
     for p in live_procs {
         let e = agg
             .entry(p.name.clone())
             .or_insert((0, 0.0, Vec::new(), String::new()));
         e.0 += 1;
         e.1 += p.ws_mb;
-        e.2.push(p.pid);
+        e.2.push(Instance {
+            pid: p.pid,
+            created: p.created,
+        });
         if e.3.is_empty() && !p.path.is_empty() {
             e.3 = p.path.clone();
         }
@@ -584,11 +613,11 @@ pub fn build_plan(
 
     let mut out: Vec<PlanItem> = Vec::new();
 
-    for (name, (inst, ws, pids, path)) in agg {
+    for (name, (inst, ws, members, path)) in agg {
         if base_procs.contains_key(&name) {
             continue;
         }
-        if pids.iter().any(|p| protected_pids.contains(p)) {
+        if members.iter().any(|m| protected_pids.contains(&m.pid)) {
             continue;
         }
         let tier = tier_for(Kind::Process, &name, &path);
@@ -599,7 +628,7 @@ pub fn build_plan(
         out.push(PlanItem {
             kind: Kind::Process,
             name: name.clone(),
-            pids,
+            members,
             instances: inst,
             mem_mb: ws,
             path,
@@ -626,7 +655,15 @@ pub fn build_plan(
         out.push(PlanItem {
             kind: Kind::Service,
             name: s.name.clone(),
-            pids: if s.pid > 0 { vec![s.pid] } else { Vec::new() },
+            // 服务按名字停，PID 只用于展示；创建时间拿不到，保持 0
+            members: if s.pid > 0 {
+                vec![Instance {
+                    pid: s.pid,
+                    created: 0,
+                }]
+            } else {
+                Vec::new()
+            },
             instances: 1,
             mem_mb: s.ws_mb,
             path: s.path.clone(),
@@ -828,6 +865,14 @@ mod tests {
             ws_mb: ws,
             priv_mb: ws / 2.0,
             path: path.into(),
+            created: 0,
+        }
+    }
+
+    fn lp_at(name: &str, pid: u32, ws: f64, path: &str, created: u64) -> LiveProc {
+        LiveProc {
+            created,
+            ..lp(name, pid, ws, path)
         }
     }
 
@@ -888,7 +933,42 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].instances, 2);
         assert_eq!(plan[0].mem_mb, 150.0);
-        assert_eq!(plan[0].pids.len(), 2);
+        assert_eq!(plan[0].pids(), vec![1, 2]);
+    }
+
+    #[test]
+    fn plan_carries_instance_identity() {
+        let live = vec![
+            lp_at("code", 10, 500.0, "F:\\VSCode\\Code.exe", 111),
+            lp_at("code", 11, 300.0, "F:\\VSCode\\Code.exe", 222),
+        ];
+        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &live, &[], &[], &[], 1.0);
+        assert_eq!(
+            plan[0].members,
+            vec![
+                Instance {
+                    pid: 10,
+                    created: 111
+                },
+                Instance {
+                    pid: 11,
+                    created: 222
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_matches_rejects_recycled_pid() {
+        // 拿不到当前创建时间 = 进程已经没了
+        assert!(!identity_matches(111, None));
+        // 创建时间对得上 = 还是那个进程
+        assert!(identity_matches(111, Some(111)));
+        // 同一 PID、不同创建时间 = 系统已经把它分给别人了
+        assert!(!identity_matches(111, Some(999)));
+        // 没记创建时间（老快照）时退回只看 PID，保持旧行为
+        assert!(identity_matches(0, Some(999)));
+        assert!(!identity_matches(0, None));
     }
 
     #[test]

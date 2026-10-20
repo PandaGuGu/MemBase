@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 纯逻辑层不碰 Win32，任何平台都该能跑通：
+  # 这条红了说明「分级 / 计划 / 打包」的判定被平台细节污染了。
+  core-linux:
+    name: core（Linux）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p membase-core
+      - run: cargo build -p membase-cli --release
+      - name: CLI 自描述仍可用
+        run: |
+          ./target/release/membase commands --json | grep -q '"commands"'
+          ./target/release/membase version
+
+  # 完整构建 + 全部测试。CLI 是控制台程序、GUI 是窗口程序，
+  # 这两个子系统不能弄反（弄反了开机任务会弹窗而不是采集）。
+  windows:
+    name: workspace（Windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --workspace --release
+
+      - name: 两个 exe 都在，且 PE 子系统正确
+        shell: bash
+        run: |
+          set -euo pipefail
+          # e_lfanew(0x3C) -> "PE\0\0"(4) -> COFF 头(20) -> OptionalHeader 里的 Subsystem
+          subsystem() {
+            local f="$1"
+            local off sub
+            off=$(od -An -tu4 -j60 -N4 "$f" | tr -d ' ')
+            sub=$(od -An -tu2 -j$((off + 4 + 20 + 68)) -N2 "$f" | tr -d ' ')
+            echo "$sub"
+          }
+          for f in target/release/membase.exe target/release/membase-ui.exe; do
+            [ -f "$f" ] || { echo "缺少产物：$f"; exit 1; }
+          done
+          cli=$(subsystem target/release/membase.exe)
+          gui=$(subsystem target/release/membase-ui.exe)
+          echo "membase.exe 子系统=$cli（应为 3 控制台）"
+          echo "membase-ui.exe 子系统=$gui（应为 2 窗口）"
+          [ "$cli" = "3" ] || exit 1
+          [ "$gui" = "2" ] || exit 1
+
+      - name: CLI 输出可解析（纯 ASCII JSON）
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(./target/release/membase.exe commands --json)
+          echo "$out" | grep -q '"commands"'
+          echo "$out" | grep -q '"exit_codes"'
+          ./target/release/membase.exe version

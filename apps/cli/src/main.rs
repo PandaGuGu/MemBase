@@ -13,7 +13,7 @@
 #[cfg(windows)]
 use membase_core::{Kind, Tier};
 #[cfg(windows)]
-use membase_win::{compare, snapshot, win};
+use membase_win::{close, compare, snapshot, win};
 // 常量与平台无关，usage() 在非 Windows 上也要用
 use membase_core as core;
 #[cfg(windows)]
@@ -658,6 +658,7 @@ fn live_now() -> LiveData {
             ws_mb: p.ws_mb,
             priv_mb: p.priv_mb,
             path: p.path.clone(),
+            created: p.created,
         })
         .collect();
     let svcs = snap
@@ -727,12 +728,27 @@ fn filter_plan(
 
 #[cfg(windows)]
 fn item_json(it: &core::PlanItem, include_caution: bool) -> String {
-    let pids: Vec<String> = it.pids.iter().map(|p| p.to_string()).collect();
+    let pids: Vec<String> = it.pids().iter().map(|p| p.to_string()).collect();
+    // members 带创建时间：调用方可以据此判断「我看到的这个实例」是否还在，
+    // 而不是只拿一串随时可能被系统复用的 PID。
+    let members: Vec<String> = it
+        .members
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"pid\":{},\"created\":{},\"created_at\":{}}}",
+                m.pid,
+                m.created,
+                jstr(&win::filetime_local_string(m.created))
+            )
+        })
+        .collect();
     format!(
-        "{{\"kind\":\"{}\",\"name\":{},\"pids\":[{}],\"instances\":{},\"mem_mb\":{:.1},\"tier\":\"{}\",\"protect\":{},\"protect_by\":{},\"actionable\":{},\"start_mode\":{},\"reason\":{},\"path\":{}}}",
+        "{{\"kind\":\"{}\",\"name\":{},\"pids\":[{}],\"members\":[{}],\"instances\":{},\"mem_mb\":{:.1},\"tier\":\"{}\",\"protect\":{},\"protect_by\":{},\"actionable\":{},\"start_mode\":{},\"reason\":{},\"path\":{}}}",
         core::kind_name(it.kind),
         jstr(&it.name),
         pids.join(","),
+        members.join(","),
         it.instances,
         it.mem_mb,
         core::tier_name(it.tier),
@@ -930,7 +946,7 @@ fn cmd_trim(args: &[String]) {
                 "{},{},{},{},{:.1},{},{},{},{}\n",
                 core::kind_name(p.kind),
                 p.name,
-                p.pids
+                p.pids()
                     .iter()
                     .map(|x| x.to_string())
                     .collect::<Vec<_>>()
@@ -974,6 +990,14 @@ fn cmd_trim(args: &[String]) {
             targets.len(),
             est_mb
         );
+        let proc_count = targets.iter().filter(|p| p.kind == Kind::Process).count();
+        if proc_count > 0 {
+            let grace = num_arg(args, "--grace-wait", 3.0).max(0.0);
+            println!(
+                "          其中 {} 项是进程：有窗口的先收关闭请求（等同点 ✕），{} 秒后才强制结束；服务直接停止",
+                proc_count, grace
+            );
+        }
         for p in &targets {
             let tail = if p.path.is_empty() { &p.reason } else { &p.path };
             println!(
@@ -1003,15 +1027,34 @@ fn cmd_trim(args: &[String]) {
         );
         std::process::exit(EXIT_REFUSED);
     }
+    // 先礼后兵：有窗口的先收 WM_CLOSE，等宽限期；没有窗口的直接终止。
+    // --force 跳过礼貌阶段（旧行为），--no-force 则允许「关不掉就留着」。
+    // 两个一起给时按 --force 处理：明确要求快的意图优先。
+    let force_flag = has_flag(args, "--force");
+    let grace_sec = num_arg(args, "--grace-wait", 3.0).max(0.0);
+    let opts = close::CloseOptions {
+        graceful: !force_flag,
+        grace_ms: (grace_sec * 1000.0) as u32,
+        force: force_flag || !has_flag(args, "--no-force"),
+    };
+
     if !yes {
         if !std::io::stdin().is_terminal() {
             eprintln!("[!] 非交互环境必须显式加 --yes 才能执行");
             std::process::exit(EXIT_REFUSED);
         }
+        let mode_desc = if !opts.graceful {
+            "直接终止（--force）".to_string()
+        } else if opts.force {
+            format!("有窗口的先发关闭请求，{} 秒后仍未退出的才强制结束", grace_sec)
+        } else {
+            format!("有窗口的先发关闭请求，{} 秒后仍未退出的保留不动", grace_sec)
+        };
         println!(
-            "即将处理 {} 项（约 {:.0} MB）。输入 yes 继续，其他取消：",
+            "即将处理 {} 项（约 {:.0} MB）。{}。输入 yes 继续，其他取消：",
             targets.len(),
-            est_mb
+            est_mb,
+            mode_desc
         );
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
@@ -1023,44 +1066,67 @@ fn cmd_trim(args: &[String]) {
 
     let protected = win::protected_pids();
     let mut results: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     let mut ok = 0usize;
     let mut fail = 0usize;
 
+    // 所有进程组一起提交：共用同一个宽限期，20 组不会变成 20 × 3 秒
+    let proc_groups: Vec<(String, Vec<close::Target>)> = targets
+        .iter()
+        .filter(|p| p.kind == Kind::Process)
+        .map(|p| {
+            (
+                p.name.clone(),
+                p.members
+                    .iter()
+                    .map(|m| close::Target {
+                        pid: m.pid,
+                        created: m.created,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let views: Vec<close::Group> = proc_groups
+        .iter()
+        .map(|(n, t)| close::Group {
+            name: n,
+            targets: t,
+        })
+        .collect();
+    let proc_reports = close::close_groups(&views, opts, &protected);
+
+    let mut proc_idx = 0usize;
     for p in &targets {
         match p.kind {
             Kind::Process => {
-                let mut killed = 0;
-                let mut last_err = String::new();
-                for pid in &p.pids {
-                    if protected.contains(pid) {
-                        last_err = "属于本工具自身进程树，拒绝".into();
-                        continue;
-                    }
-                    match win::terminate_process(*pid) {
-                        Ok(()) => killed += 1,
-                        Err(e) => last_err = e,
-                    }
-                }
-                if killed > 0 {
+                let rep = &proc_reports[proc_idx];
+                proc_idx += 1;
+                let acted = rep.closed + rep.forced;
+                if rep.done() {
                     ok += 1;
-                    results.push(format!(
-                        "{{\"kind\":\"process\",\"name\":{},\"ok\":true,\"killed\":{},\"message\":{}}}",
-                        jstr(&p.name),
-                        killed,
-                        jstr(&format!("已终止 {} 个实例", killed))
-                    ));
                 } else {
                     fail += 1;
-                    results.push(format!(
-                        "{{\"kind\":\"process\",\"name\":{},\"ok\":false,\"killed\":0,\"message\":{}}}",
-                        jstr(&p.name),
-                        jstr(&last_err)
-                    ));
                 }
+                lines.push(rep.one_line(&p.name));
+                results.push(format!(
+                    "{{\"kind\":\"process\",\"name\":{},\"ok\":{},\"killed\":{},\"requested\":{},\"closed\":{},\"forced\":{},\"exited\":{},\"skipped\":{},\"remaining\":{},\"message\":{}}}",
+                    jstr(&p.name),
+                    rep.done(),
+                    acted,
+                    rep.requested,
+                    rep.closed,
+                    rep.forced,
+                    rep.exited,
+                    rep.skipped,
+                    rep.remaining,
+                    jstr(&rep.one_line(&p.name))
+                ));
             }
             Kind::Service => match win::stop_service(&p.name) {
                 Ok(()) => {
                     ok += 1;
+                    lines.push(format!("{}: 已停止", p.name));
                     results.push(format!(
                         "{{\"kind\":\"service\",\"name\":{},\"ok\":true,\"message\":{}}}",
                         jstr(&p.name),
@@ -1069,6 +1135,7 @@ fn cmd_trim(args: &[String]) {
                 }
                 Err(e) => {
                     fail += 1;
+                    lines.push(format!("{}: {}", p.name, e));
                     results.push(format!(
                         "{{\"kind\":\"service\",\"name\":{},\"ok\":false,\"message\":{}}}",
                         jstr(&p.name),
@@ -1090,7 +1157,7 @@ fn cmd_trim(args: &[String]) {
         );
     } else {
         println!("执行完成：成功 {} 项，失败 {} 项", ok, fail);
-        for r in &results {
+        for r in &lines {
             println!("  {}", r);
         }
     }
@@ -1106,8 +1173,8 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("status", "概况：基准线 + 当前内存 + 线外计数", "", "windows"),
     ("list", "列出线外进程/服务（只读）", "--all --min-mb --only --exclude --include-caution", "windows"),
     ("plan", "只生成线外计划，不执行", "--min-mb --only --exclude --include-caution --to FILE", "windows"),
-    ("trim", "恢复基准：关掉线外项", "--execute --yes --include-caution --max --min-mb --only --exclude --plan-out", "windows"),
-    ("kill", "原子操作：终止指定进程（名字或 PID）", "<name|pid> --execute --out", "windows"),
+    ("trim", "恢复基准：先礼后兵地关掉线外项", "--execute --yes --include-caution --max --min-mb --only --exclude --plan-out --grace-wait --force --no-force", "windows"),
+    ("kill", "原子操作：终止指定进程（名字或 PID）", "<name|pid> --execute --out --grace-wait --force --no-force", "windows"),
     ("svc", "原子操作：停止/启动单个服务", "stop|start <service> --execute", "windows"),
     ("protect", "保护名单（勾选保护 = 永不处理）", "list|add|remove|clear [名字...]", "windows"),
     ("collect", "采集一次快照", "--out --at --include-self --self-destruct --task", "windows"),
@@ -1167,7 +1234,7 @@ fn cmd_kill(args: &[String]) {
     let target = match pos.first() {
         Some(t) => t.to_string(),
         None => {
-            eprintln!("用法: membase kill <进程名|PID> [--execute] [--json]");
+            eprintln!("用法: membase kill <进程名|PID> [--execute] [--grace-wait N] [--force|--no-force] [--json]");
             std::process::exit(EXIT_USAGE);
         }
     };
@@ -1225,34 +1292,43 @@ fn cmd_kill(args: &[String]) {
         return;
     }
 
-    let mut ok = 0;
-    let mut fail = 0;
-    let mut msgs: Vec<String> = Vec::new();
-    for p in &hits {
-        match win::terminate_process(p.pid) {
-            Ok(()) => ok += 1,
-            Err(e) => {
-                fail += 1;
-                msgs.push(format!("pid {}: {}", p.pid, e));
-            }
-        }
-    }
+    // 和 trim 共用同一份编排：有可见窗口的先 WM_CLOSE，
+    // 宽限期后才在身份校验下强杀。--force 用来要回旧行为。
+    let force_flag = has_flag(args, "--force");
+    let grace_sec = num_arg(args, "--grace-wait", 3.0).max(0.0);
+    let opts = close::CloseOptions {
+        graceful: !force_flag,
+        grace_ms: (grace_sec * 1000.0) as u32,
+        force: force_flag || !has_flag(args, "--no-force"),
+    };
+    let members: Vec<close::Target> = hits
+        .iter()
+        .map(|p| close::Target {
+            pid: p.pid,
+            created: p.created,
+        })
+        .collect();
+    let rep = close::close_group(&target, &members, opts, &protected);
+    let acted = rep.closed + rep.forced + rep.exited;
+
     if json {
-        let m: Vec<String> = msgs.iter().map(|s| jstr(s)).collect();
         println!(
-            "{{\"mode\":\"execute\",\"target\":{},\"ok\":{},\"failed\":{},\"messages\":[{}]}}",
+            "{{\"mode\":\"execute\",\"target\":{},\"ok\":{},\"failed\":{},\"requested\":{},\"closed\":{},\"forced\":{},\"exited\":{},\"skipped\":{},\"remaining\":{},\"message\":{}}}",
             jstr(&target),
-            ok,
-            fail,
-            m.join(",")
+            rep.remaining == 0 && acted > 0,
+            rep.remaining,
+            rep.requested,
+            rep.closed,
+            rep.forced,
+            rep.exited,
+            rep.skipped,
+            rep.remaining,
+            jstr(&rep.one_line(&target))
         );
     } else {
-        println!("已终止 {} 个，失败 {} 个", ok, fail);
-        for m in &msgs {
-            println!("  {}", m);
-        }
+        println!("{}", rep.one_line(&target));
     }
-    if fail > 0 {
+    if rep.remaining > 0 {
         std::process::exit(EXIT_ACTION_FAILED);
     }
 }
@@ -1335,7 +1411,7 @@ fn cmd_plan(args: &[String]) {
                 "{},{},{},{},{:.1},{},{},{},{}\n",
                 core::kind_name(p.kind),
                 p.name,
-                p.pids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("|"),
+                p.pids().iter().map(|x| x.to_string()).collect::<Vec<_>>().join("|"),
                 p.instances,
                 p.mem_mb,
                 core::tier_name(p.tier),

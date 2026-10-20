@@ -21,6 +21,8 @@ pub const PROCESS_TERMINATE: u32 = 0x0001;
 pub const PROCESS_VM_READ: u32 = 0x0010;
 pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+/// GetExitCodeProcess 里表示「还在跑」的哨兵值（不是真退出码）
+pub const STILL_ACTIVE: u32 = 259;
 
 pub const SC_MANAGER_CONNECT: u32 = 0x0001;
 pub const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
@@ -46,6 +48,9 @@ pub const ERROR_MORE_DATA: u32 = 234;
 pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 关窗口用的消息：和用户点标题栏那个 ✕ 是同一条
+pub const WM_CLOSE: u32 = 0x0010;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -242,6 +247,7 @@ extern "system" {
         cb: u32,
     ) -> BOOL;
     fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
+    fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut u32) -> BOOL;
     fn ProcessIdToSessionId(dwProcessId: u32, pSessionId: *mut u32) -> BOOL;
     fn GetComputerNameW(lpBuffer: *mut u16, nSize: *mut u32) -> BOOL;
     fn GetUserNameW(lpBuffer: *mut u16, pcbBuffer: *mut u32) -> BOOL;
@@ -297,6 +303,18 @@ extern "system" {
         lpServiceArgVectors: *const *const u16,
     ) -> BOOL;
     fn CloseServiceHandle(hSCObject: HANDLE) -> BOOL;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn EnumWindows(
+        lpEnumFunc: Option<unsafe extern "system" fn(HANDLE, isize) -> BOOL>,
+        lParam: isize,
+    ) -> BOOL;
+    fn GetWindowThreadProcessId(hWnd: HANDLE, lpdwProcessId: *mut u32) -> u32;
+    fn IsWindowVisible(hWnd: HANDLE) -> BOOL;
+    fn GetWindowTextLengthW(hWnd: HANDLE) -> i32;
+    fn PostMessageW(hWnd: HANDLE, Msg: u32, wParam: usize, lParam: isize) -> BOOL;
 }
 
 // ---------------- 小工具 ----------------
@@ -358,6 +376,14 @@ fn filetime_to_systime_local(ft: FILETIME) -> SYSTEMTIME {
         FileTimeToSystemTime(&local, &mut st);
         st
     }
+}
+
+/// 把 FILETIME（100ns 整数）转成本地可读时间。0 = 未知，返回空串。
+pub fn filetime_local_string(v: u64) -> String {
+    if v == 0 {
+        return String::new();
+    }
+    filetime_to_systime_local(FILETIME::from_u64(v)).fmt()
 }
 
 pub fn now_local_string() -> String {
@@ -540,6 +566,133 @@ pub fn terminate_process(pid: u32) -> Result<(), String> {
         }
         None => Err(format!("打不开进程（权限不足或已退出），错误码 {}", last_error())),
     }
+}
+
+/// 在已有句柄上读创建时间，避免为了取时间再开一次进程
+pub fn process_created(h: HANDLE) -> Option<u64> {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut c, mut e, mut k, mut u) = (zero, zero, zero, zero);
+    let ok = unsafe { GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        None
+    } else {
+        Some(c.to_u64())
+    }
+}
+
+/// 进程创建时间（FILETIME 100ns 整数）。
+///
+/// 和 PID 一起构成进程身份：PID 会被系统回收再分配，只认 PID 的话，
+/// 「看快照 → 复核 → 动手」之间目标一旦退出，就可能打到复用同一 PID 的新进程上。
+pub fn process_create_time(pid: u32) -> Option<u64> {
+    let h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    process_created(h.0)
+}
+
+/// 进程还在，并且还是「刚才看到的那个」。
+/// `created == 0` 表示调用方没拿到创建时间（老快照 / 权限不足），此时退回只看 PID。
+pub fn process_alive_as(pid: u32, created: u64) -> bool {
+    // 光「打得开进程」不等于「还活着」：进程已经在收尾（窗口已关、线程在退）
+    // 时对象还在，句柄也还打得开，但 TerminateProcess 会返回 ERROR_ACCESS_DENIED。
+    // 所以先核身份，再看退出码是不是 STILL_ACTIVE。
+    let now = match process_create_time(pid) {
+        None => return false,
+        Some(v) => v,
+    };
+    if created != 0 && now != created {
+        return false;
+    }
+    match process_exit_code(pid) {
+        Some(code) => code == STILL_ACTIVE,
+        None => true, // 读不到退出码就按「还在」算，宁可多等一轮
+    }
+}
+
+/// 进程退出码；已在收尾的进程会返回 259 以外的值。拿不到返回 None。
+pub fn process_exit_code(pid: u32) -> Option<u32> {
+    let h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(h.0, &mut code) } == 0 {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// 校验身份后终止：校验和 TerminateProcess 用**同一个句柄**，
+/// 中间不留 PID 被复用后误伤的窗口。
+pub fn terminate_process_checked(pid: u32, created: u64) -> Result<(), String> {
+    let h = match open_process(
+        pid,
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+    ) {
+        Some(h) => h,
+        None => {
+            return Err(format!(
+                "打不开进程（权限不足或已退出），错误码 {}",
+                last_error()
+            ))
+        }
+    };
+    if created != 0 {
+        let cur = match process_created(h.0) {
+            Some(v) => v,
+            None => {
+                return Err(format!("读不到创建时间，错误码 {}", last_error()));
+            }
+        };
+        if cur != created {
+            return Err("PID 已被系统复用给别的进程，放弃".into());
+        }
+    }
+    let ok = unsafe { TerminateProcess(h.0, 1) };
+    if ok == 0 {
+        Err(format!("TerminateProcess 失败，错误码 {}", last_error()))
+    } else {
+        Ok(())
+    }
+}
+
+struct CloseEnumCtx {
+    pids: Vec<u32>,
+    hits: std::collections::HashMap<u32, usize>,
+}
+
+unsafe extern "system" fn close_enum_proc(hwnd: HANDLE, lparam: isize) -> BOOL {
+    let ctx = &mut *(lparam as *mut CloseEnumCtx);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == 0 || !ctx.pids.contains(&pid) {
+        return 1;
+    }
+    // 只认用户看得见、有标题的顶层窗口：托盘隐藏窗口不参与，
+    // 否则会把「关到托盘」的程序硬拽出来，或者在无 UI 的宿主进程上乱发消息。
+    if IsWindowVisible(hwnd) == 0 || GetWindowTextLengthW(hwnd) <= 0 {
+        return 1;
+    }
+    if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+        *ctx.hits.entry(pid).or_insert(0) += 1;
+    }
+    1
+}
+
+/// 给这些进程的可见顶层窗口发 WM_CLOSE —— 和用户点 ✕ 完全一样。
+/// 返回 pid → 实际发出消息的窗口数；没有窗口的进程不会出现在结果里。
+pub fn request_close_for(pids: &[u32]) -> std::collections::HashMap<u32, usize> {
+    let mut ctx = CloseEnumCtx {
+        pids: pids.to_vec(),
+        hits: std::collections::HashMap::new(),
+    };
+    if ctx.pids.is_empty() {
+        return ctx.hits;
+    }
+    unsafe {
+        EnumWindows(Some(close_enum_proc), &mut ctx as *mut CloseEnumCtx as isize);
+    }
+    ctx.hits
 }
 
 pub fn snapshot_processes() -> Vec<PROCESSENTRY32W> {
@@ -897,4 +1050,5 @@ pub fn protected_pids() -> Vec<u32> {
     }
     out
 }
+
 

@@ -315,8 +315,9 @@ pub fn export_baseline(snap_dir: &Path, out_file: &Path) -> Result<ExportResult,
     let uptime = read_meta(snap_dir, "UptimeSeconds").unwrap_or_else(|| "0".into());
 
     let manifest = format!(
-        "{{\"generator\":\"membase {}\",\"format\":1,\"captured_at\":{},\"uptime_sec\":{},\"files\":{},\"bytes\":{},\"crc32\":\"{:08x}\"}}\n",
+        "{{\"generator\":\"membase {}\",\"build\":{},\"format\":1,\"captured_at\":{},\"uptime_sec\":{},\"files\":{},\"bytes\":{},\"crc32\":\"{:08x}\"}}\n",
         env!("CARGO_PKG_VERSION"),
+        jstr(&crate::build_id()),
         jstr(&captured),
         uptime.trim(),
         info.files.len(),

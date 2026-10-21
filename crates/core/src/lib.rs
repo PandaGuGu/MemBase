@@ -10,6 +10,54 @@ pub mod layout_store;
 
 /// crate 版本（用于 CLI 自描述与包 manifest）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 编译时刻（UTC+8，形如 `20261021-1348`），从自身 PE 头里读链接器时间戳。
+///
+/// 版本号不足以区分 build：改了代码但没升版本时，两份快照的版本号一模一样，
+/// 事后根本判断不出哪份是哪个 build 采的（2026-10-21 就被这个坑过）。
+/// 也不用编译期常量：那个只反映「本 crate 上次编译」的时刻，别的 crate 改了它不动。
+pub fn build_id() -> String {
+    let secs = match pe_link_timestamp() {
+        Some(s) => s,
+        None => 0,
+    };
+    if secs == 0 {
+        return String::new();
+    }
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(t) => t
+            .with_timezone(&chrono::Local)
+            .format("%Y%m%d-%H%M")
+            .to_string(),
+        None => String::new(),
+    }
+}
+
+/// DOS 头 → `e_lfanew` → PE 签名 + COFF 头，`TimeDateStamp` 在 COFF 头偏移 8。
+fn pe_link_timestamp() -> Option<i64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
+    let mut dos = [0u8; 64];
+    f.read_exact(&mut dos).ok()?;
+    if &dos[0..2] != b"MZ" {
+        return None;
+    }
+    let mut off = [0u8; 4];
+    off.copy_from_slice(&dos[0x3C..0x40]);
+    f.seek(SeekFrom::Start(u32::from_le_bytes(off) as u64)).ok()?;
+    let mut coff = [0u8; 12];
+    f.read_exact(&mut coff).ok()?;
+    if &coff[0..4] != b"PE\0\0" {
+        return None;
+    }
+    let ts = u32::from_le_bytes([coff[8], coff[9], coff[10], coff[11]]) as i64;
+    if ts == 0 {
+        None
+    } else {
+        Some(ts)
+    }
+}
+
 /// 默认数据目录
 pub const DEFAULT_ROOT: &str = r"C:\ProgramData\MemBaseline";
 /// 默认计划任务名
@@ -297,6 +345,9 @@ pub struct ProcAgg {
     pub instances: u32,
     pub ws_mb: f64,
     pub priv_mb: f64,
+    /// 有几个实例的内存是「没读到」而不是「真的是 0」。
+    /// 非 0 就说明这一项的内存数不可比，别拿来做涨跌结论。
+    pub unknown: u32,
 }
 
 pub fn parse_by_name(text: &str) -> BTreeMap<String, ProcAgg> {
@@ -312,18 +363,28 @@ pub fn parse_by_name(text: &str) -> BTreeMap<String, ProcAgg> {
         col_index(h, "WorkingSetMB"),
         col_index(h, "PrivateMB"),
     );
+    let i_u = col_index(h, "UnknownInstances");
     if let (Some(a), Some(b), Some(c), Some(d)) = (i_n, i_i, i_w, i_p) {
         for r in rows.iter().skip(1) {
             let name = r.get(a).cloned().unwrap_or_default();
             if name.is_empty() {
                 continue;
             }
+            let instances: u32 = r.get(b).and_then(|v| v.parse().ok()).unwrap_or(0);
+            // 老快照没有 UnknownInstances 列：工作集为空就当整组都读不到
+            let ws_cell = r.get(c).map(|s| s.trim().to_string()).unwrap_or_default();
+            let unknown = match i_u.and_then(|i| r.get(i)) {
+                Some(v) => v.trim().parse().unwrap_or(0),
+                None if ws_cell.is_empty() => instances,
+                None => 0,
+            };
             map.insert(
                 name,
                 ProcAgg {
-                    instances: r.get(b).and_then(|v| v.parse().ok()).unwrap_or(0),
-                    ws_mb: r.get(c).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                    instances,
+                    ws_mb: ws_cell.parse().unwrap_or(0.0),
                     priv_mb: r.get(d).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                    unknown,
                 },
             );
         }
@@ -350,6 +411,203 @@ pub fn parse_service_states(text: &str) -> BTreeMap<String, String> {
     map
 }
 
+// ---------------- 基准瘦身（以基准为输入，不是线外） ----------------
+
+/// 一条服务在基准里的完整画像（比 `parse_service_states` 多带内存与路径）
+#[derive(Clone, Debug, Default)]
+pub struct SvcRowAgg {
+    pub name: String,
+    pub display: String,
+    pub state: String,
+    pub start_mode: String,
+    /// 宿主进程 PID：同一宿主上的多个服务共享同一份内存
+    pub pid: u32,
+    pub host: String,
+    pub host_ws: Option<f64>,
+    pub path: String,
+}
+
+pub fn parse_service_rows(text: &str) -> Vec<SvcRowAgg> {
+    let rows = csv_parse(text);
+    let mut out = Vec::new();
+    if rows.is_empty() {
+        return out;
+    }
+    let h = &rows[0];
+    let i_name = col_index(h, "ServiceName");
+    let i_disp = col_index(h, "DisplayName");
+    let i_state = col_index(h, "State");
+    let i_mode = col_index(h, "StartMode");
+    let i_pid = col_index(h, "PID");
+    let i_host = col_index(h, "HostProcess");
+    let i_ws = col_index(h, "HostWorkingSetMB");
+    let i_path = col_index(h, "ExecutablePath");
+    let Some(i_name) = i_name else {
+        return out;
+    };
+    for r in rows.iter().skip(1) {
+        let name = r.get(i_name).cloned().unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let get = |i: Option<usize>| -> String {
+            i.and_then(|i| r.get(i)).cloned().unwrap_or_default()
+        };
+        out.push(SvcRowAgg {
+            name,
+            display: get(i_disp),
+            state: get(i_state),
+            start_mode: get(i_mode),
+            pid: get(i_pid).trim().parse().unwrap_or(0),
+            host: get(i_host),
+            // 空 = 没读到（未提权采集），不能当 0
+            host_ws: get(i_ws).trim().parse::<f64>().ok(),
+            path: get(i_path),
+        });
+    }
+    out
+}
+
+/// 从 `...\WindowsApps\Microsoft.MicrosoftPCManager_3.23.0.0_x64__8wekyb3d8bbwe\...`
+/// 里取出可用于 `Remove-AppxPackage -Package` 的包全名。
+pub fn appx_from_path(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    let idx = lower.find("\\windowsapps\\")?;
+    let rest = &path[idx + "\\windowsapps\\".len()..];
+    let seg = rest.split('\\').next()?;
+    if seg.is_empty() || !seg.contains('_') {
+        return None;
+    }
+    Some(seg.to_string())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrimAction {
+    /// 禁止开机自启（`ChangeServiceConfigW(SERVICE_DISABLED)`）
+    DisableService,
+    /// 卸载 Store 应用（`Remove-AppxPackage`），比禁用服务更彻底
+    UninstallAppx,
+}
+
+impl TrimAction {
+    pub fn key(&self) -> &'static str {
+        match self {
+            TrimAction::DisableService => "disable-service",
+            TrimAction::UninstallAppx => "uninstall-appx",
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            TrimAction::DisableService => "禁用服务",
+            TrimAction::UninstallAppx => "卸载应用",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TrimItem {
+    pub name: String,
+    pub display: String,
+    pub action: TrimAction,
+    /// `UninstallAppx` 时的包全名
+    pub appx: Option<String>,
+    /// 宿主机进程内存（同宿主上多个服务会重复显示，合计时要按 pid 去重）
+    pub mem_mb: f64,
+    pub host_pid: u32,
+    pub host: String,
+    pub start_mode: String,
+    pub path: String,
+    pub tier: Tier,
+    pub reason: String,
+}
+
+/// 以「开机基准」为输入，列出值得砍掉的服务。
+///
+/// 与 `build_plan` 的区别：那个找的是「基准里没有、现在却在跑」的线外项，
+/// 这个是找「基准里就有、但开机根本不需要」的项。瘦身只认这一个。
+///
+/// 分档：
+///   * `Blocked`（关键系统服务）一律不出现
+///   * Windows 目录下的组件 → `Caution`（要 `include_caution` 才给）
+///   * Store 应用（WindowsApps）与第三方 → `Suggested`
+pub fn build_trim_plan(rows: &[SvcRowAgg], min_mb: f64, include_caution: bool) -> Vec<TrimItem> {
+    let mut out: Vec<TrimItem> = Vec::new();
+    for r in rows {
+        if r.state != "Running" {
+            continue;
+        }
+        // Manual 的本来就不会开机自启，砍它没收益
+        if r.start_mode == "Manual" || r.start_mode == "Disabled" {
+            continue;
+        }
+        let tier = tier_for(Kind::Service, &r.name, &r.path);
+        if tier == Tier::Blocked {
+            continue;
+        }
+        let lp = r.path.to_ascii_lowercase();
+        let in_windows = lp.contains(":\\windows\\");
+        let tier = if in_windows { Tier::Caution } else { Tier::Suggested };
+        if tier == Tier::Caution && !include_caution {
+            continue;
+        }
+        let mem = r.host_ws.unwrap_or(0.0);
+        if tier == Tier::Suggested && mem < min_mb {
+            continue;
+        }
+        let appx = appx_from_path(&r.path);
+        let action = if appx.is_some() {
+            TrimAction::UninstallAppx
+        } else {
+            TrimAction::DisableService
+        };
+        let reason = match action {
+            TrimAction::UninstallAppx => format!(
+                "Store 应用随系统装上，卸载比禁用干净（禁用服务会被重新挂起来）· {}",
+                r.start_mode
+            ),
+            TrimAction::DisableService => {
+                format!("开机自启（{}）· 内存按宿主 {} 计", r.start_mode, r.host)
+            }
+        };
+        out.push(TrimItem {
+            name: r.name.clone(),
+            display: r.display.clone(),
+            action,
+            appx,
+            mem_mb: (mem * 100.0).round() / 100.0,
+            host_pid: r.pid,
+            host: r.host.clone(),
+            start_mode: r.start_mode.clone(),
+            path: r.path.clone(),
+            tier,
+            reason,
+        });
+    }
+    out.sort_by(|a, b| {
+        let rank = |t: Tier| match t {
+            Tier::Suggested => 0,
+            Tier::Caution => 1,
+            Tier::Blocked => 2,
+        };
+        rank(a.tier)
+            .cmp(&rank(b.tier))
+            .then(b.mem_mb.partial_cmp(&a.mem_mb).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    out
+}
+
+/// 合计可省内存：同一 svchost 宿主上挂 N 个服务，只能算一次。
+pub fn trim_savings(items: &[TrimItem]) -> f64 {
+    let mut seen: BTreeMap<u32, f64> = BTreeMap::new();
+    for it in items {
+        // pid 0 = 拿不到宿主（多半是停止态或读不到），按名字单独算
+        let key = if it.host_pid == 0 { 1_000_000 + it.name.len() as u32 } else { it.host_pid };
+        seen.insert(key, it.mem_mb);
+    }
+    let total: f64 = seen.values().sum();
+    (total * 100.0).round() / 100.0
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeltaKind {
     New,
@@ -357,6 +615,9 @@ pub enum DeltaKind {
     Up,
     Down,
     Same,
+    /// 有一侧的内存是「没读到」（未提权采集 / 受保护进程），涨跌无从判断。
+    /// 单独成一档，是为了不让 0 冒充真实值报出「内存暴跌」。
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -386,10 +647,13 @@ pub fn diff_procs(
             let b = base.get(n).copied().unwrap_or_default();
             let l = live.get(n).copied().unwrap_or_default();
             let delta = l.ws_mb - b.ws_mb;
+            let blind = b.unknown > 0 || l.unknown > 0;
             let kind = if b.instances == 0 {
                 DeltaKind::New
             } else if l.instances == 0 {
                 DeltaKind::Gone
+            } else if blind {
+                DeltaKind::Unknown
             } else if delta > 0.5 {
                 DeltaKind::Up
             } else if delta < -0.5 {
@@ -404,7 +668,12 @@ pub fn diff_procs(
                 live_inst: l.instances,
                 base_ws: b.ws_mb,
                 live_ws: l.ws_mb,
-                delta: (delta * 100.0).round() / 100.0,
+                // 不可比时把差值抹成 0，别让它参与排序和合计
+                delta: if blind {
+                    0.0
+                } else {
+                    (delta * 100.0).round() / 100.0
+                },
             }
         })
         .collect();
@@ -521,6 +790,9 @@ pub struct LiveProc {
     pub path: String,
     /// 创建时间（FILETIME 100ns）。0 = 未知：只按 PID 判定，和旧版行为一致。
     pub created: u64,
+    /// 有几个实例的内存是「没读到」而不是「真的是 0」（未提权采集时很常见）。
+    /// 非 0 时这一项的 `ws_mb` 是残缺的合计，不能拿去和别的快照比涨跌。
+    pub unknown: u32,
 }
 
 /// 一个进程实例的身份：PID + 创建时间。
@@ -728,6 +1000,7 @@ mod tests {
             instances: i,
             ws_mb: ws,
             priv_mb: ws / 2.0,
+            unknown: 0,
         }
     }
 
@@ -821,6 +1094,62 @@ mod tests {
         assert_eq!(d[0].name, "brandnew");
     }
 
+    // ---- 基线瘦身 ----
+
+    fn svc_row(name: &str, mode: &str, pid: u32, ws: Option<f64>, path: &str) -> SvcRowAgg {
+        SvcRowAgg {
+            name: name.into(),
+            display: name.into(),
+            state: "Running".into(),
+            start_mode: mode.into(),
+            pid,
+            host: "h".into(),
+            host_ws: ws,
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn trim_picks_appx_from_windowsapps_path() {
+        let p = r"C:\Program Files\WindowsApps\Microsoft.MicrosoftPCManager_3.23.0.0_x64__8wekyb3d8bbwe\PCManager\MSPCManagerService.exe";
+        assert_eq!(
+            appx_from_path(p).as_deref(),
+            Some("Microsoft.MicrosoftPCManager_3.23.0.0_x64__8wekyb3d8bbwe")
+        );
+        assert_eq!(appx_from_path(r"C:\Windows\System32\svchost.exe"), None);
+    }
+
+    #[test]
+    fn trim_skips_manual_and_critical_but_flags_store_app() {
+        let rows = vec![
+            svc_row("ClickToRunSvc", "Auto", 10, Some(52.3), r"C:\Program Files\Common Files\ClickToRun\x.exe"),
+            svc_row("PCManager Service Store", "Auto", 20, Some(141.0), r"C:\Program Files\WindowsApps\Microsoft.MicrosoftPCManager_3.23_x64__8we\a.exe"),
+            svc_row("ManualThing", "Manual", 30, Some(99.0), r"F:\x\y.exe"),
+            svc_row("DcomLaunch", "Auto", 40, Some(80.0), r"C:\Windows\System32\svchost.exe"),
+        ];
+        let plan = build_trim_plan(&rows, 5.0, false);
+        let names: Vec<&str> = plan.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["PCManager Service Store", "ClickToRunSvc"]);
+        assert_eq!(plan[0].action, TrimAction::UninstallAppx);
+        assert!(plan[0].appx.is_some());
+        assert_eq!(plan[1].action, TrimAction::DisableService);
+        // Windows 目录下的 svchost 服务默认不出现
+        assert!(!names.contains(&"DcomLaunch"));
+    }
+
+    #[test]
+    fn trim_savings_counts_shared_host_once() {
+        let rows = vec![
+            svc_row("A1", "Auto", 777, Some(60.0), r"F:\a\a.exe"),
+            svc_row("A2", "Auto", 777, Some(60.0), r"F:\a\a.exe"),
+            svc_row("B1", "Auto", 888, Some(20.0), r"F:\b\b.exe"),
+        ];
+        let plan = build_trim_plan(&rows, 1.0, false);
+        assert_eq!(plan.len(), 3);
+        // 两个服务共用一个宿主，只能算 60，不是 120
+        assert_eq!(trim_savings(&plan), 80.0);
+    }
+
     #[test]
     fn service_diff_reports_state_change() {
         let mut base = BTreeMap::new();
@@ -868,6 +1197,7 @@ mod tests {
             priv_mb: ws / 2.0,
             path: path.into(),
             created: 0,
+            unknown: 0,
         }
     }
 

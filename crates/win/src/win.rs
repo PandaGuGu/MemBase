@@ -44,6 +44,11 @@ pub const START_TYPE_AUTO: u32 = 2;
 pub const START_TYPE_MANUAL: u32 = 3;
 pub const START_TYPE_DISABLED: u32 = 4;
 
+pub const SERVICE_CHANGE_CONFIG: u32 = 0x0002;
+/// ChangeServiceConfig 里「这一项不改」的哨兵值
+pub const SERVICE_NO_CHANGE: u32 = 0xFFFF_FFFF;
+const TOKEN_ELEVATION_CLASS: u32 = 20;
+
 pub const ERROR_MORE_DATA: u32 = 234;
 pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -325,6 +330,20 @@ extern "system" {
         lpServiceArgVectors: *const *const u16,
     ) -> BOOL;
     fn CloseServiceHandle(hSCObject: HANDLE) -> BOOL;
+    fn ChangeServiceConfigW(
+        hService: HANDLE,
+        dwServiceType: u32,
+        dwStartType: u32,
+        dwErrorControl: u32,
+        lpBinaryPathName: *const u16,
+        lpLoadOrderGroup: *const u16,
+        lpdwTagId: *mut u32,
+        lpDependencies: *const u16,
+        lpServiceStartName: *const u16,
+        lpPassword: *const u16,
+        lpDisplayName: *const u16,
+    ) -> BOOL;
+    fn GetCurrentProcess() -> HANDLE;
     fn OpenProcessToken(
         ProcessHandle: HANDLE,
         DesiredAccess: u32,
@@ -1015,6 +1034,14 @@ pub fn start_mode_name(t: u32) -> &'static str {
     }
 }
 
+/// 单个服务当前的启动类型（`Auto` / `Manual` / `Disabled`…）。服务不存在时 None。
+pub fn service_start_mode(name: &str) -> Option<String> {
+    let scm = open_scm()?;
+    let svc = open_service(scm.0, name, SERVICE_QUERY_CONFIG)?;
+    let cfg = query_service_config(svc.0)?;
+    Some(start_mode_name(cfg.start_type).to_string())
+}
+
 pub fn stop_service(name: &str) -> Result<(), String> {
     let scm = match open_scm() {
         Some(s) => s,
@@ -1053,6 +1080,77 @@ pub fn start_service(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 当前进程是否已提权（UAC 提升过）。
+///
+/// 采集口径依赖这个：没有提权就拿不到别的账户进程的内存，
+/// 出来的基准里会有一堆 `工作集=未知`，那种快照不能用来做对比。
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elev: u32 = 0;
+        let mut len: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_ELEVATION_CLASS,
+            &mut elev as *mut u32 as *mut c_void,
+            4,
+            &mut len,
+        );
+        CloseHandle(token);
+        ok != 0 && elev != 0
+    }
+}
+
+/// 改服务的启动类型。要"下次开机别再起来"，这是唯一真的办法——
+/// 只 `ControlService(STOP)` 的话重启就回来了。
+pub fn set_service_start_mode(name: &str, start_type: u32) -> Result<(), String> {
+    let scm = match open_scm() {
+        Some(s) => s,
+        None => return Err(format!("打不开服务管理器，错误码 {}", last_error())),
+    };
+    let svc = match open_service(scm.0, name, SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG) {
+        Some(s) => s,
+        None => return Err(format!("打不开服务，错误码 {}", last_error())),
+    };
+    let ok = unsafe {
+        ChangeServiceConfigW(
+            svc.0,
+            SERVICE_NO_CHANGE,
+            start_type,
+            SERVICE_NO_CHANGE,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        let err = last_error();
+        // 5 = ERROR_ACCESS_DENIED：没提权改不动服务配置
+        if err == 5 {
+            return Err("拒绝访问：需要以管理员身份运行".to_string());
+        }
+        return Err(format!("修改启动类型失败，错误码 {}", err));
+    }
+    Ok(())
+}
+
+/// 禁止开机自启（`start= disabled`）
+pub fn disable_service_start(name: &str) -> Result<(), String> {
+    set_service_start_mode(name, START_TYPE_DISABLED)
+}
+
+/// 恢复成手动启动，作为「撤销禁用」的安全落点
+pub fn enable_service_start(name: &str) -> Result<(), String> {
+    set_service_start_mode(name, START_TYPE_MANUAL)
+}
+
 pub fn service_status(svc: HANDLE) -> Option<SERVICE_STATUS_PROCESS> {    let mut buf = [0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
     let mut needed: u32 = 0;
     let ok = unsafe {
@@ -1072,12 +1170,12 @@ pub fn service_status(svc: HANDLE) -> Option<SERVICE_STATUS_PROCESS> {    let mu
 
 // ---------------- 权限 / 自身保护 / 外壳 ----------------
 
+/// 是否以管理员权限运行。
+///
+/// 直接读令牌的提权标志，不用 `IsUserAnAdmin`：那个在 UAC 过滤令牌下的行为
+/// 更容易误判，而「能不能读别的进程内存」完全由提权状态决定。
 pub fn is_admin() -> bool {
-    #[link(name = "shell32")]
-    extern "system" {
-        fn IsUserAnAdmin() -> BOOL;
-    }
-    unsafe { IsUserAnAdmin() != 0 }
+    is_elevated()
 }
 
 /// 把当前控制台切到 UTF-8，否则中文在 cmd/老版 PowerShell 里会花屏

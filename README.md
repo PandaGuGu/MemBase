@@ -14,8 +14,33 @@ Windows 开机久了，内存被谁吃了、桌面图标被谁弄乱了？MemBas
 | 功能 | 说明 |
 |---|---|
 | 开机内存基准线 | 开机第 N 秒由 SYSTEM 计划任务采集快照；之后随时对比，列出基准之外的进程与服务 |
+| 基线瘦身 | 以基准为输入，找出「开机就有、但根本不需要」的服务：禁用自启 / 卸载 Store 应用，下次开机生效 |
 | 桌面图标布局 | 保存 / 对比 / 恢复图标位置，带真实预览、差异条和当前位置叠加 |
 | 息屏 | 全屏纯黑，ESC / 空格 / 回车 / 任意键退出；时长精确到秒；默认不动显示器电源 |
+
+## 瘦身：让开机基线本身变小
+
+`trim` 关的是「基准里没有、现在却在跑」的线外项，当场见效；
+`slim` 关的是「基准里就有、但开机不需要」的服务，**改的是下一次开机的起点**。两者方向相反，别混。
+
+同一台 16 GB 机器，开机第 30 秒实测：
+
+| | 瘦身前 | 瘦身后 |
+|---|---:|---:|
+| 已用物理内存 | 3710 MB | **3449 MB** |
+| 进程工作集合计 | 3011 MB | 2748 MB |
+| 进程 / 线程 | 100 / 1830 | 92 / 1640 |
+| 运行中服务 | 86 | 82 |
+
+一条 `slim --execute --yes` 卸掉 Store 版电脑管家（141 MB）、禁用 Office 与模拟器的自启服务（66 MB），
+另有运行中被连带清掉的崩溃上报进程。
+
+- 动作只有两种：`disable-service`（改服务启动类型）与 `uninstall-appx`
+  （路径落在 `\WindowsApps\` 下的按包名卸载——只禁服务会被重新挂起来）
+- 默认只给第三方与 Store 应用；`--include-caution` 才带上 Windows 目录下的组件，
+  那里面 `iphlpsvc` / `IKEEXT` / `nsi` 禁了会断网，必须逐条判断
+- 合计按宿主 PID 去重：同一个 svchost 上挂 10 个服务只有一份内存，相加是假账
+- 基准是历史快照，已禁用/已卸载的项会自动跳过，重复执行不会反复建议同一批
 
 ## 界面
 
@@ -65,6 +90,8 @@ Windows 开机久了，内存被谁吃了、桌面图标被谁弄乱了？MemBas
 deskkit status
 deskkit list
 deskkit trim --execute --yes
+deskkit slim --execute --yes      # 基准内部瘦身：禁用自启服务 / 卸载 Store 应用
+deskkit svc disable ClickToRunSvc --execute
 deskkit baseline capture
 deskkit install --at 60
 
@@ -82,7 +109,8 @@ deskkit screen status
 ```
 
 - 所有命令支持 `--json`；`deskkit commands --json` 会导出完整的「界面动作 → 命令」表
-- 危险动作默认只报计划：`trim` / `layout restore` / `layout repair` / `layout delete` 需要 `--execute`，删除类还要 `--yes`
+- 危险动作默认只报计划：`trim` / `slim` / `layout restore` / `layout repair` / `layout delete` 需要 `--execute`，删除类还要 `--yes`
+- `trim` 关的是「基准里没有、现在却在跑」的线外项，当场见效；`slim` 关的是「基准里就有、但开机不需要」的服务，**下次开机**才反映到基准上
 - 退出码：`0` 成功 / `1` 参数 / `2` 没有基准或布局 / `3` 读写 / `4` 动作失败 / `5` 被拒绝
 
 ![命令行页](docs/screenshots/cli.png)
@@ -114,7 +142,7 @@ cargo build --workspace --release
 # target\release\MemBase.exe   界面（带参数即命令行）
 # target\release\deskkit.exe    控制台版
 
-cargo test -p deskkit-core    # 42 个纯逻辑测试
+cargo test -p deskkit-core    # 45 个纯逻辑测试
 cargo test -p deskkit-win     # 11 个平台层测试（1 个需真实桌面会话的用例默认忽略）
 python tools/verify.py        # 99 项端到端验收
 ```
@@ -129,6 +157,8 @@ python tools/verify.py        # 99 项端到端验收
 - shell 接口不可用时恢复只改内存，重启可能被系统覆盖
 - 在别的分辨率或缩放下保存的布局，坐标可能被网格吸附
 - 动态壁纸的预览取到的是当前帧
+- 未提权采集时大量进程内存读不到，这类基准只能看名单、不能比内存（`system.json` 的 `Elevated` 会标出来）
+- 剩余待办与「明确不做」的项见 [docs/ROADMAP.md](docs/ROADMAP.md)
 
 ## License
 

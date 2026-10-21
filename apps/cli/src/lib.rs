@@ -760,8 +760,9 @@ fn live_now() -> LiveData {
         .map(|p| core::LiveProc {
             name: p.name.clone(),
             pid: p.pid,
-            ws_mb: p.ws_mb,
-            priv_mb: p.priv_mb,
+            ws_mb: p.ws_mb.unwrap_or(0.0),
+            priv_mb: p.priv_mb.unwrap_or(0.0),
+            unknown: if p.ws_mb.is_none() { 1 } else { 0 },
             path: p.path.clone(),
             created: p.created,
         })
@@ -1279,8 +1280,9 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("list", "列出线外进程/服务（只读）", "--all --min-mb --only --exclude --include-caution", "windows"),
     ("plan", "只生成线外计划，不执行", "--min-mb --only --exclude --include-caution --to FILE", "windows"),
     ("trim", "恢复基准：先礼后兵地关掉线外项", "--execute --yes --include-caution --max --min-mb --only --exclude --plan-out --grace-wait --force --no-force", "windows"),
+    ("slim", "基线瘦身：砍掉基准里开机就不需要的服务（禁用 / 卸载 Store 应用）", "--min-mb --include-caution --only --exclude --execute --yes", "windows"),
     ("kill", "原子操作：终止指定进程（名字或 PID）", "<name|pid> --execute --out --grace-wait --force --no-force", "windows"),
-    ("svc", "原子操作：停止/启动单个服务", "stop|start <service> --execute", "windows"),
+    ("svc", "原子操作：停止/启动/禁止自启单个服务", "stop|start|disable|enable <service> --execute", "windows"),
     ("protect", "保护名单（勾选保护 = 永不处理）", "list|add|remove|clear [名字...]", "windows"),
     ("collect", "采集一次快照", "--out --at --include-self --self-destruct --task", "windows"),
     ("compare", "和最近一次基准做 diff", "--min-mb --exclude", "windows"),
@@ -1424,13 +1426,13 @@ fn cmd_kill(args: &[String]) {
         if json {
             let arr: Vec<String> = hits
                 .iter()
-                .map(|p| format!("{{\"pid\":{},\"name\":{},\"mem_mb\":{:.1},\"path\":{}}}", p.pid, jstr(&p.name), p.ws_mb, jstr(&p.path)))
+                .map(|p| format!("{{\"pid\":{},\"name\":{},\"mem_mb\":{:.1},\"path\":{}}}", p.pid, jstr(&p.name), p.ws_mb.unwrap_or(0.0), jstr(&p.path)))
                 .collect();
             println!("{{\"mode\":\"dry_run\",\"target\":{},\"count\":{},\"items\":[{}]}}", jstr(&target), hits.len(), arr.join(","));
         } else {
             println!("[dry-run] 将终止 {} 个进程（加 --execute 才执行）", hits.len());
             for p in &hits {
-                println!("  pid {:<7} {:<24} {:>7.1} MB  {}", p.pid, p.name, p.ws_mb, p.path);
+                println!("  pid {:<7} {:<24} {:>7.1} MB  {}", p.pid, p.name, p.ws_mb.unwrap_or(0.0), p.path);
             }
         }
         return;
@@ -1483,20 +1485,29 @@ fn cmd_svc(args: &[String]) {
     let execute = has_flag(args, "--execute");
     let pos = positionals(args, &["--out"]);
     if pos.len() < 2 {
-        eprintln!("用法: deskkit svc <stop|start> <服务名> [--execute] [--json]");
+        eprintln!("用法: deskkit svc <stop|start|disable|enable> <服务名> [--execute] [--json]");
+        eprintln!("  disable = start=disabled，下次开机不再起来（只 stop 的话重启就回来了）");
+        eprintln!("  enable  = 恢复成手动启动（不会自动拉起）");
         std::process::exit(EXIT_USAGE);
     }
     let action = pos[0].to_lowercase();
     let name = pos[1].clone();
-    if action != "stop" && action != "start" {
-        eprintln!("动作只支持 stop / start");
+    if !matches!(action.as_str(), "stop" | "start" | "disable" | "enable") {
+        eprintln!("动作只支持 stop / start / disable / enable");
         std::process::exit(EXIT_USAGE);
     }
-    if action == "stop" && core::tier_for(Kind::Service, &name, "") == Tier::Blocked {
+    let mutating = action != "start" && action != "enable";
+    if mutating && core::tier_for(Kind::Service, &name, "") == Tier::Blocked {
         eprintln!("[!] 拒绝：{} 属于关键系统服务", name);
         std::process::exit(EXIT_REFUSED);
     }
     if !execute {
+        let verb = match action.as_str() {
+            "stop" => "停止",
+            "start" => "启动",
+            "disable" => "禁止开机自启",
+            _ => "恢复为手动启动",
+        };
         if json {
             println!(
                 "{{\"mode\":\"dry_run\",\"action\":{},\"service\":{}}}",
@@ -1504,21 +1515,28 @@ fn cmd_svc(args: &[String]) {
                 jstr(&name)
             );
         } else {
-            println!("[dry-run] 将 {} 服务 {}（加 --execute 才执行）", if action == "stop" { "停止" } else { "启动" }, name);
+            println!("[dry-run] 将{}服务 {}（加 --execute 才执行）", verb, name);
         }
         return;
     }
-    let r = if action == "stop" {
-        win::stop_service(&name)
-    } else {
-        win::start_service(&name)
+    let r = match action.as_str() {
+        "stop" => win::stop_service(&name),
+        "start" => win::start_service(&name),
+        "disable" => win::disable_service_start(&name),
+        _ => win::enable_service_start(&name),
     };
     match r {
         Ok(()) => {
+            let verb = match action.as_str() {
+                "stop" => "已停止",
+                "start" => "已启动",
+                "disable" => "已禁止开机自启",
+                _ => "已恢复为手动启动",
+            };
             if json {
                 println!("{{\"ok\":true,\"action\":{},\"service\":{}}}", jstr(&action), jstr(&name));
             } else {
-                println!("已{}：{}", if action == "stop" { "停止" } else { "启动" }, name);
+                println!("{}：{}", verb, name);
             }
         }
         Err(e) => {
@@ -1529,6 +1547,182 @@ fn cmd_svc(args: &[String]) {
             }
             std::process::exit(EXIT_ACTION_FAILED);
         }
+    }
+}
+
+/// `deskkit slim`：以开机基准为输入，列出「开机就有、但根本不需要」的服务。
+///
+/// 和 `trim` 是反的：`trim` 关掉「基准里没有、现在却在跑」的线外项；
+/// `slim` 动的是基准本身——它改的是**下一次开机的起点**，不是这一秒的占用。
+#[cfg(windows)]
+fn cmd_slim(args: &[String]) {
+    let root = root_arg(args);
+    let json = want_json(args);
+    let execute = has_flag(args, "--execute");
+    let yes = has_flag(args, "--yes");
+    let include_caution = has_flag(args, "--include-caution");
+    let min_mb = num_arg(args, "--min-mb", 5.0);
+
+    let base = match load_baseline(&root) {
+        Ok(b) => b,
+        Err(code) => std::process::exit(code),
+    };
+    let svc_text = fs::read_to_string(base.dir.join("services.csv")).unwrap_or_default();
+    let rows = core::parse_service_rows(&svc_text);
+    let mut items = core::build_trim_plan(&rows, min_mb, include_caution);
+
+    let only = list_arg(args, "--only");
+    let exclude = list_arg(args, "--exclude");
+    if !only.is_empty() {
+        items.retain(|it| only.iter().any(|n| core::wildcard_match(&it.name, n)));
+    }
+    if !exclude.is_empty() {
+        items.retain(|it| !exclude.iter().any(|n| core::wildcard_match(&it.name, n)));
+    }
+
+    // 基准是历史快照：已经禁用/已卸载的项要跳过，否则每次跑都会重复建议同一批
+    let before = items.len();
+    items.retain(|it| match win::service_start_mode(&it.name) {
+        Some(m) => m != "Disabled",
+        None => false,
+    });
+    let already = before - items.len();
+    let savings = core::trim_savings(&items);
+
+    if json {
+        let arr: Vec<String> = items
+            .iter()
+            .map(|it| {
+                format!(
+                    "{{\"name\":{},\"display\":{},\"action\":{},\"package\":{},\"mem_mb\":{:.1},\"tier\":{},\"start_mode\":{},\"path\":{},\"reason\":{}}}",
+                    jstr(&it.name),
+                    jstr(&it.display),
+                    jstr(it.action.key()),
+                    it.appx.as_deref().map(jstr).unwrap_or_else(|| "null".into()),
+                    it.mem_mb,
+                    jstr(core::tier_name(it.tier)),
+                    jstr(&it.start_mode),
+                    jstr(&it.path),
+                    jstr(&it.reason)
+                )
+            })
+            .collect();
+        println!(
+            "{{\"mode\":\"{}\",\"baseline\":{},\"count\":{},\"savings_mb\":{:.1},\"items\":[{}]}}",
+            if execute { "execute" } else { "dry_run" },
+            jstr(&base.captured),
+            items.len(),
+            savings,
+            arr.join(",")
+        );
+        if !execute {
+            return;
+        }
+    } else {
+        println!("[..] 基准：{}（{} 采集）", base.dir.display(), base.captured);
+        if items.is_empty() {
+            println!("基准里没有值得砍的自启服务（阈值 {:.0} MB）", min_mb);
+            return;
+        }
+        println!(
+            "共 {} 项，预计开机少占 {:.0} MB（同一宿主只算一次）\n",
+            items.len(),
+            savings
+        );
+        println!(
+            "  {:<12} {:>9}  {:<30} {:<7} {}",
+            "动作", "内存", "服务名", "启动", "说明"
+        );
+        for it in &items {
+            println!(
+                "  {:<12} {:>7.1} MB  {:<30} {:<7} {}",
+                it.action.label(),
+                it.mem_mb,
+                elide_cli(&it.name, 30),
+                it.start_mode,
+                elide_cli(&it.reason, 60)
+            );
+        }
+        println!();
+        if !include_caution {
+            println!("（Windows 目录下的系统组件默认不列，加 --include-caution 查看）");
+        }
+        if already > 0 {
+            println!("（另有 {} 项已经禁用或已卸载，跳过）", already);
+        }
+        if !execute {
+            println!("加 --execute --yes 真正执行；卸载类可用 --exclude 跳过。");
+            return;
+        }
+        if !yes {
+            println!("拒绝执行：--execute 需要同时给 --yes（这一步会改服务配置 / 卸载应用）");
+            std::process::exit(EXIT_REFUSED);
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for it in &items {
+        let r = match it.action {
+            core::TrimAction::DisableService => win::disable_service_start(&it.name),
+            core::TrimAction::UninstallAppx => {
+                remove_appx(it.appx.as_deref().unwrap_or_default())
+            }
+        };
+        match r {
+            Ok(()) => {
+                ok += 1;
+                if !json {
+                    println!("  ✓ {} {}", it.action.label(), it.name);
+                }
+            }
+            Err(e) => {
+                fail += 1;
+                if !json {
+                    println!("  ✗ {} {}：{}", it.action.label(), it.name, e);
+                }
+            }
+        }
+    }
+    if !json {
+        println!("\n完成：成功 {}，失败 {}。这些改动在**下次开机**才反映到基准上。", ok, fail);
+    }
+}
+
+/// 卸载 Store 应用：`Remove-AppxPackage -Package <包全名>`
+#[cfg(windows)]
+fn remove_appx(full_name: &str) -> Result<(), String> {
+    if full_name.is_empty()
+        || !full_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(format!("包名不合法: {}", full_name));
+    }
+    let script = format!("Remove-AppxPackage -Package '{}'", full_name);
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .map_err(|e| format!("调 powershell 失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if msg.is_empty() {
+            "Remove-AppxPackage 返回非 0".to_string()
+        } else {
+            msg
+        })
+    }
+}
+
+#[cfg(windows)]
+fn elide_cli(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", chars[..max.saturating_sub(1)].iter().collect::<String>())
     }
 }
 
@@ -1802,6 +1996,7 @@ fn cmd_compare(args: &[String]) {
         e.instances += 1;
         e.ws_mb += p.ws_mb;
         e.priv_mb += p.priv_mb;
+        e.unknown += p.unknown;
     }
     let diffs = core::diff_procs(&base.procs, &agg);
     let mut items: Vec<String> = Vec::new();
@@ -1825,6 +2020,7 @@ fn cmd_compare(args: &[String]) {
                 core::DeltaKind::Up => "up",
                 core::DeltaKind::Down => "down",
                 core::DeltaKind::Same => "same",
+                core::DeltaKind::Unknown => "unknown",
             }),
             d.base_ws,
             d.live_ws,
@@ -1954,6 +2150,7 @@ fn dispatch(cmd: &str, rest: &[String]) {
         "list" | "ls" => cmd_list(rest),
         "plan" => cmd_plan(rest),
         "trim" | "restore" => cmd_trim(rest),
+        "slim" => cmd_slim(rest),
         "kill" => cmd_kill(rest),
         "svc" => cmd_svc(rest),
         "commands" => cmd_commands(rest),

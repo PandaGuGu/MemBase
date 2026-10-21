@@ -212,6 +212,8 @@ struct App {
     status: String,
     search: String,
     include_caution: bool,
+    /// 执行时顺带把服务设成「禁止开机自启」（只 stop 的话重启就回来了）
+    svc_disable: bool,
     confirm: bool,
     confirm_capture: bool,
     confirm_boot: bool,
@@ -420,6 +422,7 @@ impl App {
             status: String::new(),
             search: String::new(),
             include_caution: false,
+            svc_disable: false,
             confirm: false,
             confirm_capture: false,
             confirm_boot: false,
@@ -594,8 +597,9 @@ impl App {
             .map(|p| core::LiveProc {
                 name: p.name.clone(),
                 pid: p.pid,
-                ws_mb: p.ws_mb,
-                priv_mb: p.priv_mb,
+                ws_mb: p.ws_mb.unwrap_or(0.0),
+                priv_mb: p.priv_mb.unwrap_or(0.0),
+                unknown: if p.ws_mb.is_none() { 1 } else { 0 },
                 path: p.path.clone(),
                 created: p.created,
             })
@@ -777,6 +781,7 @@ impl App {
         let reports = close::close_groups(&views, close::CloseOptions::default(), &protected);
         let mut graceful = 0usize;
         let mut forced = 0usize;
+        let mut disabled = 0usize;
         for (i, rep) in reports.iter().enumerate() {
             if rep.done() {
                 ok += 1;
@@ -798,12 +803,27 @@ impl App {
                     details.push(format!("{}: {}", name, e));
                 }
             }
+            // 「去掉」而不是「停一下」：只 ControlService(STOP) 的话，开机又全回来了
+            if self.svc_disable {
+                match win::disable_service_start(name) {
+                    Ok(()) => disabled += 1,
+                    Err(e) => {
+                        fail += 1;
+                        details.push(format!("{} 禁止自启: {}", name, e));
+                    }
+                }
+            }
         }
 
         self.confirm = false;
         self.status = format!(
-            "已执行：成功 {} 项，失败 {} 项（礼貌关闭 {} 个实例，强制 {} 个）",
-            ok, fail, graceful, forced
+            "已执行：成功 {} 项，失败 {} 项（礼貌关闭 {} 个实例，强制 {} 个）{}",
+            ok, fail, graceful, forced,
+            if disabled > 0 {
+                format!("，其中 {} 个服务已禁止开机自启（可用 svc enable 撤销）", disabled)
+            } else {
+                String::new()
+            }
         );
         if let Some(first) = details.first() {
             self.status.push_str(&format!("（{}）", first));
@@ -847,17 +867,26 @@ impl App {
 
     /// 扫描当前状态，直接立成新基准（不用重启、不用等开机 60 秒）
     fn capture_now(&mut self) {        let snap = snapshot::snapshot_now(true);
+        let unknown = snap.procs.iter().filter(|p| p.ws_mb.is_none()).count();
         let run_dir = snapshot::new_run_dir(&self.root);
         let sub = run_dir.join("now");
         match snapshot::write_snapshot(&sub, &snap) {
             Ok(()) => {
-                self.status = format!(
-                    "已把当前状态设为基准：{} 进程 / {} MB / 占用率 {}% · 采集耗时 {}",
-                    snap.procs.len(),
-                    snap.used_phys_mb,
-                    snap.load_pct,
-                    fmt_dur(snap.collect_ms)
-                );
+                self.status = if unknown > 0 {
+                    format!(
+                        "⚠ 已设为基准，但有 {} 个进程的内存没读到（未提权），这份基准不能用来对比和瘦身。\
+                         请以管理员身份重新启动本程序后再采一次。",
+                        unknown
+                    )
+                } else {
+                    format!(
+                        "已把当前状态设为基准：{} 进程 / {} MB / 占用率 {}% · 采集耗时 {}",
+                        snap.procs.len(),
+                        snap.used_phys_mb,
+                        snap.load_pct,
+                        fmt_dur(snap.collect_ms)
+                    )
+                };
                 self.reload();
             }
             Err(e) => self.status = format!("设基准失败：{e}"),
@@ -3759,6 +3788,20 @@ impl eframe::App for App {
                             .color(pal().accent),
                     )
                     .on_hover_text(cli);
+                    let has_svc = self.rows.iter().any(|r| {
+                        r.pick && r.kind == Kind::Service && can_pick(r, self.include_caution)
+                    });
+                    if has_svc || self.svc_disable {
+                        ui.add_space(6.0);
+                        ui.checkbox(
+                            &mut self.svc_disable,
+                            "服务同时禁止开机自启（下次开机不再拉起）",
+                        )
+                        .on_hover_text(
+                            "勾上 = 除了停止，还把启动类型改成 disabled，下次开机不再起来；\
+                             不勾 = 只停这一次，重启后照旧",
+                        );
+                    }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui

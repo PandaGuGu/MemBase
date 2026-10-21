@@ -304,7 +304,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deskkit-cli"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "deskkit-core"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "deskkit-ui"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "deskkit-cli",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "deskkit-win"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",

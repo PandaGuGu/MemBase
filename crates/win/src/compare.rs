@@ -1,7 +1,7 @@
 //! 对比：当前实时快照 vs 最近一次基准快照
 
 use crate::snapshot::{self, Snapshot};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -123,14 +123,20 @@ pub fn compare(root: &Path, min_mb: f64, excludes: &[String], exclude_self: bool
         col(bh, "PrivateMB"),
     );
     let mut base: BTreeMap<String, (u32, f64, f64)> = BTreeMap::new();
+    // 内存没读到的项（未提权采集 / 受保护进程）：这类项的涨跌无从判断
+    let mut base_blind: BTreeSet<String> = BTreeSet::new();
     for r in base_rows.iter().skip(1) {
         if let (Some(a), Some(b), Some(c), Some(d)) = (i_name, i_inst, i_ws, i_priv) {
             let name = r.get(a).cloned().unwrap_or_default();
+            let ws_cell = r.get(c).map(|s| s.trim().to_string()).unwrap_or_default();
+            if ws_cell.is_empty() {
+                base_blind.insert(name.clone());
+            }
             base.insert(
                 name,
                 (
                     r.get(b).and_then(|v| v.parse().ok()).unwrap_or(0),
-                    r.get(c).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                    ws_cell.parse().unwrap_or(0.0),
                     r.get(d).and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 ),
             );
@@ -152,19 +158,55 @@ pub fn compare(root: &Path, min_mb: f64, excludes: &[String], exclude_self: bool
         }
     }
 
+    // 老快照的坑：未提权采集时内存被写成了 0.00，而不是留空。
+    // 判据是「工作集 0 但线程数非 0」——真占 0 内存的进程不会有活着的线程。
+    // 命中就按「内存未知」处理，别让它冒充成「暴跌几百 MB」。
+    let probe = read_csv(&base_dir.join("processes.csv"));
+    if !probe.is_empty() {
+        let h = &probe[0];
+        if let (Some(a), Some(w), Some(t)) = (
+            col(h, "ProcessName"),
+            col(h, "WorkingSetMB"),
+            col(h, "Threads"),
+        ) {
+            for r in probe.iter().skip(1) {
+                let zero_ws = r
+                    .get(w)
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|v| v == 0.0)
+                    .unwrap_or(false);
+                let threads = r.get(t).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                if zero_ws && threads > 0 {
+                    if let Some(n) = r.get(a) {
+                        base_blind.insert(n.clone());
+                    }
+                }
+            }
+        }
+    }
+
     println!("[..] 采集当前实时快照");
     let live: Snapshot = snapshot::snapshot_now(exclude_self);
     let mut live_agg: BTreeMap<String, (u32, f64, f64)> = BTreeMap::new();
+    let mut live_blind: BTreeSet<String> = BTreeSet::new();
     for p in &live.procs {
         let e = live_agg
             .entry(p.name.clone())
             .or_insert((0u32, 0.0f64, 0.0f64));
         e.0 += 1;
-        e.1 += p.ws_mb;
-        e.2 += p.priv_mb;
+        match p.ws_mb {
+            Some(v) => e.1 += v,
+            None => {
+                live_blind.insert(p.name.clone());
+            }
+        }
+        if let Some(v) = p.priv_mb {
+            e.2 += v;
+        }
     }
 
     let mut diffs: Vec<ProcDiff> = Vec::new();
+    let mut blind: Vec<String> = Vec::new();
     let mut names: Vec<String> = base.keys().cloned().collect();
     for k in live_agg.keys() {
         if !base.contains_key(k) {
@@ -175,6 +217,11 @@ pub fn compare(root: &Path, min_mb: f64, excludes: &[String], exclude_self: bool
         let b = base.get(&n).copied().unwrap_or((0, 0.0, 0.0));
         let l = live_agg.get(&n).copied().unwrap_or((0, 0.0, 0.0));
         let delta = l.1 - b.1;
+        // 两边都在、但有一边的内存没读到：涨跌算不出来，单独记下来，别冒充「减少」
+        if b.0 > 0 && l.0 > 0 && (base_blind.contains(&n) || live_blind.contains(&n)) {
+            blind.push(n);
+            continue;
+        }
         let pct = if b.1 > 0.0 {
             Some((delta / b.1 * 1000.0).round() / 10.0)
         } else {
@@ -210,7 +257,7 @@ pub fn compare(root: &Path, min_mb: f64, excludes: &[String], exclude_self: bool
     }
     diffs.sort_by(|a, b| b.delta.partial_cmp(&a.delta).unwrap_or(std::cmp::Ordering::Equal));
 
-    let live_priv: f64 = live.procs.iter().map(|p| p.priv_mb).sum();
+    let live_priv: f64 = live.procs.iter().filter_map(|p| p.priv_mb).sum();
     let live_threads: u32 = live.procs.iter().map(|p| p.threads).sum();
     let live_handles: u32 = live.procs.iter().map(|p| p.handles).sum();
 
@@ -338,6 +385,20 @@ pub fn compare(root: &Path, min_mb: f64, excludes: &[String], exclude_self: bool
         println!("---- 服务状态变化：{} 项 ----", svc_changes.len());
         for (n, c, m) in svc_changes.iter().take(12) {
             println!("  {:<32} {:<22} 启动方式={}", n, c, m);
+        }
+        println!();
+    }
+
+    if !blind.is_empty() {
+        println!(
+            "---- 内存不可比：{} 项（有一侧没读到内存，多为未提权采集或受保护进程）----",
+            blind.len()
+        );
+        for n in blind.iter().take(8) {
+            println!("  {}", n);
+        }
+        if blind.len() > 8 {
+            println!("  …… 另有 {} 项", blind.len() - 8);
         }
         println!();
     }

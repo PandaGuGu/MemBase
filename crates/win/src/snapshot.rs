@@ -12,8 +12,10 @@ pub struct ProcRow {
     pub pid: u32,
     pub ppid: u32,
     pub session: u32,
-    pub ws_mb: f64,
-    pub priv_mb: f64,
+    /// `None` = 没权限读到（未提权时别的账户的进程基本都是 None），
+    /// 和「真的是 0 MB」必须区分开：写 0 会让 diff 报出"内存暴跌"的假结论。
+    pub ws_mb: Option<f64>,
+    pub priv_mb: Option<f64>,
     pub paged_sys_mb: f64,
     pub peak_ws_mb: f64,
     pub virtual_mb: f64,
@@ -58,6 +60,8 @@ pub struct Snapshot {
     pub os_caption: String,
     pub os_version: String,
     pub os_build: String,
+    /// 采集时是否已提权。未提权时大部分进程的内存是 `None`，基准不可用于对比。
+    pub elevated: bool,
     /// 枚举进程/服务本身花了多少毫秒（不含落盘）
     pub collect_ms: u64,
     pub procs: Vec<ProcRow>,
@@ -97,8 +101,8 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
         let mut start_time = String::new();
         let mut created = 0u64;
         let mut handles = 0u32;
-        let mut ws_mb = 0.0f64;
-        let mut priv_mb = 0.0f64;
+        let mut ws_mb: Option<f64> = None;
+        let mut priv_mb: Option<f64> = None;
         let mut peak_ws_mb = 0.0f64;
         let mut paged_sys_mb = 0.0f64;
         let mut virtual_mb = 0.0f64;
@@ -116,8 +120,8 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             user = win::process_user(h.0);
             cpu_seconds = win::process_cpu_seconds(h.0);
             if let Some(pmc) = win::process_memory(h.0) {
-                ws_mb = mb(pmc.WorkingSetSize as u64);
-                priv_mb = mb(pmc.PrivateUsage as u64);
+                ws_mb = Some(mb(pmc.WorkingSetSize as u64));
+                priv_mb = Some(mb(pmc.PrivateUsage as u64));
                 peak_ws_mb = mb(pmc.PeakWorkingSetSize as u64);
                 paged_sys_mb = mb(pmc.QuotaPagedPoolUsage as u64);
                 virtual_mb = mb(pmc.PagefileUsage as u64);
@@ -151,10 +155,16 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
             path,
         });
     }
-    procs.sort_by(|a, b| b.ws_mb.partial_cmp(&a.ws_mb).unwrap_or(std::cmp::Ordering::Equal));
+    // 读不到内存的排在最后（用 -1 当哨兵，别让它插到 Top 里去）
+    procs.sort_by(|a, b| {
+        b.ws_mb
+            .unwrap_or(-1.0)
+            .partial_cmp(&a.ws_mb.unwrap_or(-1.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // pid -> (进程名, 工作集, 专用)
-    let mut pid_map: BTreeMap<u32, (String, f64, f64)> = BTreeMap::new();
+    let mut pid_map: BTreeMap<u32, (String, Option<f64>, Option<f64>)> = BTreeMap::new();
     for p in &procs {
         pid_map.insert(p.pid, (p.name.clone(), p.ws_mb, p.priv_mb));
     }
@@ -174,7 +184,7 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
                 }
             }
             let (host, host_ws, host_priv) = match pid_map.get(&e.pid) {
-                Some((n, w, p)) => (n.clone(), Some(*w), Some(*p)),
+                Some((n, w, p)) => (n.clone(), *w, *p),
                 None => (String::new(), None, None),
             };
             svcs.push(SvcRow {
@@ -218,9 +228,26 @@ pub fn snapshot_now(exclude_self: bool) -> Snapshot {
         os_caption: os.caption,
         os_version: os.version,
         os_build: os.build,
+        elevated: win::is_elevated(),
         collect_ms: started.elapsed().as_millis() as u64,
         procs,
         svcs,
+    }
+}
+
+/// 未知内存写空字段：CSV 里「空」= 没读到，「0.00」= 真的是 0
+fn opt_mb(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.2}", x),
+        None => String::new(),
+    }
+}
+
+/// 表格里未知的写成「—」，别让读者以为是 0
+fn opt_mb_or_dash(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.2}", x),
+        None => "—".to_string(),
     }
 }
 
@@ -265,6 +292,8 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         ("LastBootTime".into(), jstr(&snap.boot_time)),
         ("UptimeSeconds".into(), snap.uptime_s.to_string()),
         ("CollectMs".into(), snap.collect_ms.to_string()),
+        ("Elevated".into(), snap.elevated.to_string()),
+        ("Build".into(), jstr(&deskkit_core::build_id())),
         ("ComputerName".into(), jstr(&snap.computer)),
         ("OsCaption".into(), jstr(&snap.os_caption)),
         ("OsVersion".into(), jstr(&snap.os_version)),
@@ -300,13 +329,13 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     );
     for p in &snap.procs {
         c.push_str(&format!(
-            "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{}\r\n",
+            "{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{}\r\n",
             csv_escape(&snap.captured_local),
             csv_escape(&p.name),
             p.pid,
             p.session,
-            p.ws_mb,
-            p.priv_mb,
+            opt_mb(p.ws_mb),
+            opt_mb(p.priv_mb),
             p.paged_sys_mb,
             p.peak_ws_mb,
             p.virtual_mb,
@@ -322,29 +351,37 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     write_text(&dir.join("processes.csv"), &c)?;
 
     // ---- processes_by_name.csv ----
-    let mut agg: BTreeMap<String, (u32, f64, f64)> = BTreeMap::new();
+    // 末列 UnknownInstances：这一组里有几个实例没读到内存（权限不足）。
+    // 有它才算得清「合计 1200 MB」到底是全量还是残缺的合计。
+    let mut agg: BTreeMap<String, (u32, f64, f64, u32)> = BTreeMap::new();
     for p in &snap.procs {
         let e = agg
             .entry(p.name.clone())
-            .or_insert((0u32, 0.0f64, 0.0f64));
+            .or_insert((0u32, 0.0f64, 0.0f64, 0u32));
         e.0 += 1;
-        e.1 += p.ws_mb;
-        e.2 += p.priv_mb;
+        match p.ws_mb {
+            Some(v) => e.1 += v,
+            None => e.3 += 1,
+        }
+        if let Some(v) = p.priv_mb {
+            e.2 += v;
+        }
     }
-    let mut rows: Vec<(String, u32, f64, f64)> = agg
+    let mut rows: Vec<(String, u32, f64, f64, u32)> = agg
         .into_iter()
-        .map(|(k, v)| (k, v.0, (v.1 * 100.0).round() / 100.0, (v.2 * 100.0).round() / 100.0))
+        .map(|(k, v)| (k, v.0, (v.1 * 100.0).round() / 100.0, (v.2 * 100.0).round() / 100.0, v.3))
         .collect();
     rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut c = String::from("ProcessName,Instances,WorkingSetMB,PrivateMB\r\n");
-    for (name, inst, ws, priv_mb) in &rows {
+    let mut c = String::from("ProcessName,Instances,WorkingSetMB,PrivateMB,UnknownInstances\r\n");
+    for (name, inst, ws, priv_mb, unknown) in &rows {
         c.push_str(&format!(
-            "{},{},{:.2},{:.2}\r\n",
+            "{},{},{:.2},{:.2},{}\r\n",
             csv_escape(name),
             inst,
             ws,
-            priv_mb
+            priv_mb,
+            unknown
         ));
     }
     write_text(&dir.join("processes_by_name.csv"), &c)?;
@@ -380,8 +417,9 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     write_text(&dir.join("services.csv"), &c)?;
 
     // ---- summary.md ----
-    let total_ws: f64 = snap.procs.iter().map(|p| p.ws_mb).sum();
-    let total_priv: f64 = snap.procs.iter().map(|p| p.priv_mb).sum();
+    let total_ws: f64 = snap.procs.iter().filter_map(|p| p.ws_mb).sum();
+    let total_priv: f64 = snap.procs.iter().filter_map(|p| p.priv_mb).sum();
+    let unknown_mem = snap.procs.iter().filter(|p| p.ws_mb.is_none()).count();
     let total_threads: u32 = snap.procs.iter().map(|p| p.threads).sum();
     let total_handles: u32 = snap.procs.iter().map(|p| p.handles).sum();
     let running = snap.svcs.iter().filter(|s| s.state == "Running").count();
@@ -395,6 +433,16 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         snap.boot_time, snap.uptime_s
     ));
     m.push_str(&format!("- 采集耗时：{} 毫秒\n", snap.collect_ms));
+    m.push_str(&format!("- 采集程序：membase {} ({})\n", deskkit_core::VERSION, deskkit_core::build_id()));
+    m.push_str(&format!(
+        "- 采集身份：{}（{}）\n",
+        snap.user,
+        if snap.elevated {
+            "已提权"
+        } else {
+            "未提权，进程内存不完整"
+        }
+    ));
     m.push_str(&format!("- 机器：{}\n\n", snap.computer));
     m.push_str("## 整机内存\n\n| 指标 | 数值 |\n| --- | ---: |\n");
     m.push_str(&format!("| 物理内存总量 | {} MB |\n", snap.total_phys_mb));
@@ -408,24 +456,60 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     m.push_str(&format!("| 进程数 | {} |\n", snap.procs.len()));
     m.push_str(&format!("| 线程数 | {} |\n", total_threads));
     m.push_str(&format!("| 句柄数 | {} |\n", total_handles));
-    m.push_str(&format!("| 工作集合计 | {:.0} MB |\n", total_ws));
-    m.push_str(&format!("| 专用内存合计 | {:.0} MB |\n", total_priv));
+    if unknown_mem > 0 {
+        m.push_str(&format!(
+            "| 工作集合计（{} 个进程读不到） | {:.0} MB |\n",
+            unknown_mem, total_ws
+        ));
+        m.push_str(&format!(
+            "| 专用内存合计（{} 个进程读不到） | {:.0} MB |\n",
+            unknown_mem, total_priv
+        ));
+    } else {
+        m.push_str(&format!("| 工作集合计 | {:.0} MB |\n", total_ws));
+        m.push_str(&format!("| 专用内存合计 | {:.0} MB |\n", total_priv));
+    }
     m.push_str(&format!(
         "| 服务 | 运行 {} / 停止 {} / 共 {} |\n\n",
         running,
         stopped,
         snap.svcs.len()
     ));
+    if unknown_mem > 0 {
+        let (cause, tail) = if snap.elevated {
+            (
+                "受保护进程：Session 0 伪进程、反作弊等",
+                "已提权，剩余这些本来就打不开，不影响排名结论。",
+            )
+        } else {
+            (
+                "未提权，别的账户的进程打不开",
+                "合计值只算了读得到的部分——这份快照不能用来比进程内存，也不能当瘦身依据。",
+            )
+        };
+        m.push_str(&format!(
+            "> ⚠ {} 个进程读不到内存（{}）。{}\n\n",
+            unknown_mem, cause, tail
+        ));
+    }
 
-    m.push_str("## 进程名聚合 Top 25\n\n| 进程名 | 实例数 | 工作集(MB) | 专用(MB) |\n| --- | ---: | ---: | ---: |\n");
-    for (name, inst, ws, priv_mb) in rows.iter().take(25) {
-        m.push_str(&format!("| {} | {} | {:.2} | {:.2} |\n", name, inst, ws, priv_mb));
+    m.push_str("## 进程名聚合 Top 25\n\n| 进程名 | 实例数 | 工作集(MB) | 专用(MB) | 读不到 |\n| --- | ---: | ---: | ---: | ---: |\n");
+    for (name, inst, ws, priv_mb, unknown) in rows.iter().take(25) {
+        m.push_str(&format!(
+            "| {} | {} | {:.2} | {:.2} | {} |\n",
+            name, inst, ws, priv_mb, unknown
+        ));
     }
     m.push_str("\n## 单进程 Top 20\n\n| 进程名 | PID | 工作集(MB) | 专用(MB) | 线程 | 句柄 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n");
     for p in snap.procs.iter().take(20) {
         m.push_str(&format!(
-            "| {} | {} | {:.2} | {:.2} | {} | {} |\n",
-            p.name, p.pid, p.ws_mb, p.priv_mb, p.threads, p.handles
+            "| {} | {} | {} | {} | {} | {} |\n",
+            p.name,
+            p.pid,
+            opt_mb_or_dash(p.ws_mb),
+            opt_mb_or_dash(p.priv_mb),
+            p.threads,
+            p.handles
         ));
     }
     m.push_str("\n## 服务宿主进程 Top 20（同一宿主只算一次）\n\n| 宿主进程 | PID | 承载服务数 | 工作集(MB) |\n| --- | ---: | ---: | ---: |\n");

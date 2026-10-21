@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DeskKit 逐项验收：命令行每个动词 + 界面每一页 + 动作表一致性。
+"""MemBase 逐项验收：命令行每个动词 + 界面每一页 + 动作表一致性。
 
 用法：
     python tools/verify.py            # 全跑，报告写到 docs/verify-<版本>.md
@@ -536,7 +536,7 @@ def check_gui_pages():
             '%dx%d / %d 色' % (w, h, colors), ok)
         if os.path.exists(path):
             hashes[label] = hashlib.md5(open(path, 'rb').read()).hexdigest()
-            bmp2png.bmp_to_png(path, os.path.join(ROOT, 'docs', 'verify-%s.png' % (slug or 'processes')))
+            bmp2png.bmp_to_png(path, os.path.join(tempfile.gettempdir(), 'deskkit_verify_%s.png' % (slug or 'processes')))
             os.remove(path)
 
     # 七页截图必须互不相同 —— 否则说明 DESKKIT_PAGE 没生效，七张都是同一页
@@ -605,7 +605,7 @@ def write_report(version):
             groups.append(r[0])
 
     lines = []
-    lines.append('# DeskKit %s 验收报告\n' % version)
+    lines.append('# MemBase %s 验收报告\n' % version)
     lines.append('由 `tools/verify.py` 自动生成，%s\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
     lines.append('**共 %d 项，通过 %d 项，失败 %d 项。**\n' % (total, total - len(failed), len(failed)))
     if failed:

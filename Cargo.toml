@@ -2,26 +2,31 @@
 resolver = "2"
 members = ["crates/*", "apps/*"]
 # 默认构建只含可移植部分：Linux/容器里 `cargo build` 也能过；
-# GUI 是 Windows 专用，用 `cargo build --workspace` 或 `-p membase-gui` 显式构建。
+# GUI 是 Windows 专用，用 `cargo build --workspace` 或 `-p deskkit-ui` 显式构建。
 default-members = ["crates/*", "apps/cli"]
 
 [workspace.package]
-version = "0.6.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
+authors = ["PandaGuGu"]
 
 [workspace.dependencies]
-membase-core = { path = "crates/core" }
-membase-win = { path = "crates/win" }
-membase-cli = { path = "apps/cli" }
+deskkit-core = { path = "crates/core" }
+deskkit-win = { path = "crates/win" }
+deskkit-cli = { path = "apps/cli" }
 eframe = { version = "0.37.0", default-features = false, features = [
     "glow",
     "default_fonts",
 ] }
 rfd = "0.17"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
-# 和 PhotoCraft 同样的思路：库禁 unsafe，平台层单独放行
+# 和 MemBase / DeskPos 一致的思路：库禁 unsafe，平台层单独放行
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -30,7 +35,9 @@ dbg_macro = "warn"
 todo = "warn"
 
 [profile.release]
-opt-level = "z"
+# 界面里有壁纸解码、图标转码与大量矢量绘制，按体积优化（"z"）会明显拖慢这些路径；
+# 这里改为速度优先，换来的体积增长在桌面程序上可以接受。
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

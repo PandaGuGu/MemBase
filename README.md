@@ -1,278 +1,207 @@
-# MemBase
+# DeskKit
 
-**开机内存基准线工具：在「刚开机」的那一刻拍一张进程与服务快照，之后随时对比、一键关掉基准之外的东西。**
+**两件桌面杂事，一个纯 Rust 程序：开机内存基准线 + 桌面图标布局。**
 
-Boot-time memory baseline for Windows: snapshot once at boot, diff against it any time, and trim whatever wasn't there.
+开机久了内存被谁吃了？桌面图标被谁弄乱了？DeskKit 把这两个问题放进同一个窗口：
+左边导航切页，右边该干嘛干嘛。界面用的是 MemBase 那套（左侧导航 / 顶栏搜索 / 状态栏 / 浅深两色），
+桌面布局页的预览是**你桌面的真实样子**——真壁纸、真图标、真任务栏。
 
-![版本](https://img.shields.io/badge/version-0.6.0-blue)
-![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
-![语言](https://img.shields.io/badge/language-Rust-orange)
-![许可](https://img.shields.io/badge/license-MIT-green)
+**硬约束：人能点的，脚本一定能发。** 界面上的每个按钮，鼠标停上去都会写出它的等价命令，
+程序里还有一页「命令行」把 30 个动作和命令一一列出来。
 
-![界面截图](docs/screenshot-0.6.0.png)
+![桌面布局页](docs/layouts.png)
 
 ---
 
-## 它解决什么问题
+## 它是怎么来的
 
-排查「开机越来越慢 / 内存莫名被吃」时，最缺的是一个**可信的参照物**：
+| 来源 | 带来了什么 | 现在的形态 |
+|---|---|---|
+| **MemBase** | 界面骨架（egui 五页导航、调色板、表格、状态栏）、开机基准线 / 线外清单 / 先礼后兵地恢复 | `crates/core` + `crates/win` + `apps/gui`，界面**原样**作为底座 |
+| **DeskPos**（Rust / C# / Python 三端） | 桌面图标快照、差异预览、恢复、修复系统布局缓存 | 并进同一套 crate，成为「桌面布局」页与 `layout` 命令组 |
+| **DeskPos.exe**（.NET 单文件） | 那个 53 MB 的自包含 exe | 不需要了：这里是**纯 Rust**，无 .NET、无 Python、无运行时依赖 |
 
-- 任务管理器只有当下，看不到「刚开机时是什么样」
-- 想复现冷启动就得重启，一天重启八次不现实
-- 网上说的「占内存大户」跟你机器上的真实情况往往不是一回事
+融合时没有另起一套数据：**布局文件、配置、基准线全在原位**，老用户打开就能看到以前存的布局。
 
-MemBase 把「开机第 N 秒」那一刻的进程与服务完整记成**基准线**，之后任何时候拍一张实时快照做 diff —— 不用重启，也不会被「我刚开了一堆东西」干扰判断。
-
-## 三个核心概念
-
-| 概念 | 说明 |
+| 数据 | 位置 |
 |---|---|
-| **基准线（baseline）** | 一份快照目录：`system.json` + 进程表 + 服务表 + 可读报告 |
-| **线外清单（plan）** | 相对基准线多出来的进程/服务，分三档：建议 / 谨慎 / 禁止 |
-| **恢复基准（trim）** | 关掉线外项。**默认 dry-run**，必须显式 `--execute` 才动手；动手时**先礼后兵** |
-
-## 快速开始
-
-需要 Windows 10/11 + Rust 1.75 以上，或直接用 Release 里的 exe。
-
-```powershell
-# 1) 构建
-cargo build --workspace --release
-#   target\release\membase-ui.exe   界面版（带参数即命令行）
-#   target\release\membase.exe      独立命令行版（脚本 / CI 用，可选）
-
-# 2) 挂一次开机采集任务（SYSTEM 权限、无窗口），采完自动销毁任务和程序副本
-membase.exe install --at 60
-
-# 3) 之后不用等到下次开机也能对比
-membase.exe compare                 # 与基准线做 diff
-membase.exe list                    # 列出线外项（只读）
-membase.exe trim --execute --yes    # 关掉线外项，回到基线状态（先礼后兵，见下）
-
-# 4) 不想等到下次开机？直接拿当前状态当基准
-membase.exe baseline capture
-```
-
-Release 版只有一个 `MemBase.exe`：双击开界面，带参数就是命令行，语法完全一样：
-
-```powershell
-.\MemBase.exe install --at 60
-.\MemBase.exe list
-```
-
-采集的两种方式等价，用哪个都行：
-
-- **界面**：第三行「开机采集」→ 拖动秒数 → 点「安排下次开机采集」（需要管理员权限）
-- **命令行**：`MemBase.exe install --at 60` / `MemBase.exe uninstall`（源码构建用 `membase.exe`）
-
-> 计划任务由 `crates/win/src/task.rs` 生成并注册：SYSTEM 账户、开机触发、20 分钟上限、
-> 电池下也执行、错过则补跑；采完写快照，然后删任务、删程序副本，不留常驻进程。
+| 桌面布局 | `%APPDATA%\DesktopIconPos\layouts\*.json`（与 DeskPos 三端共用同一份） |
+| 主题 / 数据目录配置 | `%APPDATA%\MemBase\theme.txt`、`%APPDATA%\MemBase\config.json` |
+| 内存基准线 | `C:\ProgramData\MemBaseline\run_*\T+60s\` |
 
 ## 界面
 
-左侧导航分五页，顶部是全局搜索，底部是实时统计：
+左侧导航八页：
 
 ```
 进程        线外清单表格（名称 / 类型 / 分级 / 内存 / 保护 / 恢复），内存列按用量热力着色
-基准        基准快照时间 · 采集于开机第 N 秒 · 已用内存 · 占用率 · 数据来源目录 · 导出/导入
-保护名单    protect.txt 的全部规则，可整份清空
-开机采集    开机第 N 秒 · 采集耗时 · 计划任务状态 · 安排/取消
-设置        数据目录 · 运行身份 · 外观（浅色/深色）· 三档分级与先礼后兵的说明
+基准        基准快照时间 · 采集于开机第 N 秒 · 已用内存 · 导出 / 导入 .mbz
+桌面布局    布局清单 + 真实缩略预览 + 差异条 + 叠加当前位置 + 保存 / 恢复 / 删除 / 修复缓存
+保护名单    protect.txt 的全部规则，可单条移除或整份清空
+开机采集    开机第 N 秒采集，SYSTEM 权限、无窗口，采完自动销毁任务
+工具        息屏（全屏黑 + 可选热键退出 + 时/分/秒）+ 显示器与路径信息
+命令行      30 个界面动作 → 等价命令，逐条可复制
+设置        数据目录 · 布局目录 · 运行身份 · 外观（浅色 / 深色）
 ```
 
-「进程」页顶部的按钮：刷新对比 · 含系统组件（全选范围开关）· 全部保护 / 取消全部保护 ·
-全选 N 项 / 清空勾选 · 恢复选中 N 项（主操作，蓝色实心）。
+### 桌面布局页
 
-**每行两个勾选框，含义不同：**
+- **真实预览**：拿当前壁纸当底、逐个图标取系统真实图标（48px 超大清准），按保存时的坐标摆好，连任务栏都画上
+- **悬停看名字**：图标缩小后认不出，鼠标停上去弹名称
+- **叠加当前位置**：蓝色虚线标出「这次恢复会移动的那几个图标现在在哪」
+- **差异条**：`会动 N · 已消失 N · 新增 N · shell 接口 可用/不可用 · 布局缓存 N 字节`
+- **保存**：同名覆盖；名字里的 `/ : * ?` 会换成下划线
+- **恢复**：优先走 shell 官方接口（能持久化），不可用时退回改 explorer 内存，并如实告诉你「重启可能被覆盖」
+- **修复缓存**：只在「每次重启固定错乱同一批图标」时才需要，先备份注册表值再删除
 
-| 位置 | 名字 | 作用 | 是否写盘 |
-|---|---|---|---|
-| 每行右侧 | 「恢复」 | 这一轮要关掉它 | 否，刷新后按默认值重置 |
-| 每行左侧 | 「保护」 | 永不处理，写进保护名单 | 是，立即生效 |
+![浅色主题](docs/layouts-light.png)
 
-**批量操作只有两个按钮，文字写的是「点下去会发生什么」，不是当前状态：**
+### 工具页 · 息屏
 
-| 控件 | 三种形态 | 点下去 |
-|---|---|---|
-| 勾选按钮 | `全选 16 项` / `清空勾选` / `无可勾选项` | 在全选与一个不选之间翻转 |
-| 保护按钮 | `全部保护` / `取消全部保护` | 整份名单一次写入或一次撤掉 |
-| `已保护 N · 清空` | 只有「保护了一部分」时出现 | 把这 N 项从名单里去掉（通配规则保留） |
+**只黑屏，不锁屏**。点一下，整屏纯黑，按 **ESC** 就回来（默认不动显示器电源）：
 
-同一个按钮会自己变成反操作，所以没有「全部保护 / 取消保护」来回点的循环。中间的「含系统组件」只是**全选的范围开关**（放开「谨慎处理」那一栏），不参与保护。
+| 做什么 | 怎么做 |
+|---|---|
+| 进入息屏 | 点「息屏」（命令行 `deskkit screen off`） |
+| 退出热键 | 下拉框选 **ESC / 空格 / 回车 / 任意键**，默认 ESC；点一下鼠标、动一下鼠标也退 |
+| 息屏时长 | **时 / 分 / 秒** 三个框分开调，精确到秒；全 0 = 不定时，一直黑到你按键 |
+| 快捷时长 | 5 分钟 / 30 分钟 / 1 小时 三个按钮一键设 |
+| 到点之后 | 自动退出息屏、还原窗口 |
+| 同时关闭显示器 | 可选开关，**默认关**；命令行 `deskkit screen power on` |
+| 上次息屏 | 工具页直接看，记录在 `%APPDATA%\MemBase\last_screen_off.txt` |
 
-「采集约 N 毫秒」同样是实测值：来自基准 `system.json` 里的 `CollectMs`（枚举进程与服务的用时，不含写盘）；老基准没有该字段时，用本次刷新的实测值兜底。这个数字通常是几十毫秒，所以「开机第 60 秒采集」对开机体验没有可感知的影响。
+- 默认只盖一层**全屏纯黑窗口**，显示器始终亮着：这是唯一保证「一定退得出来」的做法，也是同类工具（如息屏助手）的默认行为
+- 「同时关闭显示器」会真发 `WM_SYSCOMMAND / SC_MONITORPOWER`：更省电，但**有些机器关得掉、叫不醒**——关掉后屏幕黑着、按什么都没反应。所以它默认关闭，勾之前请先确认你这台机器能正常唤醒
+- 退出走**系统级监听**：后台线程常挂 `WH_KEYBOARD_LL` 低级键盘钩子（另加按键/光标轮询兜底），跟窗口有没有焦点、窗口是否被隐藏都无关；命中就吞掉那一下并立刻唤醒界面
+- 退出判断挂在 `eframe::App::logic` 而不是画界面的那一路——窗口被最小化 / 隐藏时 eframe 只调 `logic`，写在 `ui` 里就永远不会被执行
+- 前 3 秒会在屏幕中央显示一行很暗的「按 ESC 退出 · 0:29:59 后自动亮」，之后彻底全黑（提示里的键名跟着你设的热键走）
+- 从点下「息屏」到松手后 0.8 秒内，鼠标的挪动不算退出（免得手还没离开鼠标就自己退了）
+
+![工具页](docs/verify-tools.png)
+
+黑屏层长这样（前 3 秒有一行很暗的提示，之后彻底全黑）：
+
+![息屏黑屏层](docs/blackout.png)
 
 ## 命令行
 
-每个原子操作一个动词：
+一个 exe 两种身份：双击开界面，带参数就是命令行（`deskkit-ui.exe layout list` 也能用）。
+另外有独立控制台版 `deskkit.exe`，给计划任务和脚本用。
 
-| 命令 | 作用 |
-|---|---|
-| `status` | 基准线信息 + 当前内存 + 线外计数 |
-| `list` | 列出线外进程/服务（`--all` 含关键项） |
-| `plan` | 只生成计划，可 `--to` 写 CSV |
-| `trim` | 恢复基准：`--execute` 才动手，`--max` 限制数量，`--grace-wait` / `--force` / `--no-force` 控制关闭方式 |
-| `kill <名\|PID>` | 原子操作：终止指定进程，同样走先礼后兵（`--grace-wait` / `--force` / `--no-force`） |
-| `svc stop\|start <服务>` | 原子操作：启停单个服务 |
-| `protect list\|add\|remove\|clear` | 保护名单，支持 `MuMu*` 通配 |
-| `collect` | 采集快照（`--at` 指定开机后第几秒） |
-| `compare` | 与最近一次基准 diff |
-| `baseline info\|verify\|capture\|export\|import` | 基准线本体：查看 / 校验 / 采集当前态 / 打包 / 还原 |
-| `config get\|set\|clear` | 数据目录 |
-| `commands` | 自描述：所有命令 + 参数 + 平台 + 退出码表 |
-| `install` / `uninstall` | 开机计划任务 |
+```bash
+deskkit status                        # 基准线 + 当前内存 + 线外计数
+deskkit list                          # 线外清单（只读）
+deskkit trim --execute --yes          # 恢复基准：先礼后兵地关掉线外项
+deskkit baseline capture              # 把当前状态立成基准
+deskkit install --at 60               # 安排下次开机第 60 秒采集
 
-所有命令都支持 `--json`，输出是**纯 ASCII 转义**的 JSON（中文走 `\uXXXX`），任何代码页下都不会解析失败，适合脚本与 AI 调用：
+deskkit layout list                   # 已保存的布局
+deskkit layout save 工作              # 保存当前桌面
+deskkit layout diff 工作 --positions  # 只看差异，逐个打印当前坐标
+deskkit layout restore 工作 --execute --yes
+deskkit layout status                 # 图标数 / 自动排列 / 分辨率 / shell 接口 / 缓存
+deskkit layout probe                  # shell 官方接口能不能用
+deskkit layout repair --execute --yes # 备份并清理系统布局缓存
+deskkit theme set dark
+deskkit ui --page layouts              # 打开界面并停在布局页
 
-```powershell
-membase list --json | ConvertFrom-Json
-membase trim --execute --yes --max 5 --json
+deskkit screen off                              # 息屏（默认只盖全屏黑窗，不动显示器电源）
+deskkit screen off --seconds 90 --exit-key space # 这次 90 秒、空格退出
+deskkit screen off --seconds 0                  # 不定时，一直黑到你按
+deskkit screen off --delay 5                    # 5 秒后再关，够你把手拿开
+deskkit screen duration 0:05:30                 # 默认时长 5 分 30 秒（也认 90s / 5m / 1h）
+deskkit screen key space                        # 默认退出热键（跟界面下拉框同一个文件）
+deskkit screen power on                         # 息屏时同时关显示器电源（更省电，但可能叫不醒）
+deskkit screen status                           # 显示器 / 通道 / 时长 / 热键 / 上次息屏
 ```
 
-退出码固定：`0` 成功 / `1` 参数 / `2` 无基准 / `3` IO / `4` 动作失败 / `5` 被护栏拒绝。
+每个命令都支持 `--json`，`deskkit commands --json` 还会把整张「界面动作 → 命令」表一起导出：
 
-## 数据目录
-
-优先级从高到低：
-
-```
---out DIR  >  MEMBASE_ROOT  >  %APPDATA%\MemBase\config.json  >  %ProgramData%\MemBaseline
+```json
+{"version":"1.0.0", "commands":[...],
+ "gui_actions":[{"key":"layout_restore","page":"桌面布局","label":"恢复选中布局",
+                 "cli":"deskkit layout restore <名字> --execute --yes", "note":"..."}]}
 ```
 
-配置放 APPDATA 而不是数据目录里 —— 数据目录本身可能被改，配置得先找得到。界面第二行直接显示当前目录，`[更改…]` 可以换到任意位置。
+退出码：`0` 成功 / `1` 参数 / `2` 没有基准或布局 / `3` 读写 / `4` 动作失败 / `5` 被拒绝。
 
-目录里只有四类内容，不会有脚本或一次性产物：
+**默认不动手**：`trim`、`layout restore`、`layout repair`、`layout delete` 不加 `--execute` / `--yes` 就只报计划。
+这样界面上的「确认」和命令行里的「显式开关」是同一件事——而且确认弹窗里直接写着这次勾选对应的命令：
 
-```
-<数据目录>\
-├─ membase.exe                      install 自动拷贝的自身副本（开机任务执行它）
-├─ protect.txt                      保护名单
-├─ run_YYYYMMDD_HHMMSS\<标签>\      快照：system.json / processes.csv / services.csv / summary.md …
-└─ exports\baseline_<时间>.mbz      基准包
-```
+![确认弹窗里写出等价命令](docs/confirm.png)
 
-## 保护名单（protect.txt）
+![命令行页](docs/cli.png)
 
-纯文本，就放在数据目录里。界面的勾选框和 `membase protect add` 写的是**同一个文件**，改完不用重启，下次刷新即生效：
+## 构建
 
-```
-# MemBase 保护名单（每行一项，格式 进程:名字 或 服务:名字）
-进程:MuMu*
-服务:DPS
+需要 Windows 10/11 + Rust 1.75 以上。
+
+```bash
+cargo build --workspace --release
+#   target\release\deskkit-ui.exe   界面（带参数即命令行）
+#   target\release\deskkit.exe      控制台版
 ```
 
-- 每行一条，`#` 开头是注释，空行忽略；保存时按字母排序重写，注释头保留
-- 三种写法：`进程:chrome`（精确）、`进程:MuMu*`（同类型通配，`*` `?`）、`MuMu*`（裸名，进程与服务都匹配）
-- 只对同一类型生效：`进程:DPS` 不会顺手保护同名服务；匹配不区分大小写
-- 界面里「已保护」= 精确命中，「通配保护」= 被通配规则命中，悬停能看到命中的是哪一条
-- 保护优先于「恢复」勾选：被保护的行勾选框置灰，统计与执行都会跳过
-- 保存只重写「当前列表覆盖到的条目」，通配规则、此刻没在跑的旧项不会被顺手抹掉
+或者双击 `build.bat`，产物收进 `dist\`。
 
-![通配保护：名单里写 进程:Steam++*，两项都被识别为「通配保护」，恢复勾选框置灰](docs/protect-wildcard-0.4.0.png)
-
-## 基准包（.mbz）
-
-`baseline export` 把 `run_<时间戳>\<标签>\` 里的快照打成一个 zip（后缀 `.mbz`），单文件就能拷走、归档、拿到别的机器上复盘：
-
-```powershell
-membase baseline export                        # → exports\baseline_<采集时间>.mbz
-membase baseline export --to D:\bk\boot.mbz    # 自己指定路径
-membase baseline import D:\bk\boot.mbz --label imported --force
+```bash
+cargo test -p deskkit-core    # 42 个纯逻辑测试，不需要桌面环境
+python tools/verify.py        # 91 项端到端验收（见下）
 ```
 
-- 包内 6 个文件：`manifest.json`（generator / format / captured_at / uptime_sec / files / crc32）+ `system.json` + `processes.csv` + `processes_by_name.csv` + `services.csv` + `summary.md`
-- `import` 先校验文件清单与 crc32，坏包不落地；解开成 `run_<采集时间>_import\` 并成为最新基准
-- 包是 store 方式的 zip（不压缩），只保证与自身互操作
+## 验收
 
-## 关闭是怎么发生的（先礼后兵）
+「编译过了」不算完。`tools/verify.py` 会把每个动词、每一页都真跑一遍：
 
-`trim --execute` 和界面「恢复选中」都不是上来就砍，顺序固定：
+- **产物 3 项 + 命令行 68 项**：每个子命令发一次（写盘的一律指向临时目录），危险动作只验护栏——
+  `trim --execute` 无 `--yes` 必须被拒、`layout repair` 不加 `--execute` 不许动注册表、
+  `screen off --dry-run` 只探通道、不关屏、不改「上次息屏」记录；时长与热键改完必须读回并还原
+- **界面 11 项**：八页各截一帧并比对 md5（确认 `DESKKIT_PAGE` 真的切页，不是八张同一页）、两个确认弹窗；
+  另有一项息屏黑屏层（断言 ≥95% 像素纯黑且仍有提示文字）
+- **一致性 5 项**：30 个界面动作 → 命令的动词都真实存在；GUI 源码里引用的每个 key 都在表里；
+  反向检查有没有「界面上有按钮、表里没命令」的动作
+- **环境复原 4 项**：保护名单条数、主题、数据目录、计划任务全部回到验收前的状态
 
-1. **身份复核** —— 用 `(PID, 创建时间)` 重新打开每个目标；PID 已被系统回收复用就跳过，
-   不会打在刚启动的新进程上；
-2. **有可见窗口的** 发 `WM_CLOSE` —— 和你点标题栏那个 ✕ 是同一条消息，程序可以弹「是否保存」；
-3. **没有窗口的**（后台常驻、更新器）没有 UI 可等，直接终止；
-4. **宽限期**（默认 3 秒）到点还没退的，才在身份校验下强杀；
-5. 结果分类上报：`礼貌关闭 / 强制 / 已退出 / 跳过 / 仍未退出`，不再只报一个「成功」。
+最新结果见 [docs/verify-1.0.0.md](docs/verify-1.0.0.md)：**91 项，通过 91，失败 0**。
 
-| 用法 | 行为 |
-|---|---|
-| 默认 | WM_CLOSE → 等 3 秒 → 强杀 |
-| `--grace-wait 10` | 多给点时间（正在编译、正在写文档） |
-| `--no-force` | 只礼不兵：关不掉就留着，报告里写「仍未退出」 |
-| `--force` | 跳过 WM_CLOSE 直接终止（旧行为，脚本想快就用它） |
+八页实拍（同一台机器连续截的，可对比深浅色与各页数据）：
 
-界面和命令行共用 `crates/win/src/close.rs` 这一份编排；多组一起关时**共用一个宽限期**，
-不是每组各等 3 秒（20 项也不会卡一分钟）。
+| 进程 | 桌面布局 | 工具 |
+|---|---|---|
+| ![](docs/verify-processes.png) | ![](docs/verify-layouts.png) | ![](docs/verify-tools.png) |
 
-## 安全模型
+![命令行页](docs/cli.png)
 
-这是个会终止进程的工具，所以护栏比功能重要：
-
-1. **三档分级** —— 建议（第三方程序）/ 谨慎（Windows 组件，需显式勾选）/ 禁止（csrss、lsass、svchost、dwm、MsMpEng 等，永不触碰）
-2. **自身保护** —— 不杀自己、启动自己的进程树，以及所有 `membase` 实例
-3. **身份而不是 PID** —— 目标以 `(PID, 创建时间)` 记录，动手前在同一句柄上复核，
-   PID 被复用、进程已退出都会让这一项被跳过而不是误伤
-4. **执行前二次校验** —— 即使计划文件被改写，关键组件依然拒绝执行
-5. **默认 dry-run** —— 不加 `--execute` 只出计划；非交互环境必须显式 `--yes`；超过 `--max`（默认 20）直接拒绝
-6. **先礼后兵** —— 有窗口的先 `WM_CLOSE`（等同点 ✕），宽限期后才强杀；无窗口进程才直接终止
-7. **服务不级联** —— 只用 `Stop-Service`（无 `-Force`），有依赖在跑就报错跳过
-
-> 杀进程只做「对照实验」用。真正省内存的做法是排查出元凶后卸载它、或禁掉它的自启项；被系统判定为必需的东西杀了也会自己回来。
-
-## 架构
-
-按「纯逻辑 / 平台 / 前端」分层，两个前端共用同一套判定：
+## 结构
 
 ```
-.
-├── crates/core/   membase-core   分级、CSV、diff、线外计划、基准打包、配置
-│                                 零平台依赖、零 unsafe，可在 Linux/容器里跑测试
-├── crates/win/    membase-win    Win32 FFI：进程 / 服务 / 快照 / 计划任务 / 关闭编排
-│                                 整个工程唯一允许 unsafe 的地方
-├── apps/cli/      membase-cli    命令行逻辑库 → 薄壳 membase.exe（控制台）
-└── apps/gui/      membase-gui    → membase-ui.exe（egui，同一个 exe 也跑命令行）
+crates/core   纯逻辑：分级 / CSV / diff / 线外计划 / 基准线打包 + 布局模型与存储（零平台依赖，零 unsafe）
+crates/win    平台层：Win32 进程 / 服务 / 计划任务 + 桌面 ListView / shell IFolderView（unsafe 只在这里）
+apps/cli      命令行：每个原子操作一个动词，ACTIONS 表是「界面动作 → 命令」的单一来源
+apps/gui      egui 界面：MemBase 骨架 + 桌面布局页 + 命令行页
 ```
 
-`unsafe_code` 在 workspace 级别 `forbid`，只有 `membase-win` 单独放开。界面与命令行都调用 `core::build_plan()`，判定规则只有一份；开机任务的定义也只有 `win::task` 一份，界面按钮与 `install` / `uninstall` 共用。
+## 实现要点
 
-命令行逻辑放在 `membase-cli` 库里：独立构建的 `membase.exe` 是它的薄壳，界面版带参数启动时也直接调用同一份逻辑，所以两边行为完全一致。
-
-## 构建与测试
-
-```powershell
-cargo build --workspace --release   # 完整构建（CLI + 界面）
-cargo test --workspace              # 全部测试（CI 在 Windows 上跑的也是这条）
-```
-
-测试标准（分层原则、判定门槛、CI 闸门、发版前人工验收清单、哪些东西**不**测）见
-[docs/TESTING.md](docs/TESTING.md)。
+- 恢复位置首选 shell 自己的 `IFolderView::SelectAndPositionItems`（`IShellWindows → IServiceProvider → IShellBrowser → IFolderView`），
+  位置由 shell 写入并立即持久化；拿不到才退回 `LVM_SETITEMPOSITION32` + 跨进程写内存
+- 必须 `SetProcessDpiAwarenessContext(-4)` + `CoInitialize`：否则 125% / 150% 缩放下读到的是逻辑像素，恢复后整体偏移
+  （`deskkit layout` 和 GUI 走同一个 `deskkit_win::init()`，命令行不会漏）
+- 只清 `LVS_AUTOARRANGE`，不发 `LVM_ARRANGE`：后者会立刻重排，把刚写好的位置冲掉
+- shell 的网格吸附是异步的，写完读回核对，最多 4 轮，一次点击收敛
+- 内存侧仍然是「先礼后兵」：有窗口的先发 `WM_CLOSE`，宽限期后才强制结束；一次操作共用一个宽限期
+- `schtasks` 自己的「成功: 已创建计划任务」会被静音：混进 stdout 会把 `--json` 打脏（验收时真踩到了）
+- 两套 Win32 绑定（`win.rs` 进程侧 / `sys.rs` 桌面侧）各自独立：句柄类型写法不同（`*mut c_void` vs `isize`），
+  ABI 一致，刻意不合并以免为统一类型改几十处调用点
 
 ## 已知限制
 
-- **按进程名归组**：同一程序的多开实例算一项，恢复时整组处理；
-  实例身份按 `(PID, 创建时间)` 记录，能防 PID 复用误伤，但不区分「哪几个实例是线外的」
-- **无窗口进程没有「礼貌」一说**：只对有可见窗口的进程发 `WM_CLOSE`；
-  控制台脚本（`python train.py`）也算无窗口，会被直接终止 —— 勾选前看清楚
-- **窗口判定偏保守**：只看「可见 + 有标题的顶层窗口」，托盘程序和部分 UWP 子窗口会被当成无窗口进程
-- `CommandLine` 仍为空（要读目标进程的 PEB，跨位数/受保护进程还会失败）；
-  `Manufacturer` / `Model` / `PhysicalProcessors` / 页面文件三项仍为 `null`（需要 WMI 或性能计数器）
-- `PagedSystemMB` 是进程的分页池配额（`QuotaPagedPoolUsage`），`VirtualMB` 是提交大小
-  （`PagefileUsage`），都不等于「虚拟地址空间」；`CpuSeconds` 是进程启动至今的累计 CPU 时间，
-  不是「开机后用了多少」
-- 打不开令牌 / 句柄的进程（受保护进程、跨会话的高权限进程）`UserName`、`CpuSeconds`、
-  内存三项会是空值或 0，不是采集出错
-- GUI 仅 Windows；CLI 的采集与清理能力也仅 Windows（`baseline` / `config` / `commands` 跨平台）
-
-## 变更记录
-
-当前 **0.6.0**：界面与命令行合并为单文件，开机采集不再需要额外的 CLI。
-上一版 **0.5.2**：顶栏新增整机内存占用（百分比 + 已用 / 总可用），每秒刷新。
-更早 **0.5.1**：修复 `--self-destruct` 残留程序副本；补齐快照里的 `UserName` / `CpuSeconds` /
-`PagedSystemMB` / `VirtualMB` / `OsCaption` / `OsVersion` / `OsBuild`。
-更早 **0.5.0**：先礼后兵（`WM_CLOSE` → 宽限期 → 强杀）、`(PID, 创建时间)` 实例身份、CI。
-完整历史与格式 / 接口变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
+- 图标按**显示名**匹配：改名或删掉的文件不会被恢复，新加的图标保持原位
+- 要跨进程读写 explorer 内存，**杀软报毒是常态**，加白名单即可
+- shell 接口不可用时恢复只改内存，重启可能被系统覆盖（界面和 `layout status` 都会明说）
+- 布局是在别的分辨率 / 缩放下保存的，坐标可能不落在当前网格点，会被吸附
+- 预览背景是静态壁纸；动态壁纸取到的是当前帧
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -6,13 +6,13 @@
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::win::CREATE_NO_WINDOW;
 
 /// 默认任务名；采集完成后任务会自毁，所以常年为空是正常状态。
 /// 直接复用 core 里的常量，避免两个 crate 各存一份字符串。
-pub use membase_core::DEFAULT_TASK;
+pub use deskkit_core::DEFAULT_TASK;
 
 /// 只读的任务快照，给 GUI 显示用
 #[derive(Clone, Debug, Default)]
@@ -83,7 +83,7 @@ fn task_xml(exe: &Path, out: &Path, at_sec: u64, task: &str) -> String {
     )
 }
 
-/// 注册开机采集任务，并把 `src_exe` 复制成 `<out>\membase.exe`。
+/// 注册开机采集任务，并把 `src_exe` 复制成 `<out>\deskkit.exe`。
 ///
 /// 界面版和命令行版是同一个程序（带参数走命令行、无参数开界面），
 /// 所以这里不需要再区分 PE 子系统：任务参数 `collect ...` 不会开窗口。
@@ -102,7 +102,7 @@ pub fn install(
         return Err(format!("找不到可执行文件：{}", src_exe.display()));
     }
     fs::create_dir_all(out).map_err(|e| format!("建目录失败: {e}"))?;
-    let target = out.join("membase.exe");
+    let target = out.join("deskkit.exe");
 
     // 自己拷自己会失败（win 上占用），先比路径
     let same = match (src_exe.canonicalize(), target.canonicalize()) {
@@ -121,6 +121,8 @@ pub fn install(
     }
     fs::write(&tmp, &bytes).map_err(|e| format!("写 XML 失败: {e}"))?;
 
+    // 静音：schtasks 会往 stdout 打「成功: 已创建计划任务…」，
+    // 混进 --json 的流里就没法解析了，结果一律用返回值表达
     let st = Command::new("schtasks")
         .args([
             "/Create",
@@ -131,6 +133,8 @@ pub fn install(
             "/F",
         ])
         .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     let _ = fs::remove_file(&tmp);
 
@@ -151,6 +155,8 @@ pub fn uninstall(task: &str) -> Result<(), String> {
     let st = Command::new("schtasks")
         .args(["/Delete", "/TN", task, "/F"])
         .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     match st {
         Ok(s) if s.success() => Ok(()),

@@ -1,22 +1,8 @@
-# 构建产物
 /target
-**/target
-
-# 数据包 / 快照（本地产物，不入库）
-*.mbz
-run_*/
-live_*/
-exports/
-
-# Windows / 编辑器
-*.pdb
-*.ilk
-Thumbs.db
-desktop.ini
-.DS_Store
-.idea/
-.vscode/
-*.swp
-
-# 本地工作目录（记忆、临时截图等，不入库）
+/dist
+*.bmp
 .workbuddy/
+
+# Python 工具缓存
+__pycache__/
+*.pyc

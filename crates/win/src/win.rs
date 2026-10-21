@@ -1328,7 +1328,7 @@ pub fn protected_pids() -> Vec<u32> {
     // 0) 按名字保护本工具自己的所有实例（用户可能同时开着桌面版和命令行版，
     //    它们不在彼此的父进程链里，但仍然绝不该被清理）
     for (&pid, n) in names.iter() {
-        if n == "membase" || n == "membase-ui" || n == "mem base" {
+        if n == "deskkit" || n == "deskkit-ui" {
             if !out.contains(&pid) {
                 out.push(pid);
             }

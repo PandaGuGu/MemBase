@@ -1,11 +1,15 @@
 [package]
-name = "membase-core"
+name = "deskkit-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MemBase 纯逻辑层：分级、CSV、diff、线外计划、基准线打包（零平台依赖，零 unsafe）"
+description = "DeskKit 纯逻辑层：内存基准线分级/CSV/diff/打包 + 桌面布局模型与存储（零平台依赖，零 unsafe）"
 
 [dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
 
 [lints]
 workspace = true

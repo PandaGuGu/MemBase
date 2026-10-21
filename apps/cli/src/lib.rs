@@ -1,8 +1,13 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
-//! membase —— 开机内存基准线工具（命令行逻辑）
+//! deskkit —— 内存基准线 + 桌面图标布局（命令行逻辑）
 //!
-//! 同一份逻辑被两个入口复用：独立的 `membase.exe`（控制台），
-//! 以及带参数启动的界面版 `MemBase.exe`（自己接回父控制台）。
+//! 同一份逻辑被两个入口复用：独立的 `deskkit.exe`（控制台），
+//! 以及带参数启动的界面版 `deskkit-ui.exe`（自己接回父控制台）。
+//!
+//! 两件本来不相干的事在这里共用一套骨架：
+//!   * 内存侧：开机基准线 / 线外清单 / 恢复基准（原 MemBase）
+//!   * 桌面侧：桌面图标布局 / 差异预览 / 恢复 / 修复缓存（原 DeskPos）
+//! 界面上的每个可点操作，在 [`layout::ACTIONS`] 里都有一条等价命令。
 //!
 //! 设计目标：所有操作都能被脚本 / AI 驱动
 //!   * 每个动作一个子命令，没有交互式菜单
@@ -14,11 +19,16 @@
 //!   4 有动作执行失败 / 5 被安全护栏拒绝 / 6 需要管理员权限
 
 #[cfg(windows)]
-use membase_core::{Kind, Tier};
+pub mod layout;
 #[cfg(windows)]
-use membase_win::{close, compare, snapshot, win};
+pub mod screen;
+
+#[cfg(windows)]
+use deskkit_core::{Kind, Tier};
+#[cfg(windows)]
+use deskkit_win::{close, compare, snapshot, win};
 // 常量与平台无关，usage() 在非 Windows 上也要用
-use membase_core as core;
+use deskkit_core as core;
 #[cfg(windows)]
 use std::collections::BTreeMap;
 #[cfg(windows)]
@@ -41,9 +51,9 @@ const EXIT_REFUSED: i32 = 5;
 
 fn usage() {
     println!(
-        r#"membase {ver} —— 开机内存基准线工具（采集 / 对比 / 恢复基准）
+        r#"deskkit {ver} —— 内存基准线 + 桌面图标布局（每个界面操作都有命令）
 
-用法: membase <命令> [选项]
+用法: deskkit <命令> [选项]
 
   status                     概况：基准线信息 + 当前内存 + 线外计数
   list                       列出线外进程/服务（只读，不动手）
@@ -106,12 +116,36 @@ fn usage() {
 
   install / uninstall        注册 / 删除开机计划任务
 
+  layout                     桌面图标布局（原 DeskPos 的全部能力）
+      layout list            列出已保存的布局
+      layout save [名字]      保存当前桌面（名字缺省=auto-时间戳）
+      layout restore [名字]   恢复布局：默认演练，--execute --yes 才动手
+      layout diff [名字]      只看差异（--positions 逐个打印当前坐标）
+      layout show [名字]      查看布局内容
+      layout delete <名字> --yes
+      layout status          图标数 / 自动排列 / 分辨率 / shell 接口 / 缓存
+      layout probe           诊断 shell 官方接口能不能用
+      layout repair          清理损坏的系统布局缓存（默认演练）
+      layout dir [--open]    布局目录
+
+  theme                      外观（与界面「设置」页同一个文件）
+      theme get | set light|dark
+
+  ui                         打开界面（可选 --page 指定页面）
+      ui --page layouts     进程|基准|layouts|protect|boot|cli|tools|settings
+
+  screen                     息屏（只关显示器，不锁屏）
+      screen off             立刻关屏；--seconds N 到点自动亮，--exit-key K 换退出键
+      screen duration [时长]  默认时长：1:05:09 / 90s / 5m / 1h / 0（不定时）
+      screen key [键]         默认退出热键：esc / space / enter / any
+      screen status          显示器 / 通道 / 默认时长 / 退出键 / 上次息屏
+
 全局:
   --json                     输出 JSON（适合程序/AI 解析）
   --out DIR                  数据目录，默认 {root}
 
 退出码: 0 成功 / 1 参数 / 2 无基准 / 3 IO / 4 动作失败 / 5 被拒绝"#,
-        ver = membase_core::VERSION,
+        ver = deskkit_core::VERSION,
         root = core::default_root(),
         task = core::default_task()
     );
@@ -181,10 +215,73 @@ fn positionals<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a String> 
     out
 }
 
+
+// ---------------- 外观（与界面「设置」页共用 theme.txt） ----------------
+
+/// 主题文件路径：和基准线配置同目录的 theme.txt
+pub fn theme_path() -> PathBuf {
+    deskkit_core::config::config_path().with_file_name("theme.txt")
+}
+
+pub fn read_theme() -> bool {
+    fs::read_to_string(theme_path())
+        .map(|t| t.trim().eq_ignore_ascii_case("dark"))
+        .unwrap_or(false)
+}
+
+pub fn write_theme(dark: bool) -> std::io::Result<()> {
+    let p = theme_path();
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(p, if dark { "dark" } else { "light" })
+}
+
+fn cmd_theme(args: &[String]) {
+    let json = want_json(args);
+    let pos = positionals(args, &["--out"]);
+    let sub = pos.first().map(|s| s.to_lowercase()).unwrap_or_else(|| "get".into());
+    let value = pos.get(1).map(|s| s.to_lowercase());
+
+    match sub.as_str() {
+        "get" | "show" => {}
+        "set" => {
+            let dark = match value.as_deref() {
+                Some("dark") | Some("深色") | Some("黑") => true,
+                Some("light") | Some("浅色") | Some("白") => false,
+                _ => {
+                    eprintln!("用法: deskkit theme set light|dark");
+                    std::process::exit(EXIT_USAGE);
+                }
+            };
+            if let Err(e) = write_theme(dark) {
+                eprintln!("[x] 写主题失败: {}", e);
+                std::process::exit(EXIT_IO);
+            }
+        }
+        other => {
+            eprintln!("未知子命令: theme {}", other);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+
+    let dark = read_theme();
+    if json {
+        println!(
+            "{{\"ok\":true,\"theme\":{},\"file\":{}}}",
+            jstr(if dark { "dark" } else { "light" }),
+            jstr(&theme_path().to_string_lossy())
+        );
+    } else {
+        println!("当前外观 : {}", if dark { "深色" } else { "浅色" });
+        println!("配置文件 : {}", theme_path().display());
+    }
+}
+
 // ---------------- 数据目录配置（跨平台） ----------------
 
 fn cmd_config(args: &[String]) {
-    use membase_core::config as cfg;
+    use deskkit_core::config as cfg;
     let json = want_json(args);
     let pos = positionals(args, &["--out", "--to", "--task", "--label"]);
     let sub = pos.first().map(|s| s.as_str()).unwrap_or("get");
@@ -217,12 +314,17 @@ fn cmd_config(args: &[String]) {
                 println!("当前生效 : {}", effective);
                 println!("来源     : {}", source);
             }
+            // 界面「打开数据目录」的等价命令；--json 时仍会把路径打出来
+            if has_flag(args, "--open") {
+                #[cfg(windows)]
+                deskkit_win::win::open_folder(&effective);
+            }
         }
         "set" => {
             let dir = match pos.get(1) {
                 Some(d) => d.to_string(),
                 None => {
-                    eprintln!("用法: membase config set <目录>");
+                    eprintln!("用法: deskkit config set <目录>");
                     std::process::exit(EXIT_USAGE);
                 }
             };
@@ -244,7 +346,7 @@ fn cmd_config(args: &[String]) {
                     } else {
                         println!("已设置数据目录：{}", dir);
                         println!("  写入 : {}", path.display());
-                        println!("  提示 : 新目录还没有基准线的话，用 `membase baseline capture`");
+                        println!("  提示 : 新目录还没有基准线的话，用 `deskkit baseline capture`");
                         println!("         或 GUI 的「扫描当前 → 设为基准」建一份");
                     }
                 }
@@ -284,7 +386,7 @@ fn cmd_config(args: &[String]) {
 // ---------------- 基准线：查看 / 校验 / 导出 / 导入（跨平台） ----------------
 
 fn cmd_baseline(args: &[String]) {
-    use membase_core::bundle;
+    use deskkit_core::bundle;
     let root = root_arg(args);
     let json = want_json(args);
     let sub = args
@@ -346,7 +448,7 @@ fn cmd_baseline(args: &[String]) {
             let dir = match bundle::find_latest_baseline(&root) {
                 Some(d) => d,
                 None => {
-                    eprintln!("[x] 没有基准快照：{}（先跑 membase collect）", root.display());
+                    eprintln!("[x] 没有基准快照：{}（先跑 deskkit collect）", root.display());
                     std::process::exit(EXIT_NO_BASELINE);
                 }
             };
@@ -489,7 +591,7 @@ fn cmd_baseline(args: &[String]) {
             let pkg = match pos.iter().find(|p| !matches!(p.as_str(), "import")) {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    eprintln!("用法: membase baseline import <包文件.mbz> [--label NAME] [--force]");
+                    eprintln!("用法: deskkit baseline import <包文件.mbz> [--label NAME] [--force]");
                     std::process::exit(EXIT_USAGE);
                 }
             };
@@ -522,7 +624,7 @@ fn cmd_baseline(args: &[String]) {
                         println!("  包   : {}", pkg.display());
                         println!("  落地 : {}", r.dir.display());
                         println!("  采集 : {}", captured);
-                        println!("  注意 : 导入的快照是「最新」的一份，membase status/trim 会以它为基准");
+                        println!("  注意 : 导入的快照是「最新」的一份，deskkit status/trim 会以它为基准");
                     }
                 }
                 Err(e) => {
@@ -617,7 +719,7 @@ fn load_baseline(root: &Path) -> Result<Baseline, i32> {
         Some(d) => d,
         None => {
             eprintln!(
-                "[x] 没有基准快照：{}（先跑 membase collect）",
+                "[x] 没有基准快照：{}（先跑 deskkit collect）",
                 root.display()
             );
             return Err(EXIT_NO_BASELINE);
@@ -1185,10 +1287,39 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("baseline", "基准线：查看/校验/采集当前态/导出/导入", "info|verify|capture|export|import [包] [--to FILE] [--label NAME]", "all"),
     ("install", "注册开机计划任务", "--out --at --task", "windows"),
     ("uninstall", "删除开机计划任务", "--task", "windows"),
-    ("config", "数据目录配置：查看/修改/清除", "get|set <目录>|clear", "all"),
+    ("layout", "桌面图标布局：保存/差异/恢复/修复缓存", "list|save|restore|diff|show|delete|status|probe|repair|dir [名字] [--execute --yes --positions --open]", "windows"),
+    ("theme", "外观：查看/切换浅色深色", "get|set light|dark", "all"),
+    ("screen", "息屏：只关显示器，不锁屏（热键退出 / 定时自动亮）", "off|status|duration|key [--seconds N --exit-key K --delay N --dry-run]", "windows"),
+    ("ui", "打开界面（可指定落在哪一页）", "--page layouts|baseline|protect|boot|cli|tools|settings", "windows"),
+    ("config", "数据目录配置：查看/修改/清除", "get|set <目录>|clear [--open]", "all"),
     ("commands", "列出所有命令与参数（本表）", "", "all"),
     ("version", "打印版本", "", "all"),
 ];
+
+/// 界面动作表导出成 JSON：每个按钮的等价命令都在这里，
+/// 这样「人能点的脚本一定能发」这件事是可被机器检查的。
+#[cfg(windows)]
+fn actions_json() -> String {
+    layout::ACTIONS
+        .iter()
+        .map(|a| {
+            format!(
+                "{{\"key\":{},\"page\":{},\"label\":{},\"cli\":{},\"note\":{}}}",
+                jstr(a.key),
+                jstr(a.page),
+                jstr(a.label),
+                jstr(a.cli),
+                jstr(a.note)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(not(windows))]
+fn actions_json() -> String {
+    String::new()
+}
 
 fn cmd_commands(args: &[String]) {
     let json = want_json(args);
@@ -1205,17 +1336,19 @@ fn cmd_commands(args: &[String]) {
                 )
             })
             .collect();
+        let actions = actions_json();
         println!(
-            "{{\"version\":{},\"data_root\":{},\"exit_codes\":{{\"0\":\"ok\",\"1\":\"usage\",\"2\":\"no_baseline\",\"3\":\"io\",\"4\":\"action_failed\",\"5\":\"refused\"}},\"commands\":[{}]}}",
-            jstr(membase_core::VERSION),
+            "{{\"version\":{},\"data_root\":{},\"exit_codes\":{{\"0\":\"ok\",\"1\":\"usage\",\"2\":\"no_baseline\",\"3\":\"io\",\"4\":\"action_failed\",\"5\":\"refused\"}},\"commands\":[{}],\"gui_actions\":[{}]}}",
+            jstr(deskkit_core::VERSION),
             jstr(&core::default_root()),
-            items.join(",")
+            items.join(","),
+            actions
         );
         return;
     }
     println!(
-        "membase {}  数据目录 {}",
-        membase_core::VERSION,
+        "deskkit {}  数据目录 {}",
+        deskkit_core::VERSION,
         core::default_root()
     );
     println!();
@@ -1223,6 +1356,14 @@ fn cmd_commands(args: &[String]) {
         println!("  {:<10} {:<38} {}", n, d, p);
         if !a.is_empty() {
             println!("  {:<10}   {}", "", a);
+        }
+    }
+    #[cfg(windows)]
+    {
+        println!();
+        println!("界面动作 → 命令（界面「命令行」页同源）:");
+        for a in layout::ACTIONS {
+            println!("  {:<10} {:<22} {}", a.page, a.label, a.cli);
         }
     }
 }
@@ -1237,7 +1378,7 @@ fn cmd_kill(args: &[String]) {
     let target = match pos.first() {
         Some(t) => t.to_string(),
         None => {
-            eprintln!("用法: membase kill <进程名|PID> [--execute] [--grace-wait N] [--force|--no-force] [--json]");
+            eprintln!("用法: deskkit kill <进程名|PID> [--execute] [--grace-wait N] [--force|--no-force] [--json]");
             std::process::exit(EXIT_USAGE);
         }
     };
@@ -1342,7 +1483,7 @@ fn cmd_svc(args: &[String]) {
     let execute = has_flag(args, "--execute");
     let pos = positionals(args, &["--out"]);
     if pos.len() < 2 {
-        eprintln!("用法: membase svc <stop|start> <服务名> [--execute] [--json]");
+        eprintln!("用法: deskkit svc <stop|start> <服务名> [--execute] [--json]");
         std::process::exit(EXIT_USAGE);
     }
     let action = pos[0].to_lowercase();
@@ -1509,7 +1650,7 @@ fn cmd_protect(args: &[String]) {
     match sub {
         "add" => {
             if names.is_empty() {
-                eprintln!("用法: membase protect add <名字[,名字...]>");
+                eprintln!("用法: deskkit protect add <名字[,名字...]>");
                 std::process::exit(EXIT_USAGE);
             }
             for n in names {
@@ -1703,7 +1844,56 @@ fn cmd_compare(args: &[String]) {
     );
 }
 
-/// 注册开机采集任务。XML、拷 exe、调 schtasks 都在 membase-win::task 里，
+
+/// `deskkit ui`：把界面拉起来。页面切换本身也有命令入口，
+/// 这样「界面上的每个操作」连「打开界面并停在布局页」都能被脚本表达。
+#[cfg(windows)]
+fn cmd_ui(args: &[String]) {
+    let page = arg_value(args, "--page").unwrap_or_default();
+    let cur = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[x] 取不到自身路径: {}", e);
+            std::process::exit(EXIT_IO);
+        }
+    };
+    let is_gui = cur
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase().contains("ui"))
+        .unwrap_or(false);
+    let gui = if is_gui {
+        cur.clone()
+    } else {
+        cur.with_file_name("deskkit-ui.exe")
+    };
+    if !gui.is_file() {
+        eprintln!("[x] 找不到界面程序：{}", gui.display());
+        std::process::exit(EXIT_IO);
+    }
+    let mut cmd = Command::new(&gui);
+    if !page.trim().is_empty() {
+        cmd.env("DESKKIT_PAGE", page.trim());
+    }
+    match cmd.spawn() {
+        Ok(_) => {
+            if want_json(args) {
+                println!(
+                    "{{\"ok\":true,\"exe\":{},\"page\":{}}}",
+                    jstr(&gui.to_string_lossy()),
+                    jstr(page.trim())
+                );
+            } else {
+                println!("已打开界面：{}", gui.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("[x] 启动失败: {}", e);
+            std::process::exit(EXIT_IO);
+        }
+    }
+}
+
+/// 注册开机采集任务。XML、拷 exe、调 schtasks 都在 deskkit-win::task 里，
 /// GUI 的按钮走的是同一份实现。
 #[cfg(windows)]
 fn cmd_install(args: &[String]) {
@@ -1713,7 +1903,7 @@ fn cmd_install(args: &[String]) {
     let json = want_json(args);
 
     let cur = std::env::current_exe().expect("取不到自身路径");
-    let res = membase_win::task::install(&cur, &out, at, &task);
+    let res = deskkit_win::task::install(&cur, &out, at, &task);
     let ok = res.is_ok();
     let target = res
         .as_ref()
@@ -1744,7 +1934,7 @@ fn cmd_install(args: &[String]) {
 fn cmd_uninstall(args: &[String]) {
     let task = task_arg(args);
     let json = want_json(args);
-    let res = membase_win::task::uninstall(&task);
+    let res = deskkit_win::task::uninstall(&task);
     let ok = res.is_ok();
     if json {
         println!("{{\"ok\":{},\"task\":{}}}", ok, jstr(&task));
@@ -1797,7 +1987,7 @@ pub fn run() {
             return;
         }
         "version" | "-V" | "--version" => {
-            println!("membase {}", membase_core::VERSION);
+            println!("deskkit {}", deskkit_core::VERSION);
             return;
         }
         "baseline" => {
@@ -1813,6 +2003,41 @@ pub fn run() {
             cmd_config(&argv[2..]);
             return;
         }
+        "theme" => {
+            cmd_theme(&argv[2..]);
+            return;
+        }
+        "screen" | "display" => {
+            #[cfg(windows)]
+            {
+                std::process::exit(screen::cmd_screen(&argv[2..]));
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("deskkit screen 只支持 Windows");
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        "ui" | "gui" => {
+            #[cfg(windows)]
+            {
+                cmd_ui(&argv[2..]);
+            }
+            #[cfg(not(windows))]
+            eprintln!("deskkit ui 只支持 Windows");
+            return;
+        }
+        "layout" | "layouts" | "desk" => {
+            #[cfg(windows)]
+            {
+                std::process::exit(layout::cmd_layout(&argv[2..]));
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("deskkit layout 只支持 Windows（依赖 explorer 的桌面 ListView）");
+                std::process::exit(EXIT_USAGE);
+            }
+        }
         _ => {}
     }
     #[cfg(windows)]
@@ -1820,7 +2045,7 @@ pub fn run() {
     #[cfg(not(windows))]
     {
         let _ = cmd;
-        eprintln!("membase 的采集/清理只支持 Windows；纯逻辑部分用 `cargo test -p membase-core` 验证。");
+        eprintln!("deskkit 的采集/清理与桌面布局只支持 Windows；纯逻辑部分用 `cargo test -p deskkit-core` 验证。");
         std::process::exit(EXIT_USAGE);
     }
 }

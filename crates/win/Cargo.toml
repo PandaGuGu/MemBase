@@ -1,12 +1,24 @@
 [package]
-name = "membase-win"
+name = "deskkit-win"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MemBase 平台层：Win32 进程/服务/计划任务封装（unsafe 只允许出现在这里）"
+description = "DeskKit 平台层：Win32 进程/服务/计划任务 + 桌面图标 ListView 与 shell IFolderView（unsafe 只允许出现在这里）"
+
+[features]
+default = []
+# GUI 预览才需要解壁纸（png/jpeg/bmp），CLI 不必背这个依赖
+preview = ["dep:image"]
 
 [dependencies]
-membase-core.workspace = true
+deskkit-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+    "jpeg",
+    "bmp",
+] }
 
 [lints.rust]
 unsafe_code = "allow"

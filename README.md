@@ -58,7 +58,7 @@ Windows 开机久了，内存被谁吃了、桌面图标被谁弄乱了？MemBas
 
 ## 命令行
 
-同一个程序两种身份：双击 `deskkit-ui.exe` 开界面，带参数就是命令行；`deskkit.exe` 是纯控制台版，给脚本和计划任务用。
+同一个程序两种身份：双击 `MemBase.exe` 开界面，带参数就是命令行；`deskkit.exe` 是纯控制台版，给脚本和计划任务用。
 
 ```bash
 # 基准线
@@ -93,7 +93,7 @@ deskkit screen status
 
 ## 下载与运行
 
-从 [Releases](https://github.com/PandaGuGu/MemBase/releases/latest) 下载最新压缩包，解压后运行 `deskkit-ui.exe`。
+从 [Releases](https://github.com/PandaGuGu/MemBase/releases/latest) 下载最新压缩包，解压后运行 `MemBase.exe`。
 
 - 开机采集需要管理员权限；安装后注册 SYSTEM 计划任务，采完自动删除任务和程序副本
 - 首次使用先在「基准」页采集或导入一份基准，再回「进程」页对比
@@ -111,8 +111,8 @@ deskkit screen status
 
 ```bash
 cargo build --workspace --release
-# target\release\deskkit-ui.exe   界面（带参数即命令行）
-# target\release\deskkit.exe      控制台版
+# target\release\MemBase.exe   界面（带参数即命令行）
+# target\release\deskkit.exe    控制台版
 
 cargo test -p deskkit-core    # 42 个纯逻辑测试
 cargo test -p deskkit-win     # 11 个平台层测试（1 个需真实桌面会话的用例默认忽略）

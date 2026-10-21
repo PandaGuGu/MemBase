@@ -7,7 +7,7 @@ description = "DeskKit 桌面界面（egui）：内存基准线 + 桌面图标�
 build = "build.rs"
 
 [[bin]]
-name = "deskkit-ui"
+name = "MemBase"
 path = "src/main.rs"
 
 [dependencies]

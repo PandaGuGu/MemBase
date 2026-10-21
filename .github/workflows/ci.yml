@@ -50,13 +50,13 @@ jobs:
             sub=$(od -An -tu2 -j$((off + 4 + 20 + 68)) -N2 "$f" | tr -d ' ')
             echo "$sub"
           }
-          for f in target/release/deskkit.exe target/release/deskkit-ui.exe; do
+          for f in target/release/deskkit.exe target/release/MemBase.exe; do
             [ -f "$f" ] || { echo "缺少产物：$f"; exit 1; }
           done
           cli=$(subsystem target/release/deskkit.exe)
-          gui=$(subsystem target/release/deskkit-ui.exe)
+          gui=$(subsystem target/release/MemBase.exe)
           echo "deskkit.exe 子系统=$cli（应为 3 控制台）"
-          echo "deskkit-ui.exe 子系统=$gui（应为 2 窗口）"
+          echo "MemBase.exe 子系统=$gui（应为 2 窗口）"
           [ "$cli" = "3" ] || exit 1
           [ "$gui" = "2" ] || exit 1
 
@@ -73,5 +73,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./target/release/deskkit-ui.exe version
-          ./target/release/deskkit-ui.exe commands --json | grep -q '"commands"'
+          ./target/release/MemBase.exe version
+          ./target/release/MemBase.exe commands --json | grep -q '"commands"'

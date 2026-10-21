@@ -25,7 +25,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, 'dist', 'deskkit.exe')
-GUI = os.path.join(ROOT, 'dist', 'deskkit-ui.exe')
+GUI = os.path.join(ROOT, 'dist', 'MemBase.exe')
 
 results = []      # (分组, 项目, 命令, 期望, 实际, 结论, 备注)
 notes = []
@@ -394,7 +394,7 @@ def check_blackout_exit():
     try:
         h = 0
         for _ in range(150):
-            h = u.FindWindowW(None, 'DeskKit · 内存基准线 + 桌面布局')
+            h = u.FindWindowW(None, 'MemBase · 内存基准线 + 桌面布局')
             if h:
                 break
             time.sleep(0.1)
@@ -436,7 +436,7 @@ def check_blackout_exit():
                 proc = subprocess.Popen([GUI], env=e)
                 h = 0
                 for _ in range(150):
-                    h = u.FindWindowW(None, 'DeskKit · 内存基准线 + 桌面布局')
+                    h = u.FindWindowW(None, 'MemBase · 内存基准线 + 桌面布局')
                     if h:
                         break
                     time.sleep(0.1)

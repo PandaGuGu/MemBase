@@ -2,7 +2,7 @@
 //! deskkit —— 内存基准线 + 桌面图标布局（命令行逻辑）
 //!
 //! 同一份逻辑被两个入口复用：独立的 `deskkit.exe`（控制台），
-//! 以及带参数启动的界面版 `deskkit-ui.exe`（自己接回父控制台）。
+//! 以及带参数启动的界面版 `MemBase.exe`（自己接回父控制台）。
 //!
 //! 两件本来不相干的事在这里共用一套骨架：
 //!   * 内存侧：开机基准线 / 线外清单 / 恢复基准（原 MemBase）
@@ -1864,7 +1864,7 @@ fn cmd_ui(args: &[String]) {
     let gui = if is_gui {
         cur.clone()
     } else {
-        cur.with_file_name("deskkit-ui.exe")
+        cur.with_file_name("MemBase.exe")
     };
     if !gui.is_file() {
         eprintln!("[x] 找不到界面程序：{}", gui.display());

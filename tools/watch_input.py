@@ -32,7 +32,7 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 # 关心的程序（窗口标题里的关键字 -> 友好名）
 TARGETS = {
-    '内存基准线 + 桌面布局': 'DeskKit',
+    '内存基准线 + 桌面布局': 'MemBase',
     '息屏助手': '息屏助手',
 }
 VK_NAMES = {0x1B: 'Esc', 0x0D: 'Enter', 0x20: 'Space', 0x09: 'Tab',
@@ -173,7 +173,7 @@ def main():
         os.environ.get('TEMP', '.'), 'deskkit_watch_%s.log' % time.strftime('%m%d_%H%M%S'))
     log_fp = open(path, 'w', encoding='utf-8')
     log('[启动] 日志 = %s' % path)
-    log('[启动] 现在请照常操作：点 DeskKit 的「息屏」→ 按 ESC；再拿「息屏助手」对比一次')
+    log('[启动] 现在请照常操作：点 MemBase 的「息屏」→ 按 ESC；再拿「息屏助手」对比一次')
     log('[启动] 结束时按 Ctrl+C')
     threading.Thread(target=hook_thread, daemon=True).start()
     try:

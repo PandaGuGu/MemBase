@@ -13,14 +13,14 @@ if errorlevel 1 (
 echo [2/2] 收产物到 dist
 if not exist dist mkdir dist
 copy /y target\release\deskkit.exe    dist\ >nul
-copy /y target\release\deskkit-ui.exe dist\ >nul
+copy /y target\release\MemBase.exe    dist\ >nul
 
 echo.
-for %%F in (dist\deskkit.exe dist\deskkit-ui.exe) do (
+for %%F in (dist\deskkit.exe dist\MemBase.exe) do (
   echo   %%~nxF  %%~zF 字节
 )
 echo.
 echo 用法：
-echo   dist\deskkit-ui.exe                 开界面
-echo   dist\deskkit-ui.exe layout list     同一个 exe 当命令行用
+echo   dist\MemBase.exe                    开界面
+echo   dist\MemBase.exe layout list        同一个 exe 当命令行用
 echo   dist\deskkit.exe layout status      纯控制台版

@@ -1,4 +1,4 @@
-//! DeskKit GUI —— 内存基准线 · 桌面图标布局（同一套界面）
+//! MemBase GUI —— 内存基准线 · 桌面图标布局（同一套界面）
 //!
 //! 界面上每个按钮都有一条等价命令行（见 deskkit-cli 的 ACTIONS 表）：
 //! 按钮 hover 会直接把那条命令写出来，程序里也另有一页「命令行」做对照。
@@ -2017,7 +2017,7 @@ impl App {
                     ui,
                     "版本",
                     &format!(
-                        "DeskKit {} · deskkit-ui（egui · 纯 Rust）",
+                        "MemBase {} · MemBase.exe（egui · 纯 Rust）",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -3268,7 +3268,7 @@ impl App {
                 kv_row(
                     ui,
                     "版本",
-                    &format!("DeskKit {} · deskkit-ui（egui · 纯 Rust）", env!("CARGO_PKG_VERSION")),
+                    &format!("MemBase {} · MemBase.exe（egui · 纯 Rust）", env!("CARGO_PKG_VERSION")),
                 );
                 ui.add_space(8.0);
                 note(
@@ -4362,12 +4362,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([980.0, 620.0])
-            .with_title("DeskKit · 内存基准线 + 桌面布局")
+            .with_title("MemBase · 内存基准线 + 桌面布局")
             .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
-        "DeskKit",
+        "MemBase",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

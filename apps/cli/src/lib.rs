@@ -3099,7 +3099,7 @@ fn read_selfheal(root: &Path) -> BTreeMap<String, String> {
 /// 记一条「杀掉又回来了」的结论。只有真的跑过 `restart` 才会写，
 /// 不做自动探测 —— 探测本身就要杀进程，那正是要避免的打地鼠。
 #[cfg(windows)]
-fn note_selfheal(root: &Path, name: &str) {
+pub fn note_selfheal(root: &Path, name: &str) {
     let p = selfheal_file(root);
     let text = fs::read_to_string(&p).unwrap_or_default();
     let next = core::selfheal::note(

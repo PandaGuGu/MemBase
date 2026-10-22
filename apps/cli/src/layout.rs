@@ -78,10 +78,10 @@ pub const ACTIONS: &[Action] = &[
     },
     Action {
         key: "proc_restart",
-        page: "进程",
-        label: "重启选中 N 项",
+        page: "进程·可回收",
+        label: "实测重启选中 N 项",
         cli: "MemBase.exe restart <名字> --execute --yes",
-        note: "关掉再按原路径拉起，等 3 秒实测回收量；勾选的行 = 逐个执行",
+        note: "只处理基准内跑久了的增长项；关掉再按原路径拉起，等 3 秒实测回收量（可能为负）",
     },
     // ---------------- 瘦身页 ----------------
     Action {

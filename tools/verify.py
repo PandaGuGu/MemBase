@@ -620,7 +620,8 @@ def check_gui_pages():
     import bmp2png  # noqa: E402  （同目录的小工具，纯标准库）
 
     pages = [
-        (None, '进程（默认页）'),
+        (None, '进程·线外（默认页）'),
+        ('recover', '进程·可回收'),
         ('slim', '瘦身'),
         ('startup', '启动项'),
         ('baseline', '基准'),

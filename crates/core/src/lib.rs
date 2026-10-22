@@ -1187,6 +1187,99 @@ pub fn build_plan(
     out
 }
 
+/// 基准内、当前仍在增长的进程 —— 「局部重启」的候选。
+///
+/// 和 [`build_plan`] 的方向相反：那边找「基准里没有」的线外项，
+/// 这里找「基准里就有、但跑了一段时间又涨上来」的项。典型是 explorer
+/// （开机 227 MB，跑几小时能到 600+），这部分只能靠重启回收，不能靠瘦身。
+///
+/// 不入榜的三种情况：
+///   * 基准或当前有实例内存没读到 —— 涨跌无从判断，不拿残缺合计硬算；
+///   * 增长低于 `min_growth_mb` —— 噪声；
+///   * 进程名不在基准里 —— 那是线外项，归 `build_plan` 管。
+#[derive(Clone, Debug)]
+pub struct ReclaimItem {
+    pub name: String,
+    pub instances: u32,
+    pub base_instances: u32,
+    pub mem_mb: f64,
+    pub base_mb: f64,
+    pub growth_mb: f64,
+    pub path: String,
+    pub tier: Tier,
+    /// 能不能走 `restart`（关键组件 / 共享宿主 / 无路径会被拒）
+    pub allowed: bool,
+    /// 拒绝原因；`allowed` 时为空的静态串
+    pub reason: &'static str,
+    pub protect: bool,
+    pub protect_by: String,
+}
+
+pub fn build_reclaim_plan(
+    base_procs: &BTreeMap<String, ProcAgg>,
+    live_procs: &[LiveProc],
+    whitelist: &[String],
+    min_growth_mb: f64,
+) -> Vec<ReclaimItem> {
+    let mut agg: BTreeMap<String, (u32, f64, u32, String)> = BTreeMap::new();
+    for p in live_procs {
+        let e = agg
+            .entry(p.name.clone())
+            .or_insert((0, 0.0, 0, String::new()));
+        e.0 += 1;
+        e.1 += p.ws_mb;
+        e.2 += p.unknown;
+        if e.3.is_empty() && !p.path.is_empty() {
+            e.3 = p.path.clone();
+        }
+    }
+
+    let mut out: Vec<ReclaimItem> = Vec::new();
+    for (name, (instances, mem_mb, unknown, path)) in agg {
+        let Some(base) = base_procs.get(&name) else {
+            continue;
+        };
+        // 任一侧有实例读不到内存，这一项的「增长」就是残缺的
+        if base.unknown > 0 || unknown > 0 {
+            continue;
+        }
+        let growth_mb = mem_mb - base.ws_mb;
+        if growth_mb < min_growth_mb {
+            continue;
+        }
+        let tier = tier_for(Kind::Process, &name, &path);
+        let chk = crate::feature::restart_check(
+            crate::feature::RestartKind::Process,
+            &name,
+            &path,
+            tier,
+        );
+        let by = protect_pattern(whitelist, Kind::Process, &name).unwrap_or_default();
+        out.push(ReclaimItem {
+            name,
+            instances,
+            base_instances: base.instances,
+            mem_mb,
+            base_mb: base.ws_mb,
+            growth_mb,
+            path,
+            tier,
+            allowed: chk.allowed,
+            reason: chk.reason,
+            protect: !by.is_empty(),
+            protect_by: by,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.growth_mb
+            .partial_cmp(&a.growth_mb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
 pub fn plan_actionable(plan: &[PlanItem], include_caution: bool) -> Vec<&PlanItem> {
     plan.iter().filter(|p| p.actionable(include_caution)).collect()
 }
@@ -1723,6 +1816,61 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn reclaim_only_counts_baseline_growth() {
+        let mut base = BTreeMap::new();
+        base.insert("explorer".to_string(), agg(1, 227.0));
+        base.insert("ctfmon".to_string(), agg(1, 32.0));
+        base.insert("stable".to_string(), agg(1, 100.0));
+
+        let live = vec![
+            lp("explorer", 1, 619.0, "C:\\Windows\\explorer.exe"),
+            lp("ctfmon", 2, 36.0, "C:\\Windows\\System32\\ctfmon.exe"),
+            lp("stable", 3, 101.0, "C:\\Tools\\stable.exe"),
+            lp("new-app", 4, 800.0, "C:\\Tools\\new.exe"), // 基准里没有，归线外
+        ];
+        let plan = build_reclaim_plan(&base, &live, &[], 10.0);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].name, "explorer");
+        assert_eq!(plan[0].growth_mb, 392.0);
+        assert!(plan[0].allowed);
+        assert_eq!(plan[0].base_instances, 1);
+    }
+
+    #[test]
+    fn reclaim_skips_unknown_and_blocks_critical() {
+        let mut base = BTreeMap::new();
+        base.insert("explorer".to_string(), agg(1, 200.0));
+        base.insert("dwm".to_string(), agg(1, 100.0));
+        let mut blind = agg(1, 300.0);
+        blind.unknown = 1;
+        base.insert("blind".to_string(), blind);
+
+        let mut live_blind = lp("blind", 3, 400.0, "C:\\blind.exe");
+        live_blind.unknown = 1;
+        let live = vec![
+            lp("explorer", 1, 600.0, "C:\\Windows\\explorer.exe"),
+            lp("dwm", 2, 300.0, "C:\\Windows\\System32\\dwm.exe"),
+            live_blind,
+        ];
+        let plan = build_reclaim_plan(&base, &live, &[], 10.0);
+        assert_eq!(plan.len(), 2);
+        let dwm = plan.iter().find(|p| p.name == "dwm").unwrap();
+        assert!(!dwm.allowed);
+        assert!(dwm.reason.contains("关键"));
+        assert!(!plan.iter().any(|p| p.name == "blind"));
+    }
+
+    #[test]
+    fn reclaim_marks_protected() {
+        let mut base = BTreeMap::new();
+        base.insert("explorer".to_string(), agg(1, 200.0));
+        let live = vec![lp("explorer", 1, 600.0, "C:\\Windows\\explorer.exe")];
+        let plan = build_reclaim_plan(&base, &live, &["进程:explorer".to_string()], 10.0);
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].protect);
     }
 
     #[test]

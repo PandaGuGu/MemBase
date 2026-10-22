@@ -1,19 +1,23 @@
 [package]
-name = "deskkit-cli"
+name = "membase-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DeskKit 命令行：每个原子操作一个子命令，全部支持 --json；GUI 的每个按钮都在这里有对应动词"
+description = "MemBase 命令行：每个原子操作一个子命令，全部支持 --json；GUI 的每个按钮都在这里有对应动词"
 
+# 控制台子系统的独立版。名字不能叫 membase：Windows 文件名不区分大小写，
+# 会和数据目录里的任务副本 membase.exe 撞名。
 [[bin]]
-name = "deskkit"
+name = "membase-cli"
 path = "src/main.rs"
 
 [dependencies]
-deskkit-core.workspace = true
-deskkit-win.workspace = true
+membase-core.workspace = true
+membase-win.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+# MCP 层要用 serde_json；core 已经在编它，不新增编译量
+serde_json.workspace = true
 
 [lints]
 workspace = true

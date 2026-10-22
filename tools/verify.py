@@ -120,15 +120,15 @@ def bmp_stats(path):
 
 def shot(page, modal=None, name=None, env_extra=None):
     """用界面自带的截图开关抓一帧，返回 (路径, 尺寸, 颜色数)。"""
-    path = os.path.join(tempfile.gettempdir(), 'deskkit_shot_%s.bmp' % (name or page or 'default'))
+    path = os.path.join(tempfile.gettempdir(), 'membase_shot_%s.bmp' % (name or page or 'default'))
     if os.path.exists(path):
         os.remove(path)
     e = dict(os.environ)
-    e['DESKKIT_SHOT'] = path
+    e['MEMBASE_SHOT'] = path
     if page:
-        e['DESKKIT_PAGE'] = page
+        e['MEMBASE_PAGE'] = page
     if modal:
-        e['DESKKIT_SHOT_MODAL'] = modal
+        e['MEMBASE_SHOT_MODAL'] = modal
     if env_extra:
         e.update(env_extra)
     p = subprocess.run([GUI], capture_output=True, env=e, timeout=120)
@@ -196,7 +196,7 @@ def check_mem(tmp):
     case(G, 'compare', ['compare'], 0)
 
     # 保护名单：加一条临时项、确认写入、再删掉
-    entry = '进程:__deskkit_verify__'
+    entry = '进程:__membase_verify__'
     case(G, 'protect list', ['protect', 'list', '--json'], 0)
     case(G, 'protect add', ['protect', 'add', entry], 0)
 
@@ -356,7 +356,7 @@ def check_layout():
     add(G, '演练未改注册表', 'layout repair（无 --execute）', cache_before, cache_after,
         cache_before == cache_after, '缓存大小前后一致')
 
-    name = '__deskkit_verify__'
+    name = '__membase_verify__'
     case(G, 'layout save', ['layout', 'save', name], 0,
          verify=lambda o, e, c: True)
     case(G, 'layout show', ['layout', 'show', name, '--json'], 0,
@@ -467,7 +467,7 @@ def check_screen():
 def check_blackout_exit():
     """息屏退得出来吗 —— 这是用户踩过两次的坑，必须真按键验一遍。
 
-    全程 **不真关显示器**（DESKKIT_BLACKOUT_TEST=1 只进黑屏层），
+    全程 **不真关显示器**（MEMBASE_BLACKOUT_TEST=1 只进黑屏层），
     用窗口的 WS_EX_TOPMOST 位判断在不在息屏（比量矩形可靠，全屏命令是异步的）。
     重点验第二种：窗口被最小化/隐藏时 eframe 只调 logic() 不调 ui()，
     退出判断写在 ui 里就会永久失效 —— 那就是「息屏退不出来」。
@@ -485,7 +485,7 @@ def check_blackout_exit():
         u.keybd_event(VK_ESCAPE, 0, 2, 0)
 
     e = dict(os.environ)
-    e['DESKKIT_BLACKOUT_TEST'] = '1'
+    e['MEMBASE_BLACKOUT_TEST'] = '1'
     proc = subprocess.Popen([GUI], env=e)
     try:
         h = 0
@@ -499,7 +499,7 @@ def check_blackout_exit():
             if h and topmost(h):
                 break
             time.sleep(0.1)
-        add(G, '黑屏层已置顶', 'DESKKIT_BLACKOUT_TEST=1', 'WS_EX_TOPMOST 置位',
+        add(G, '黑屏层已置顶', 'MEMBASE_BLACKOUT_TEST=1', 'WS_EX_TOPMOST 置位',
             '置位' if topmost(h) else '没置位', bool(h) and topmost(h))
         if not (h and topmost(h)):
             return
@@ -541,7 +541,7 @@ def check_blackout_exit():
                         break
                     time.sleep(0.1)
                 if not (h and topmost(h)):
-                    add(G, '重新进入息屏（为验最小化）', 'DESKKIT_BLACKOUT_TEST=1', '置顶',
+                    add(G, '重新进入息屏（为验最小化）', 'MEMBASE_BLACKOUT_TEST=1', '置顶',
                         '没置顶', False)
                     return
                 time.sleep(1.2)
@@ -551,14 +551,14 @@ def check_blackout_exit():
 
 
 def check_blackout():
-    """黑屏层：进全屏纯黑，不动显示器（DESKKIT_BLACKOUT_TEST 只跳过关屏那一步）。"""
+    """黑屏层：进全屏纯黑，不动显示器（MEMBASE_BLACKOUT_TEST 只跳过关屏那一步）。"""
     G = '息屏'
-    path = os.path.join(tempfile.gettempdir(), 'deskkit_blackout.bmp')
+    path = os.path.join(tempfile.gettempdir(), 'membase_blackout.bmp')
     if os.path.exists(path):
         os.remove(path)
     e = dict(os.environ)
-    e['DESKKIT_BLACKOUT_TEST'] = '1'
-    e['DESKKIT_SHOT'] = path
+    e['MEMBASE_BLACKOUT_TEST'] = '1'
+    e['MEMBASE_SHOT'] = path
     code = subprocess.run([GUI], capture_output=True, env=e, timeout=120).returncode
     w, h, colors = bmp_stats(path) if os.path.exists(path) else (0, 0, 0)
     # 大面积纯黑 + 一行灰提示：颜色数很少但不为 0
@@ -578,7 +578,7 @@ def check_blackout():
         os.remove(path)
     ratio = (dark / total) if total else 0.0
     ok = code == 0 and w >= 1600 and 0 < colors < 60 and ratio > 0.95
-    add(G, '黑屏层（全屏）', 'DESKKIT_BLACKOUT_TEST=1', '≥95% 纯黑 + 有提示文字',
+    add(G, '黑屏层（全屏）', 'MEMBASE_BLACKOUT_TEST=1', '≥95% 纯黑 + 有提示文字',
         '%dx%d / %d 色 / 纯黑 %.1f%%' % (w, h, colors, ratio * 100), ok)
 
 
@@ -635,14 +635,14 @@ def check_gui_pages():
     for slug, label in pages:
         path, (w, h, colors), code = shot(slug)
         ok = w > 800 and h > 500 and colors > 60 and code == 0
-        add(G, label, 'DESKKIT_PAGE=%s' % (slug or '(默认)'), '渲染正常',
+        add(G, label, 'MEMBASE_PAGE=%s' % (slug or '(默认)'), '渲染正常',
             '%dx%d / %d 色' % (w, h, colors), ok)
         if os.path.exists(path):
             hashes[label] = hashlib.md5(open(path, 'rb').read()).hexdigest()
-            bmp2png.bmp_to_png(path, os.path.join(tempfile.gettempdir(), 'deskkit_verify_%s.png' % (slug or 'processes')))
+            bmp2png.bmp_to_png(path, os.path.join(tempfile.gettempdir(), 'membase_verify_%s.png' % (slug or 'processes')))
             os.remove(path)
 
-    # 每页截图必须互不相同 —— 否则说明 DESKKIT_PAGE 没生效，全都截成了同一页
+    # 每页截图必须互不相同 —— 否则说明 MEMBASE_PAGE 没生效，全都截成了同一页
     add(G, '各页内容互不相同', '%d 张截图 md5' % len(pages), len(pages), len(set(hashes.values())),
         len(set(hashes.values())) == len(pages))
 
@@ -650,14 +650,89 @@ def check_gui_pages():
         page = None if modal == 'trim' else 'layouts'
         path, (w, h, colors), code = shot(page, modal=modal, name='m_' + modal)
         ok = w > 800 and colors > 60 and code == 0
-        add(G, label, 'DESKKIT_SHOT_MODAL=%s' % modal, '渲染正常',
+        add(G, label, 'MEMBASE_SHOT_MODAL=%s' % modal, '渲染正常',
             '%dx%d / %d 色' % (w, h, colors), ok)
         if os.path.exists(path):
             os.remove(path)
 
 
 # =====================================================================
-# 6. 一致性不变量：界面动作 ↔ 命令 ↔ GUI 源码
+# 6.5 MCP 服务端：AI 能直接调用，且护栏与命令行一致
+# =====================================================================
+def check_mcp():
+    G = 'MCP'
+    selftest = os.path.join(ROOT, 'tools', 'mcp_selftest.py')
+    if not os.path.isfile(selftest):
+        add(G, '自测脚本存在', selftest, '存在', '缺失', False)
+        return
+
+    # 直接跑自测脚本（它是真的起进程发 JSON-RPC，不是 mock）
+    import subprocess
+    p = subprocess.run([sys.executable, selftest, EXE],
+                       capture_output=True, text=True, encoding='utf-8', errors='replace')
+    out = (p.stdout or '') + (p.stderr or '')
+    ok = p.returncode == 0
+    total = len([l for l in out.splitlines() if l.startswith('[')])
+    add(G, 'MCP 自测全通过', 'tools/mcp_selftest.py', '0 失败',
+        '0 失败' if ok else '有失败', ok, out.strip().splitlines()[-1] if out.strip() else '')
+
+    # 单独确认几个关键事实（自测脚本内部也查了，这里是防脚本本身坏掉时静默通过）
+    try:
+        tools = mcp_tools(EXE)
+        names = {t['name'] for t in tools}
+        add(G, '工具数', 'tools/list', '16', len(tools), len(tools) == 16)
+        need = {'mem_status', 'mem_list', 'mem_plan', 'mem_trim', 'mem_slim',
+                'mem_restart', 'mem_kill', 'mem_svc', 'mem_feature', 'mem_startup',
+                'mem_protect', 'mem_collect', 'mem_compare', 'mem_transient',
+                'mem_baseline', 'mem_commands'}
+        add(G, '工具集合完整', 'tools/list', '16 个', '缺 %d' % len(need - names),
+            not (need - names), ', '.join(sorted(need - names)))
+
+        # 动手类工具必须带 execute/yes；只读类必须不带
+        mutating = {'mem_trim', 'mem_slim', 'mem_restart', 'mem_kill', 'mem_svc',
+                    'mem_feature', 'mem_startup', 'mem_protect', 'mem_baseline'}
+        bad = []
+        for t in tools:
+            props = t.get('inputSchema', {}).get('properties', {})
+            has_gate = 'execute' in props and 'yes' in props
+            if t['name'] in mutating and not has_gate:
+                bad.append('%s 缺门禁' % t['name'])
+            if t['name'] not in mutating and has_gate:
+                bad.append('%s 不该有门禁' % t['name'])
+        add(G, '门禁位与动手属性一致', 'tools/list 的 inputSchema', '全部一致',
+            '不一致 %d' % len(bad), not bad, '; '.join(bad[:3]))
+    except Exception as e:
+        add(G, 'tools/list 可读', 'tools/list', '成功', str(e)[:60], False)
+
+
+def mcp_tools(exe):
+    """起一个 MCP 服务端，拿到工具清单。"""
+    import subprocess
+    p = subprocess.Popen([exe, 'mcp'], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def ask(msg):
+        p.stdin.write((json.dumps(msg) + '\n').encode('utf-8'))
+        p.stdin.flush()
+        # stdout 是二进制流，readline 只在文本流里有
+        return json.loads(p.stdout.readline().decode('utf-8'))
+
+    try:
+        ask({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+             'params': {'protocolVersion': '2025-06-18', 'capabilities': {},
+                        'clientInfo': {'name': 'verify', 'version': '1'}}})
+        doc = ask({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
+        return doc.get('result', {}).get('tools', [])
+    finally:
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+        p.wait(timeout=10)
+
+
+# =====================================================================
+# 7. 一致性不变量：界面动作 ↔ 命令 ↔ GUI 源码
 # =====================================================================
 def check_consistency():
     G = '一致性'
@@ -766,7 +841,7 @@ def main():
         raise SystemExit('先构建：cargo build --workspace --release')
     version = check_artifacts()
     protect_before = len(jload(run(['protect', 'list', '--json'])[1]).get('protect', []))
-    tmp = tempfile.mkdtemp(prefix='deskkit_verify_')
+    tmp = tempfile.mkdtemp(prefix='membase_verify_')
     try:
         check_mem(tmp)
         check_maint(tmp)
@@ -774,6 +849,7 @@ def main():
         check_layout()
         check_task()
         check_consistency()
+        check_mcp()
         check_screen()
         check_restored(protect_before)
         if not fast:

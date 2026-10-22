@@ -1656,7 +1656,7 @@ pub fn delete_user_reg_value(path: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 卸载一个 Store 应用（包全名来自 [`deskkit_core::appx_from_path`]）。
+/// 卸载一个 Store 应用（包全名来自 [`membase_core::appx_from_path`]）。
 ///
 /// 路径落在 `\WindowsApps\` 下的服务，只禁服务会被重新挂起来，必须真卸。
 /// 界面和命令行共用这一份，不许各写一套。

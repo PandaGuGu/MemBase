@@ -304,7 +304,7 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         ("UptimeSeconds".into(), snap.uptime_s.to_string()),
         ("CollectMs".into(), snap.collect_ms.to_string()),
         ("Elevated".into(), snap.elevated.to_string()),
-        ("Build".into(), jstr(&deskkit_core::build_id())),
+        ("Build".into(), jstr(&membase_core::build_id())),
         ("ComputerName".into(), jstr(&snap.computer)),
         ("OsCaption".into(), jstr(&snap.os_caption)),
         ("OsVersion".into(), jstr(&snap.os_version)),
@@ -456,8 +456,8 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     ));
     m.push_str(&format!(
         "- 采集程序：membase {} ({})\n",
-        deskkit_core::VERSION,
-        deskkit_core::build_id()
+        membase_core::VERSION,
+        membase_core::build_id()
     ));
     m.push_str(&format!(
         "- 采集身份：{}（{}）\n",

@@ -194,6 +194,38 @@ MemBase.exe screen status
 
 ![确认弹窗](docs/screenshots/confirm.png)
 
+## MCP：让 AI 直接调用
+
+同一个 `MemBase.exe` 还能当 MCP server（Model Context Protocol，stdio + JSON-RPC 2.0），把上面那套动词原样暴露给 AI 客户端（Claude Code、Cursor、WorkBuddy 等）：
+
+```bash
+MemBase.exe mcp
+```
+
+客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "membase": {
+      "command": "C:\\Program Files\\MemBase\\MemBase.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+提供 16 个工具：`mem_status` / `mem_list` / `mem_plan` / `mem_trim` / `mem_slim` / `mem_restart` / `mem_kill` / `mem_svc` / `mem_feature` / `mem_startup` / `mem_protect` / `mem_collect` / `mem_compare` / `mem_transient` / `mem_baseline` / `mem_commands`。
+
+**护栏与命令行完全一致** —— MCP 不是绕过安全机制的后门：
+
+- 每个会动手的工具都带 `execute` 与 `yes` 两个布尔位，**必须同时为 true** 才会真的动手；只给 `execute` 会被拒绝
+- 两个都为 false（默认）时只输出预演结果，不碰系统
+- 关键系统服务仍然被拒（`Tier::Blocked`），保护名单仍然生效
+- 工具实现直接调用已有 CLI 动词，不重写业务逻辑 —— 界面上能做的，AI 也能做，反之亦然
+
+MCP 层不引入任何新依赖（只用已在编译的 `serde_json`），手写 JSON-RPC 的行分隔收发。
+
 ## 下载与运行
 
 从 [Releases](https://github.com/PandaGuGu/MemBase/releases/latest) 下载最新压缩包，解压后运行 `MemBase.exe`。
@@ -216,8 +248,8 @@ MemBase.exe screen status
 cargo build --workspace --release
 # target\release\MemBase.exe   唯一产物：界面（带参数即命令行）
 
-cargo test -p deskkit-core    # 70 个纯逻辑测试
-cargo test -p deskkit-win     # 15 个平台层测试（1 个需真实桌面会话的用例默认忽略）
+cargo test -p membase-core    # 70 个纯逻辑测试
+cargo test -p membase-win     # 15 个平台层测试（1 个需真实桌面会话的用例默认忽略）
 python tools/verify.py        # 124 项全量验收（命令行动词 + 每页截图 + 动作表一致性）
 python tools/verify.py --fast # 跳过 10 页截图与黑屏层，只验命令行，约 10 秒
 ```

@@ -19,12 +19,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p deskkit-core
-      - run: cargo build -p deskkit-cli --release
+      - run: cargo test -p membase-core
+      - run: cargo build -p membase-cli --release
       - name: CLI 自描述仍可用
         run: |
-          ./target/release/deskkit commands --json | grep -q '"commands"'
-          ./target/release/deskkit version
+          ./target/release/membase-cli commands --json | grep -q '"commands"'
+          ./target/release/membase-cli version
 
   # 完整构建 + 全部测试。CLI 是控制台程序、GUI 是窗口程序，
   # 这两个子系统不能弄反（弄反了开机任务会弹窗而不是采集）。
@@ -50,12 +50,12 @@ jobs:
             sub=$(od -An -tu2 -j$((off + 4 + 20 + 68)) -N2 "$f" | tr -d ' ')
             echo "$sub"
           }
-          for f in target/release/deskkit.exe target/release/MemBase.exe; do
+          for f in target/release/membase-cli.exe target/release/MemBase.exe; do
             [ -f "$f" ] || { echo "缺少产物：$f"; exit 1; }
           done
-          cli=$(subsystem target/release/deskkit.exe)
+          cli=$(subsystem target/release/membase-cli.exe)
           gui=$(subsystem target/release/MemBase.exe)
-          echo "deskkit.exe 子系统=$cli（应为 3 控制台）"
+          echo "membase-cli.exe 子系统=$cli（应为 3 控制台）"
           echo "MemBase.exe 子系统=$gui（应为 2 窗口）"
           [ "$cli" = "3" ] || exit 1
           [ "$gui" = "2" ] || exit 1
@@ -64,10 +64,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          out=$(./target/release/deskkit.exe commands --json)
+          out=$(./target/release/membase-cli.exe commands --json)
           echo "$out" | grep -q '"commands"'
           echo "$out" | grep -q '"exit_codes"'
-          ./target/release/deskkit.exe version
+          ./target/release/membase-cli.exe version
 
       - name: 界面版也能当命令行用（单文件分发）
         shell: bash
@@ -75,3 +75,15 @@ jobs:
           set -euo pipefail
           ./target/release/MemBase.exe version
           ./target/release/MemBase.exe commands --json | grep -q '"commands"'
+
+      - name: MCP 服务端自检（便携版直接当 MCP server）
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/mcp_selftest.py target/release/MemBase.exe
+
+      - name: MCP 服务端自检（控制台版）
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/mcp_selftest.py target/release/membase-cli.exe

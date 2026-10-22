@@ -10,7 +10,7 @@
 //! 自己抠字符串会在中文路径和相对路径上翻车。
 
 use crate::win;
-use deskkit_core::startup::{self as core_startup, StartupRaw, StartupSource};
+use membase_core::startup::{self as core_startup, StartupRaw, StartupSource};
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};

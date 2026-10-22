@@ -1,19 +1,19 @@
 //! MemBase GUI —— 内存基准线 · 桌面图标布局（同一套界面）
 //!
-//! 界面上每个按钮都有一条等价命令行（见 deskkit-cli 的 ACTIONS 表）：
+//! 界面上每个按钮都有一条等价命令行（见 membase-cli 的 ACTIONS 表）：
 //! 按钮 hover 会直接把那条命令写出来，程序里也另有一页「命令行」做对照。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use deskkit_cli::layout::{self as cli_map, ACTIONS};
-use deskkit_core as core;
-use deskkit_core::layout::{IconPos, Layout, LayoutEntry, Plan};
-use deskkit_core::layout_store as store;
-use deskkit_core::{Kind, Tier};
-use deskkit_win::gui_icon::{self, IconProvider};
-use deskkit_win::task::{self as boot, TaskInfo};
-use deskkit_win::desktop::Desktop;
-use deskkit_win::{actions, close, repair, restart, shellview::ShellView, snapshot, startup, win};
+use membase_cli::layout::{self as cli_map, ACTIONS};
+use membase_core as core;
+use membase_core::layout::{IconPos, Layout, LayoutEntry, Plan};
+use membase_core::layout_store as store;
+use membase_core::{Kind, Tier};
+use membase_win::gui_icon::{self, IconProvider};
+use membase_win::task::{self as boot, TaskInfo};
+use membase_win::desktop::Desktop;
+use membase_win::{actions, close, repair, restart, shellview::ShellView, snapshot, startup, win};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -123,7 +123,7 @@ fn pal() -> Palette {
 
 /// 主题偏好落在 %APPDATA%\MemBase\theme.txt，读写都走 cli crate（与 `MemBase.exe theme` 同源）
 fn load_theme() -> bool {
-    deskkit_cli::read_theme()
+    membase_cli::read_theme()
 }
 
 struct Row {
@@ -312,14 +312,14 @@ struct App {
     /// 正在息屏（全屏黑）
     blackout: Option<Blackout>,
     /// 息屏期间的全局输入监听：系统级查按键/光标，跟窗口焦点无关
-    bo_watch: Option<deskkit_win::screen::Watch>,
+    bo_watch: Option<membase_win::screen::Watch>,
     /// 默认息屏时长（秒，0 = 不自动退出）
     bo_secs: u64,
     /// 退出息屏的热键（默认 ESC）
-    bo_key: deskkit_win::screen::ExitKey,
+    bo_key: membase_win::screen::ExitKey,
     /// 息屏时是否同时关显示器电源（默认否：只盖黑窗，最不容易退不出来）
     bo_power_off: bool,
-    /// 自检模式：DESKKIT_BLACKOUT_TEST=1 时进息屏但不真关显示器（截图验证用）
+    /// 自检模式：MEMBASE_BLACKOUT_TEST=1 时进息屏但不真关显示器（截图验证用）
     bo_test: bool,
 }
 
@@ -532,7 +532,7 @@ impl App {
         setup_fonts(&cc.egui_ctx);
         let dark = load_theme();
         set_dark_mode(dark);
-        let root = PathBuf::from(deskkit_core::config::data_root(None));
+        let root = PathBuf::from(membase_core::config::data_root(None));
         let protect_file = root.join("protect.txt");
         let boot = boot::query(core::DEFAULT_TASK);
         // 已经安排过就沿用当时的秒数，免得重新注册时手滑改掉
@@ -563,7 +563,7 @@ impl App {
             is_admin: win::is_admin(),
             protect_file,
             frames: 0,
-            shot_path: std::env::var("DESKKIT_SHOT").ok(),
+            shot_path: std::env::var("MEMBASE_SHOT").ok(),
             scan_rx: None,
             themed_for: None,
             page: Page::Processes,
@@ -606,16 +606,16 @@ impl App {
             scr_last: String::new(),
             blackout: None,
             bo_watch: None,
-            bo_secs: deskkit_win::screen::default_secs(),
-            bo_key: deskkit_win::screen::exit_key(),
-            bo_power_off: deskkit_win::screen::power_off(),
-            bo_test: std::env::var("DESKKIT_BLACKOUT_TEST").is_ok(),
+            bo_secs: membase_win::screen::default_secs(),
+            bo_key: membase_win::screen::exit_key(),
+            bo_power_off: membase_win::screen::power_off(),
+            bo_test: std::env::var("MEMBASE_BLACKOUT_TEST").is_ok(),
         };
         // 屏幕分辨率很便宜，先取好
-        let (sw, sh) = deskkit_win::sys::screen_size();
+        let (sw, sh) = membase_win::sys::screen_size();
         app.lay_screen = format!("{}×{}", sw, sh);
-        // 自检/截图：DESKKIT_PAGE=layouts|cli|... 直接开在指定页
-        if let Ok(p) = std::env::var("DESKKIT_PAGE") {
+        // 自检/截图：MEMBASE_PAGE=layouts|cli|... 直接开在指定页
+        if let Ok(p) = std::env::var("MEMBASE_PAGE") {
             app.page = match p.to_lowercase().as_str() {
                 "layouts" | "layout" | "desk" => Page::Layouts,
                 "cli" | "commands" => Page::Cli,
@@ -682,7 +682,7 @@ impl App {
             collect_from_base: false,
             missing: None,
         };
-        let Some(base_dir) = deskkit_win::compare::find_latest_baseline(root) else {
+        let Some(base_dir) = membase_win::compare::find_latest_baseline(root) else {
             out.missing = Some(format!(
                 "没有基准快照，先跑一次 MemBase.exe collect（{}）",
                 root.display()
@@ -988,10 +988,10 @@ impl App {
             }
         };
         let text = dir.to_string_lossy().to_string();
-        let cfg = deskkit_core::config::Config {
+        let cfg = membase_core::config::Config {
             data_root: Some(text.clone()),
         };
-        match deskkit_core::config::save(&cfg) {
+        match membase_core::config::save(&cfg) {
             Ok(path) => {
                 self.root = dir.clone();
                 self.protect_file = dir.join("protect.txt");
@@ -1093,7 +1093,7 @@ impl App {
         self.slim_loaded = true;
         self.slim_items.clear();
         self.slim_pick.clear();
-        let Some(dir) = deskkit_win::compare::find_latest_baseline(&self.root) else {
+        let Some(dir) = membase_win::compare::find_latest_baseline(&self.root) else {
             self.slim_msg = "没有基准快照：先在「基准」页采集或导入一份".to_string();
             return;
         };
@@ -1117,7 +1117,7 @@ impl App {
                 *mem_by_exe.entry(p.name.to_lowercase()).or_insert(0.0) += ws;
             }
         }
-        let startup_raw = deskkit_win::startup::scan();
+        let startup_raw = membase_win::startup::scan();
         let no_baseline: std::collections::BTreeSet<String> = Default::default();
         let startup_items = core::startup::build_startup_items(&startup_raw, &no_baseline);
         let startup_items = core::build_startup_trim_items(
@@ -1220,7 +1220,7 @@ impl App {
     fn refresh_startup(&mut self) {
         let raw = startup::scan();
         let mut baseline: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        if let Some(dir) = deskkit_win::compare::find_latest_baseline(&self.root) {
+        if let Some(dir) = membase_win::compare::find_latest_baseline(&self.root) {
             let text =
                 std::fs::read_to_string(dir.join("processes_by_name.csv")).unwrap_or_default();
             for (name, _) in core::parse_by_name(&text) {
@@ -1297,7 +1297,7 @@ impl App {
     }
 
     fn export_baseline(&mut self) {
-        let dir = match deskkit_win::compare::find_latest_baseline(&self.root) {
+        let dir = match membase_win::compare::find_latest_baseline(&self.root) {
             Some(d) => d,
             None => {
                 self.status = "没有基准可以导出".into();
@@ -1305,10 +1305,10 @@ impl App {
             }
         };
         let captured =
-            deskkit_core::bundle::snapshot_meta(&dir, "CapturedAtLocal").unwrap_or_default();
-        let mut stamp = deskkit_core::bundle::stamp_from_local(&captured);
+            membase_core::bundle::snapshot_meta(&dir, "CapturedAtLocal").unwrap_or_default();
+        let mut stamp = membase_core::bundle::stamp_from_local(&captured);
         if stamp.is_empty() {
-            stamp = deskkit_core::bundle::timestamp();
+            stamp = membase_core::bundle::timestamp();
         }
         let picked = rfd::FileDialog::new()
             .set_title("导出基准线")
@@ -1322,7 +1322,7 @@ impl App {
                 return;
             }
         };
-        match deskkit_core::bundle::export_baseline(&dir, &path) {
+        match membase_core::bundle::export_baseline(&dir, &path) {
             Ok(r) => {
                 self.status = format!(
                     "已导出 {} 个文件 / {} 字节 → {}",
@@ -1348,9 +1348,9 @@ impl App {
             }
         };
         // 先校验，坏包绝不落地
-        match deskkit_core::bundle::verify_package(&path) {
+        match membase_core::bundle::verify_package(&path) {
             Ok((n, crc, captured)) => {
-                match deskkit_core::bundle::import_baseline(&self.root, &path, "imported") {
+                match membase_core::bundle::import_baseline(&self.root, &path, "imported") {
                     Ok(r) => {
                         self.status = format!(
                             "已导入 {} 个文件（采集 {}）→ {}",
@@ -2895,7 +2895,7 @@ impl App {
                     if self.dark != dark_mode() {
                         set_dark_mode(self.dark);
                         // 与 `MemBase.exe theme set` 同一个实现，界面和命令不会各写各的
-                        let _ = deskkit_cli::write_theme(self.dark);
+                        let _ = membase_cli::write_theme(self.dark);
                         self.status = format!(
                             "外观已切到{}（同 CLI：MemBase.exe theme set {}）",
                             if self.dark { "深色" } else { "浅色" },
@@ -2940,7 +2940,7 @@ impl App {
                 self.lay_arrange = None;
             }
         }
-        let (w, h) = deskkit_win::sys::screen_size();
+        let (w, h) = membase_win::sys::screen_size();
         self.lay_screen = format!("{}×{}", w, h);
         self.lay_shell = ShellView::try_open().is_some();
         self.lay_cache = repair::describe_cache();
@@ -3154,9 +3154,9 @@ impl App {
 
     /// 工具页要显示的三件事：几台显示器、关屏通道通不通、上次什么时候息屏
     fn refresh_screen_status(&mut self) {
-        self.scr_monitors = deskkit_win::screen::monitor_count();
-        self.scr_channel = deskkit_win::screen::probe();
-        self.scr_last = deskkit_win::screen::last_off().unwrap_or_default();
+        self.scr_monitors = membase_win::screen::monitor_count();
+        self.scr_channel = membase_win::screen::probe();
+        self.scr_last = membase_win::screen::last_off().unwrap_or_default();
     }
 
     /// 进入息屏：窗口铺成全屏纯黑；**默认不动显示器电源**。
@@ -3169,8 +3169,8 @@ impl App {
         let secs = self.bo_secs;
         let mut note = String::new();
         let mut powered = false;
-        if !self.bo_test && deskkit_win::screen::power_off() {
-            match deskkit_win::screen::off() {
+        if !self.bo_test && membase_win::screen::power_off() {
+            match membase_win::screen::off() {
                 // 关不掉也不算失败：黑屏照样挡住内容，只是费点电，如实告诉用户
                 Ok(()) => powered = true,
                 Err(e) => note = format!("（{}）", e),
@@ -3184,11 +3184,11 @@ impl App {
             std::sync::Arc::new(move || ctx.request_repaint())
                 as std::sync::Arc<dyn Fn() + Send + Sync>
         };
-        match deskkit_win::screen::Watch::start(
+        match membase_win::screen::Watch::start(
             self.bo_key,
             // 自检模式下不认鼠标移动：截图验收时谁碰一下鼠标都会把黑屏层收掉
-            !self.bo_test && deskkit_win::screen::mouse_exit(),
-            !self.bo_test && deskkit_win::screen::block_keys(),
+            !self.bo_test && membase_win::screen::mouse_exit(),
+            !self.bo_test && membase_win::screen::block_keys(),
             Some(wake_ui),
         ) {
             Ok(w) => self.bo_watch = Some(w),
@@ -3212,7 +3212,7 @@ impl App {
             egui::WindowLevel::AlwaysOnTop,
         ));
         // 息屏就是一片纯黑，鼠标指针也得收掉，不然屏幕上永远挂着一个箭头
-        deskkit_win::screen::hide_cursor();
+        membase_win::screen::hide_cursor();
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         ctx.request_repaint();
     }
@@ -3229,10 +3229,10 @@ impl App {
             egui::WindowLevel::Normal,
         ));
         // 不管之前是什么状态，退出息屏都把指针还回来
-        deskkit_win::screen::show_cursor();
+        membase_win::screen::show_cursor();
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         if powered {
-            deskkit_win::screen::wake();
+            membase_win::screen::wake();
         }
         self.refresh_screen_status();
         self.status = format!(
@@ -3287,10 +3287,10 @@ impl App {
         });
         let click = ctx.input(|i| i.pointer.any_click());
         let hot = match self.bo_key {
-            deskkit_win::screen::ExitKey::Esc => ctx.input(|i| i.key_pressed(egui::Key::Escape)),
-            deskkit_win::screen::ExitKey::Space => ctx.input(|i| i.key_pressed(egui::Key::Space)),
-            deskkit_win::screen::ExitKey::Enter => ctx.input(|i| i.key_pressed(egui::Key::Enter)),
-            deskkit_win::screen::ExitKey::Any => any_key,
+            membase_win::screen::ExitKey::Esc => ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+            membase_win::screen::ExitKey::Space => ctx.input(|i| i.key_pressed(egui::Key::Space)),
+            membase_win::screen::ExitKey::Enter => ctx.input(|i| i.key_pressed(egui::Key::Enter)),
+            membase_win::screen::ExitKey::Any => any_key,
         };
         if hot || click {
             let why = if click {
@@ -3325,7 +3325,7 @@ impl App {
                 format!(
                     "按 {} 退出 · {} 后自动亮",
                     self.bo_key.label(),
-                    deskkit_win::screen::fmt_hms(left)
+                    membase_win::screen::fmt_hms(left)
                 )
             }
             None => format!("按 {} 退出", self.bo_key.label()),
@@ -3924,15 +3924,15 @@ impl App {
                     );
                     if r1.changed() || r2.changed() || r3.changed() {
                         self.bo_secs = hh * 3600 + mm * 60 + ss;
-                        let _ = deskkit_win::screen::set_default_secs(self.bo_secs);
+                        let _ = membase_win::screen::set_default_secs(self.bo_secs);
                         self.status = format!(
                             "默认息屏时长已设为 {} · 同 CLI：MemBase.exe screen duration {}",
                             if self.bo_secs == 0 {
                                 "不定时".to_string()
                             } else {
-                                deskkit_win::screen::fmt_hms(self.bo_secs)
+                                membase_win::screen::fmt_hms(self.bo_secs)
                             },
-                            deskkit_win::screen::fmt_hms(self.bo_secs)
+                            membase_win::screen::fmt_hms(self.bo_secs)
                         );
                     }
                     let hov = format!(
@@ -3950,12 +3950,12 @@ impl App {
                             .on_hover_text(format!(
                                 "一键设为 {}\n同 CLI：MemBase.exe screen duration {}",
                                 label,
-                                deskkit_win::screen::fmt_hms(secs)
+                                membase_win::screen::fmt_hms(secs)
                             ))
                             .clicked()
                         {
                             self.bo_secs = secs;
-                            let _ = deskkit_win::screen::set_default_secs(secs);
+                            let _ = membase_win::screen::set_default_secs(secs);
                             self.status = format!("默认息屏时长已设为 {}", label);
                         }
                         ui.add_space(4.0);
@@ -3971,12 +3971,12 @@ impl App {
                         .selected_text(self.bo_key.label())
                         .width(96.0)
                         .show_ui(ui, |ui| {
-                            for k in deskkit_win::screen::ExitKey::all() {
+                            for k in membase_win::screen::ExitKey::all() {
                                 ui.selectable_value(&mut self.bo_key, k, k.label());
                             }
                         });
                     if self.bo_key != before {
-                        let _ = deskkit_win::screen::set_exit_key(self.bo_key);
+                        let _ = membase_win::screen::set_exit_key(self.bo_key);
                         self.status = format!(
                             "退出热键已改为 {} · 同 CLI：MemBase.exe screen key {}",
                             self.bo_key.label(),
@@ -3999,7 +3999,7 @@ impl App {
                         "更省电，但有些机器关得掉、叫不醒（屏幕黑着按什么都没反应）。\n默认关闭：只盖全屏黑窗，ESC 一定退得出来",
                     );
                     if r.changed() {
-                        let _ = deskkit_win::screen::set_power_off(self.bo_power_off);
+                        let _ = membase_win::screen::set_power_off(self.bo_power_off);
                         self.status = if self.bo_power_off {
                             "已打开「同时关闭显示器」：退出时会尝试叫醒显示器".into()
                         } else {
@@ -4047,7 +4047,7 @@ impl App {
                         "MemBase.exe screen off --seconds {} --exit-key {}  ·  MemBase.exe screen duration {}",
                         self.bo_secs,
                         self.bo_key.as_str(),
-                        deskkit_win::screen::fmt_hms(self.bo_secs)
+                        membase_win::screen::fmt_hms(self.bo_secs)
                     ),
                 );
 
@@ -4067,7 +4067,7 @@ impl App {
                 kv_row(
                     ui,
                     "缩放比例",
-                    &format!("{:.0}%", deskkit_win::sys::dpi_scale() * 100.0),
+                    &format!("{:.0}%", membase_win::sys::dpi_scale() * 100.0),
                 );
                 kv_row(
                     ui,
@@ -4280,14 +4280,14 @@ impl eframe::App for App {
         }
         // 调试：截图时顺便把确认弹窗打开，方便验证弹窗样式（boot = 开机采集弹窗）
         if self.frames == 2 {
-            match std::env::var("DESKKIT_SHOT_MODAL").as_deref() {
+            match std::env::var("MEMBASE_SHOT_MODAL").as_deref() {
                 Ok("boot") => self.confirm_boot = true,
                 Ok("layout") => self.confirm_restore = true,
                 Ok(_) => self.confirm = true,
                 Err(_) => {}
             }
         }
-        // 自检：DESKKIT_BLACKOUT_TEST=1 时自动进一次息屏（不真关显示器）。
+        // 自检：MEMBASE_BLACKOUT_TEST=1 时自动进一次息屏（不真关显示器）。
         // 帧计数一直走，这个自检才能脱离截图模式单独跑
         if self.bo_test && self.blackout.is_none() && self.frames == 3 {
             self.enter_blackout(&ctx);
@@ -5369,14 +5369,14 @@ fn main() -> eframe::Result<()> {
                 default_hook(info);
             }
         }));
-        let code = match std::panic::catch_unwind(deskkit_cli::run) {
+        let code = match std::panic::catch_unwind(membase_cli::run) {
             Ok(()) => 0,
             Err(_) => 3,
         };
         std::process::exit(code);
     }
     // DPI 感知 + COM 单线程套间：桌面图标坐标和 shell 接口都依赖它们
-    deskkit_win::init();
+    membase_win::init();
     let icon = egui::IconData {
         rgba: include_bytes!("../../../assets/icon_256.rgba").to_vec(),
         width: 256,

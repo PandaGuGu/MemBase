@@ -1,8 +1,8 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 //! MemBase.exe —— 内存基准线 + 桌面图标布局（命令行逻辑）
 //!
-//! 同一份逻辑被两个入口复用：独立的 `deskkit.exe`（控制台），
-//! 以及带参数启动的界面版 `MemBase.exe`（自己接回父控制台）。
+//! 同一份逻辑被两个入口复用：带参数启动的便携版 `MemBase.exe`
+//! （自己接回父控制台），以及独立的控制台版 `membase.exe`。
 //!
 //! 两件本来不相干的事在这里共用一套骨架：
 //!   * 内存侧：开机基准线 / 线外清单 / 恢复基准（原 MemBase）
@@ -13,10 +13,13 @@
 //!   * 每个动作一个子命令，没有交互式菜单
 //!   * 所有子命令支持 --json，输出结构化结果
 //!   * 固定退出码；需要动手的动作默认 dry-run，必须显式 --execute
+//!   * `mcp` 子命令把同一套动词以 MCP 协议暴露给 AI（见 [`mcp`]）
 //!
 //! 退出码：
 //!   0 成功 / 1 参数错误 / 2 没有基准快照 / 3 读写失败
 //!   4 有动作执行失败 / 5 被安全护栏拒绝 / 6 需要管理员权限
+
+pub mod mcp;
 
 #[cfg(windows)]
 pub mod layout;
@@ -24,11 +27,11 @@ pub mod layout;
 pub mod screen;
 
 #[cfg(windows)]
-use deskkit_core::{Kind, Tier};
+use membase_core::{Kind, Tier};
 #[cfg(windows)]
-use deskkit_win::{close, compare, restart, snapshot, win};
+use membase_win::{close, compare, restart, snapshot, win};
 // 常量与平台无关，usage() 在非 Windows 上也要用
-use deskkit_core as core;
+use membase_core as core;
 #[cfg(windows)]
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(windows)]
@@ -108,6 +111,11 @@ fn usage() {
 
   commands                   列出所有命令与参数（JSON 供 AI 发现）
 
+  mcp                        以 MCP 协议（stdio + JSON-RPC 2.0）服务
+                             同一套动词暴露给 AI，护栏与命令行完全一致：
+                             动手类工具的 execute 与 yes 必须同时为 true
+                             客户端配置：command=MemBase.exe, args=[mcp]
+
   trim                       恢复基准：关掉线外项
       --execute              真正执行（不加就是 dry-run，只出计划）
       --yes                  跳过确认（非交互环境必须带）
@@ -177,7 +185,7 @@ fn usage() {
   --out DIR                  数据目录，默认 {root}
 
 退出码: 0 成功 / 1 参数 / 2 无基准 / 3 IO / 4 动作失败 / 5 被拒绝"#,
-        ver = deskkit_core::VERSION,
+        ver = membase_core::VERSION,
         root = core::default_root(),
         task = core::default_task()
     );
@@ -257,7 +265,7 @@ fn positionals<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a String> 
 
 /// 主题文件路径：和基准线配置同目录的 theme.txt
 pub fn theme_path() -> PathBuf {
-    deskkit_core::config::config_path().with_file_name("theme.txt")
+    membase_core::config::config_path().with_file_name("theme.txt")
 }
 
 pub fn read_theme() -> bool {
@@ -318,7 +326,7 @@ fn cmd_theme(args: &[String]) {
 // ---------------- 数据目录配置（跨平台） ----------------
 
 fn cmd_config(args: &[String]) {
-    use deskkit_core::config as cfg;
+    use membase_core::config as cfg;
     let json = want_json(args);
     let pos = positionals(args, &["--out", "--to", "--task", "--label"]);
     let sub = pos.first().map(|s| s.as_str()).unwrap_or("get");
@@ -354,7 +362,7 @@ fn cmd_config(args: &[String]) {
             // 界面「打开数据目录」的等价命令；--json 时仍会把路径打出来
             if has_flag(args, "--open") {
                 #[cfg(windows)]
-                deskkit_win::win::open_folder(&effective);
+                membase_win::win::open_folder(&effective);
             }
         }
         "set" => {
@@ -423,7 +431,7 @@ fn cmd_config(args: &[String]) {
 // ---------------- 基准线：查看 / 校验 / 导出 / 导入（跨平台） ----------------
 
 fn cmd_baseline(args: &[String]) {
-    use deskkit_core::bundle;
+    use membase_core::bundle;
     let root = root_arg(args);
     let json = want_json(args);
     let sub = args
@@ -1557,6 +1565,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("ui", "打开界面（可指定落在哪一页）", "--page layouts|baseline|protect|boot|cli|tools|settings", "windows"),
     ("config", "数据目录配置：查看/修改/清除", "get|set <目录>|clear [--open]", "all"),
     ("commands", "列出所有命令与参数（本表）", "", "all"),
+    ("mcp", "以 MCP 协议（stdio）服务，供 AI 直接调用", "", "windows"),
     ("version", "打印版本", "", "all"),
 ];
 
@@ -1603,7 +1612,7 @@ fn cmd_commands(args: &[String]) {
         let actions = actions_json();
         println!(
             "{{\"version\":{},\"data_root\":{},\"exit_codes\":{{\"0\":\"ok\",\"1\":\"usage\",\"2\":\"no_baseline\",\"3\":\"io\",\"4\":\"action_failed\",\"5\":\"refused\"}},\"commands\":[{}],\"gui_actions\":[{}]}}",
-            jstr(deskkit_core::VERSION),
+            jstr(membase_core::VERSION),
             jstr(&core::default_root()),
             items.join(","),
             actions
@@ -1612,7 +1621,7 @@ fn cmd_commands(args: &[String]) {
     }
     println!(
         "MemBase.exe {}  数据目录 {}",
-        deskkit_core::VERSION,
+        membase_core::VERSION,
         core::default_root()
     );
     println!();
@@ -1850,7 +1859,7 @@ fn stop_and_disable_startup(
             let _ = close::close_group(exe, &targets, opts, &protected);
         }
     }
-    deskkit_win::startup::set_enabled(src, name, false)
+    membase_win::startup::set_enabled(src, name, false)
 }
 
 /// `MemBase.exe slim`：以开机基准为输入，列出「开机就有、但根本不需要」的服务。
@@ -1907,7 +1916,7 @@ fn cmd_slim(args: &[String]) {
     // 旧版 startup 一刀切跳过 Microsoft 目录后，trim / slim / feature 三条路也都够不着。
     // 这里按「进程真的在跑 + 内存过阈值」把它捞回来，系统任务里的空挂项自然不出现。
     let nodes = proc_nodes();
-    let startup_raw = deskkit_win::startup::scan();
+    let startup_raw = membase_win::startup::scan();
     let startup_items =
         core::startup::build_startup_items(&startup_raw, &baseline_proc_names(&root));
     let mut mem_by_exe: BTreeMap<String, f64> = BTreeMap::new();
@@ -2099,7 +2108,7 @@ fn cmd_startup(args: &[String]) {
         .unwrap_or_else(|| "list".into());
 
     let root = root_arg(args);
-    let raw = deskkit_win::startup::scan();
+    let raw = membase_win::startup::scan();
     let baseline = baseline_proc_names(&root);
     let items = core::startup::build_startup_items(&raw, &baseline);
 
@@ -2261,7 +2270,7 @@ fn cmd_startup(args: &[String]) {
         eprintln!("[!] 改启动项要显式加 --yes");
         std::process::exit(EXIT_REFUSED);
     }
-    match deskkit_win::startup::set_enabled(it.source, &it.name, enable) {
+    match membase_win::startup::set_enabled(it.source, &it.name, enable) {
         Ok(()) => {
             if json {
                 println!(
@@ -3359,7 +3368,7 @@ fn cmd_ui(args: &[String]) {
     }
     let mut cmd = Command::new(&gui);
     if !page.trim().is_empty() {
-        cmd.env("DESKKIT_PAGE", page.trim());
+        cmd.env("MEMBASE_PAGE", page.trim());
     }
     match cmd.spawn() {
         Ok(_) => {
@@ -3380,7 +3389,7 @@ fn cmd_ui(args: &[String]) {
     }
 }
 
-/// 注册开机采集任务。XML、拷 exe、调 schtasks 都在 deskkit-win::task 里，
+/// 注册开机采集任务。XML、拷 exe、调 schtasks 都在 membase-win::task 里，
 /// GUI 的按钮走的是同一份实现。
 #[cfg(windows)]
 fn cmd_install(args: &[String]) {
@@ -3393,7 +3402,7 @@ fn cmd_install(args: &[String]) {
     let json = want_json(args);
 
     let cur = std::env::current_exe().expect("取不到自身路径");
-    let res = deskkit_win::task::install(&cur, &out, at, also, &task);
+    let res = membase_win::task::install(&cur, &out, at, also, &task);
     let ok = res.is_ok();
     let target = res
         .as_ref()
@@ -3431,7 +3440,7 @@ fn cmd_install(args: &[String]) {
 fn cmd_uninstall(args: &[String]) {
     let task = task_arg(args);
     let json = want_json(args);
-    let res = deskkit_win::task::uninstall(&task);
+    let res = membase_win::task::uninstall(&task);
     let ok = res.is_ok();
     if json {
         println!("{{\"ok\":{},\"task\":{}}}", ok, jstr(&task));
@@ -3489,7 +3498,7 @@ pub fn run() {
             return;
         }
         "version" | "-V" | "--version" => {
-            println!("MemBase {}", deskkit_core::VERSION);
+            println!("MemBase {}", membase_core::VERSION);
             return;
         }
         "baseline" => {
@@ -3500,6 +3509,18 @@ pub fn run() {
         "commands" => {
             cmd_commands(&argv[2..]);
             return;
+        }
+        "mcp" => {
+            // MCP 服务端：走 stdio 的 JSON-RPC，把同一套动词暴露给 AI
+            #[cfg(windows)]
+            {
+                std::process::exit(mcp::serve());
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("MemBase.exe mcp 只支持 Windows（工具本身依赖 Win32）");
+                std::process::exit(EXIT_USAGE);
+            }
         }
         "config" => {
             cmd_config(&argv[2..]);
@@ -3547,7 +3568,7 @@ pub fn run() {
     #[cfg(not(windows))]
     {
         let _ = cmd;
-        eprintln!("MemBase.exe 的采集/清理与桌面布局只支持 Windows；纯逻辑部分用 `cargo test -p deskkit-core` 验证。");
+        eprintln!("MemBase.exe 的采集/清理与桌面布局只支持 Windows；纯逻辑部分用 `cargo test -p membase-core` 验证。");
         std::process::exit(EXIT_USAGE);
     }
 }

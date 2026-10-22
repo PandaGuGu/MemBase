@@ -1,9 +1,9 @@
 [package]
-name = "deskkit-ui"
+name = "membase-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DeskKit 桌面界面（egui）：内存基准线 + 桌面图标布局，全部动作都有等价命令行"
+description = "MemBase 桌面界面（egui）：内存基准线 + 桌面图标布局，全部动作都有等价命令行"
 build = "build.rs"
 
 [[bin]]
@@ -11,9 +11,9 @@ name = "MemBase"
 path = "src/main.rs"
 
 [dependencies]
-deskkit-core.workspace = true
-deskkit-win = { workspace = true, features = ["preview"] }
-deskkit-cli.workspace = true
+membase-core.workspace = true
+membase-win = { workspace = true, features = ["preview"] }
+membase-cli.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 chrono.workspace = true

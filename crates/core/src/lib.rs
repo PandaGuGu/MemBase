@@ -1,7 +1,7 @@
 //! 纯逻辑层：分级、CSV 解析、diff、线外计划、基准线打包 + 桌面布局模型与存储。
 //!
 //! 这一层不依赖任何平台 API、不含 unsafe，可以在 Windows / Linux / 容器里直接跑测试。
-//! 平台相关的东西在 deskkit-win，命令行在 apps/cli，界面在 apps/gui。
+//! 平台相关的东西在 membase-win，命令行在 apps/cli，界面在 apps/gui。
 
 pub mod bundle;
 pub mod config;

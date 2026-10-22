@@ -8,9 +8,9 @@
 //!   0 成功 / 1 参数 / 2 没有布局或没有桌面 / 3 读写失败
 //!   4 动作执行失败 / 5 被拒绝（缺 --yes 之类）
 
-use deskkit_core::layout::Layout;
-use deskkit_core::layout_store as store;
-use deskkit_win::{actions, desktop::Desktop, repair, shellview::ShellView};
+use membase_core::layout::Layout;
+use membase_core::layout_store as store;
+use membase_win::{actions, desktop::Desktop, repair, shellview::ShellView};
 
 use crate::{
     has_flag, want_json, EXIT_ACTION_FAILED, EXIT_IO, EXIT_NO_BASELINE, EXIT_REFUSED,
@@ -358,7 +358,7 @@ fn suffix(list: &[String], max: usize) -> String {
 fn jstr_arr(list: &[String]) -> String {
     let items: Vec<String> = list
         .iter()
-        .map(|s| deskkit_core::bundle::jstr(s))
+        .map(|s| membase_core::bundle::jstr(s))
         .collect();
     format!("[{}]", items.join(","))
 }
@@ -366,7 +366,7 @@ fn jstr_arr(list: &[String]) -> String {
 /// 入口：`MemBase.exe layout <动词> [参数]`
 pub fn cmd_layout(args: &[String]) -> i32 {
     // 读桌面要 DPI 感知，走 shell 接口要 COM 套间；和 GUI 用同一份初始化
-    deskkit_win::init();
+    membase_win::init();
     let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     let r = match sub.as_str() {
@@ -423,9 +423,9 @@ fn layout_list(args: &[String]) -> i32 {
             .map(|e| {
                 format!(
                     "{{\"name\":{},\"file\":{},\"created\":{},\"icons\":{},\"screen\":{{\"w\":{},\"h\":{}}}}}",
-                    deskkit_core::bundle::jstr(e.display_name()),
-                    deskkit_core::bundle::jstr(&e.path.to_string_lossy()),
-                    deskkit_core::bundle::jstr(&e.stamp),
+                    membase_core::bundle::jstr(e.display_name()),
+                    membase_core::bundle::jstr(&e.path.to_string_lossy()),
+                    membase_core::bundle::jstr(&e.stamp),
                     e.count(),
                     e.data.screen.w,
                     e.data.screen.h
@@ -434,7 +434,7 @@ fn layout_list(args: &[String]) -> i32 {
             .collect();
         println!(
             "{{\"dir\":{},\"count\":{},\"layouts\":[{}]}}",
-            deskkit_core::bundle::jstr(&store::dir().to_string_lossy()),
+            membase_core::bundle::jstr(&store::dir().to_string_lossy()),
             items.len(),
             arr.join(",")
         );
@@ -485,8 +485,8 @@ fn layout_save(args: &[String]) -> i32 {
     if want_json(args) {
         println!(
             "{{\"ok\":true,\"name\":{},\"file\":{},\"icons\":{},\"auto_arrange\":{},\"screen\":{{\"w\":{},\"h\":{}}}}}",
-            deskkit_core::bundle::jstr(&layout.name),
-            deskkit_core::bundle::jstr(&path.to_string_lossy()),
+            membase_core::bundle::jstr(&layout.name),
+            membase_core::bundle::jstr(&path.to_string_lossy()),
             layout.icons.len(),
             layout.auto_arrange,
             layout.screen.w,
@@ -524,7 +524,7 @@ fn layout_show(args: &[String]) -> i32 {
             .map(|i| {
                 format!(
                     "{{\"name\":{},\"x\":{},\"y\":{}}}",
-                    deskkit_core::bundle::jstr(&i.name),
+                    membase_core::bundle::jstr(&i.name),
                     i.x,
                     i.y
                 )
@@ -532,8 +532,8 @@ fn layout_show(args: &[String]) -> i32 {
             .collect();
         println!(
             "{{\"name\":{},\"created\":{},\"screen\":{{\"w\":{},\"h\":{}}},\"auto_arrange\":{},\"icons\":[{}]}}",
-            deskkit_core::bundle::jstr(&data.name),
-            deskkit_core::bundle::jstr(&data.created),
+            membase_core::bundle::jstr(&data.name),
+            membase_core::bundle::jstr(&data.created),
             data.screen.w,
             data.screen.h,
             data.auto_arrange,
@@ -588,7 +588,7 @@ fn layout_diff(args: &[String]) -> i32 {
                     if cx != it.x || cy != it.y {
                         rows.push(format!(
                             "{{\"name\":{},\"from\":[{},{}],\"to\":[{},{}]}}",
-                            deskkit_core::bundle::jstr(&it.name),
+                            membase_core::bundle::jstr(&it.name),
                             cx,
                             cy,
                             it.x,
@@ -600,7 +600,7 @@ fn layout_diff(args: &[String]) -> i32 {
         }
         println!(
             "{{\"layout\":{},\"total\":{},\"to_move\":{},\"missing\":{},\"extra\":{},\"moves\":[{}]}}",
-            deskkit_core::bundle::jstr(&name),
+            membase_core::bundle::jstr(&name),
             plan.total,
             plan.to_move,
             jstr_arr(&plan.missing),
@@ -686,7 +686,7 @@ fn layout_restore(args: &[String]) -> i32 {
                 if cx != it.x || cy != it.y {
                     moves.push(format!(
                         "{{\"name\":{},\"from\":[{},{}],\"to\":[{},{}]}}",
-                        deskkit_core::bundle::jstr(&it.name),
+                        membase_core::bundle::jstr(&it.name),
                         cx,
                         cy,
                         it.x,
@@ -698,7 +698,7 @@ fn layout_restore(args: &[String]) -> i32 {
         if want_json(args) {
             println!(
                 "{{\"ok\":true,\"dry_run\":true,\"layout\":{},\"total\":{},\"to_move\":{},\"missing\":{},\"moves\":[{}]}}",
-                deskkit_core::bundle::jstr(&name),
+                membase_core::bundle::jstr(&name),
                 plan.total,
                 plan.to_move,
                 jstr_arr(&plan.missing),
@@ -745,7 +745,7 @@ fn layout_restore(args: &[String]) -> i32 {
         println!(
             "{{\"ok\":{},\"layout\":{},\"restored\":{},\"moved\":{},\"rounds\":{},\"shell_api\":{},\"auto_arrange_disabled\":{},\"failed\":{},\"missing\":{},\"extra\":{}}}",
             r.failed.is_empty(),
-            deskkit_core::bundle::jstr(&name),
+            membase_core::bundle::jstr(&name),
             r.restored,
             r.moved,
             r.rounds,
@@ -813,7 +813,7 @@ fn layout_delete(args: &[String]) -> i32 {
             if want_json(args) {
                 println!(
                     "{{\"ok\":true,\"deleted\":{}}}",
-                    deskkit_core::bundle::jstr(&name)
+                    membase_core::bundle::jstr(&name)
                 );
             } else {
                 println!("已删除: {}", name);
@@ -837,7 +837,7 @@ fn layout_status(args: &[String]) -> i32 {
     };
     let count = d.count().unwrap_or(0);
     let arrange = d.auto_arrange();
-    let (sw, sh) = deskkit_win::sys::screen_size();
+    let (sw, sh) = membase_win::sys::screen_size();
     let pid = d.pid();
     let layouts = store::list().len();
     let cache = repair::describe_cache();
@@ -851,10 +851,10 @@ fn layout_status(args: &[String]) -> i32 {
             arrange,
             sw,
             sh,
-            deskkit_core::bundle::jstr(&store::dir().to_string_lossy()),
+            membase_core::bundle::jstr(&store::dir().to_string_lossy()),
             layouts,
             shell_ok,
-            deskkit_core::bundle::jstr(&cache)
+            membase_core::bundle::jstr(&cache)
         );
         return 0;
     }
@@ -887,7 +887,7 @@ fn layout_probe(args: &[String]) -> i32 {
                     .map(|i| {
                         format!(
                             "{{\"name\":{},\"x\":{},\"y\":{}}}",
-                            deskkit_core::bundle::jstr(&i.name),
+                            membase_core::bundle::jstr(&i.name),
                             i.x,
                             i.y
                         )
@@ -948,7 +948,7 @@ fn layout_repair(args: &[String]) -> i32 {
             println!(
                 "{{\"ok\":true,\"dry_run\":true,\"needed\":true,\"bytes\":{},\"backup\":{}}}",
                 blob.len(),
-                deskkit_core::bundle::jstr(&repair::backup_path().to_string_lossy())
+                membase_core::bundle::jstr(&repair::backup_path().to_string_lossy())
             );
         } else {
             println!("[演练] {}", msg);
@@ -975,7 +975,7 @@ fn layout_repair(args: &[String]) -> i32 {
                 println!(
                     "{{\"ok\":true,\"needed\":true,\"bytes\":{},\"backup\":{}}}",
                     info.bytes,
-                    deskkit_core::bundle::jstr(&info.backup.to_string_lossy())
+                    membase_core::bundle::jstr(&info.backup.to_string_lossy())
                 );
             } else {
                 println!(
@@ -1000,12 +1000,12 @@ fn layout_repair(args: &[String]) -> i32 {
 fn layout_dir(args: &[String]) -> i32 {
     let dir = store::dir();
     if has_flag(args, "--open") {
-        deskkit_win::win::open_folder(&dir.to_string_lossy());
+        membase_win::win::open_folder(&dir.to_string_lossy());
     }
     if want_json(args) {
         println!(
             "{{\"dir\":{},\"exists\":{}}}",
-            deskkit_core::bundle::jstr(&dir.to_string_lossy()),
+            membase_core::bundle::jstr(&dir.to_string_lossy()),
             dir.is_dir()
         );
     } else {

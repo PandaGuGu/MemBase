@@ -1,9 +1,9 @@
 [package]
-name = "deskkit-win"
+name = "membase-win"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DeskKit 平台层：Win32 进程/服务/计划任务 + 桌面图标 ListView 与 shell IFolderView（unsafe 只允许出现在这里）"
+description = "MemBase 平台层：Win32 进程/服务/计划任务 + 桌面图标 ListView 与 shell IFolderView（unsafe 只允许出现在这里）"
 
 [features]
 default = []
@@ -11,7 +11,7 @@ default = []
 preview = ["dep:image"]
 
 [dependencies]
-deskkit-core.workspace = true
+membase-core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 image = { version = "0.25", optional = true, default-features = false, features = [

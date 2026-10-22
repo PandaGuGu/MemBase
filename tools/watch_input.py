@@ -6,7 +6,7 @@
 最后把日志发回来即可。不改动系统、不联网、不驻留，Ctrl+C 就退出。
 
 用法：
-    py -3 tools/watch_input.py            # 日志写到 %TEMP%\\deskkit_watch_<时间>.log
+    py -3 tools/watch_input.py            # 日志写到 %TEMP%\\membase_watch_<时间>.log
     py -3 tools/watch_input.py out.log    # 指定日志文件
 """
 import ctypes
@@ -170,7 +170,7 @@ def sample_loop():
 def main():
     global log_fp
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.environ.get('TEMP', '.'), 'deskkit_watch_%s.log' % time.strftime('%m%d_%H%M%S'))
+        os.environ.get('TEMP', '.'), 'membase_watch_%s.log' % time.strftime('%m%d_%H%M%S'))
     log_fp = open(path, 'w', encoding='utf-8')
     log('[启动] 日志 = %s' % path)
     log('[启动] 现在请照常操作：点 MemBase 的「息屏」→ 按 ESC；再拿「息屏助手」对比一次')

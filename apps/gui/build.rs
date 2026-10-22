@@ -1,5 +1,5 @@
 fn main() {
-    println!("cargo:rerun-if-changed=../../assets/deskkit.ico");
+    println!("cargo:rerun-if-changed=../../assets/membase.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
     // 只有「在 Windows 上构建 Windows 目标」时才挂资源（图标 + 版本信息）。
@@ -8,7 +8,7 @@ fn main() {
     {
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
             let mut res = winres::WindowsResource::new();
-            res.set_icon("../../assets/deskkit.ico");
+            res.set_icon("../../assets/membase.ico");
             res.set("ProductName", "MemBase");
             res.set("FileDescription", "MemBase - 内存基准线 + 桌面图标布局");
             res.set("CompanyName", "MemBase");

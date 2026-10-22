@@ -8,7 +8,7 @@
 //! 做法：先备份成文件，再删值，重启后系统会重建一份干净的。
 
 use crate::sys::*;
-use deskkit_core::layout_store as store;
+use membase_core::layout_store as store;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 

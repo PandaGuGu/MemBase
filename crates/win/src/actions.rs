@@ -1,7 +1,7 @@
 //! 高层动作：保存 / 差异预览 / 恢复 —— CLI 和 GUI 共用
 
 use crate::desktop::Desktop;
-use deskkit_core::layout::{IconPos, Layout, Plan, RestoreResult, Screen};
+use membase_core::layout::{IconPos, Layout, Plan, RestoreResult, Screen};
 use crate::shellview::ShellView;
 use crate::sys;
 use anyhow::Result;

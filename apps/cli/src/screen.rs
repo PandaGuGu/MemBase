@@ -10,8 +10,8 @@
 //! 息屏本身无损可逆，所以不像 trim 那样强制 --execute，只提供 --dry-run 供自检。
 
 use crate::{arg_value, has_flag, want_json, EXIT_ACTION_FAILED, EXIT_USAGE};
-use deskkit_core::bundle::jstr;
-use deskkit_win::screen::{self, ExitKey};
+use membase_core::bundle::jstr;
+use membase_win::screen::{self, ExitKey};
 
 pub const SCREEN_COMMANDS: &[(&str, &str, &str)] = &[
     ("off", "立刻关显示器（不锁屏）", "[--seconds N] [--minutes N] [--delay N] [--dry-run] [--json]"),
@@ -42,7 +42,7 @@ pub fn screen_usage() -> String {
 
 pub fn cmd_screen(args: &[String]) -> i32 {
     // 读分辨率要 DPI 感知，否则 125% 缩放下报的是逻辑像素
-    deskkit_win::init();
+    membase_win::init();
     let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     match sub.as_str() {
@@ -184,8 +184,8 @@ fn screen_off(args: &[String]) -> i32 {
 
 fn screen_status(args: &[String]) -> i32 {
     let monitors = screen::monitor_count();
-    let (w, h) = deskkit_win::sys::screen_size();
-    let dpi = deskkit_win::sys::dpi_scale();
+    let (w, h) = membase_win::sys::screen_size();
+    let dpi = membase_win::sys::dpi_scale();
     let last = screen::last_off().unwrap_or_default();
     let channel = screen::probe();
     let secs = screen::default_secs();

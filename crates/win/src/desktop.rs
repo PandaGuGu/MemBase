@@ -3,7 +3,7 @@
 //! 读名字 / 读坐标 / 写坐标都要把结构体放进 explorer 的地址空间再发消息，
 //! 这是我们自己的进程看不到别人的内存导致的，老牌做法。
 
-use deskkit_core::layout::IconPos;
+use membase_core::layout::IconPos;
 use crate::sys::*;
 use anyhow::{bail, Result};
 use std::ffi::c_void;

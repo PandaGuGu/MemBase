@@ -23,7 +23,7 @@
 
 #![allow(non_snake_case)]
 
-use deskkit_core::config;
+use membase_core::config;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -713,7 +713,7 @@ impl Drop for Watch {
 
 /// 界面自检要跳过「真关屏」时用
 pub fn blackout_test_mode() -> bool {
-    std::env::var("DESKKIT_BLACKOUT_TEST").is_ok()
+    std::env::var("MEMBASE_BLACKOUT_TEST").is_ok()
 }
 
 #[cfg(test)]

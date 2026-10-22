@@ -12,7 +12,7 @@ use crate::win::CREATE_NO_WINDOW;
 
 /// 默认任务名；采集完成后任务会自毁，所以常年为空是正常状态。
 /// 直接复用 core 里的常量，避免两个 crate 各存一份字符串。
-pub use deskkit_core::DEFAULT_TASK;
+pub use membase_core::DEFAULT_TASK;
 
 /// 只读的任务快照，给 GUI 显示用
 #[derive(Clone, Debug, Default)]

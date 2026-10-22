@@ -59,12 +59,62 @@
 | README 口径 | 「命令行」章节改为单文件说明，并注明 PowerShell 用 `.\MemBase.exe`、Git Bash 用 `./MemBase.exe`；构建段的测试数 / 验收项数 / 验收文档链接更新到 1.2.x |
 | 验收加断言 | `verify.py` 新增「`dist/` 里只有一个 exe」，产物检查从「两个文件都存在」改为「只有一个」 |
 
-内部 crate 名（`deskkit-core` / `deskkit-win` / `deskkit-cli` / `deskkit-ui`）保持不变 —— 只出现在 `Cargo.toml` 与 `use` 里，不影响任何用户可见行为，改名会连带 116 处引用与 `-p` 参数，收益为零。
+内部 crate 名（`membase-core` / `membase-win` / `membase-cli` / `membase-ui`）保持不变 —— 只出现在 `Cargo.toml` 与 `use` 里，不影响任何用户可见行为，改名会连带 116 处引用与 `-p` 参数，收益为零。
 
 **验收**：`python tools/verify.py --fast` **107 项 0 失败**（`docs/verify-1.2.1.md`），
 含新断言「`dist/` 里只有一个 exe」、版本断言改为 `MemBase 1.2.1`。
 发布包 `dist/MemBase-v1.2.1-win-x64.zip`（`MemBase.exe` + `README.md` + `LICENSE`，3.3 MB）。
 `docs/screenshots/cli.png` 已按新文案重抓（命令行页 37 条命令全部 `MemBase.exe <动词>`）。
+
+---
+
+## 2026-10-22 · 命名统一 + MCP 入口
+
+上一节「crate 名保持不变」的结论**已被推翻** —— 当时只算「改名对用户零收益」，
+没算「历史包袱」：仓库里 `deskkit` 这个名字散在 crate 名、二进制名、临时文件名、
+CI 路径、图标文件名里，新人接手时分不清 `deskkit-cli`（crate）和 `deskkit.exe`（产物）
+到底是什么关系。既然品牌已经统一到 MemBase，名字就该一次清干净。
+
+### 改名（`deskkit` → `membase`）
+
+| 对象 | 旧 | 新 |
+|---|---|---|
+| crate | `deskkit-core/win/cli/ui` | `membase-core/win/cli/ui` |
+| 控制台二进制 | `deskkit.exe` | `membase-cli.exe` |
+| 图标 | `assets/deskkit.ico` | `assets/membase.ico` |
+| 环境变量 | `DESKKIT_PAGE` / `DESKKIT_SHOT` / `DESKKIT_BLACKOUT_TEST` | `MEMBASE_*` |
+| 临时文件 | `deskkit_shot_*` / `deskkit_verify_*` / `__deskkit_verify__` | `membase_*` / `__membase_verify__` |
+
+- **二进制不能叫 `membase.exe`**：Windows 文件名不区分大小写，会和数据目录里
+  `task::install()` 复制的任务副本 `membase.exe` 撞名。控制台版叫 `membase-cli.exe`。
+- 替换用「长模式优先」的成对替换（`deskkit-core` → `membase-core` 先于裸 `deskkit`），
+  否则会像 1.2.1 那次一样误伤 crate 名。
+- 历史归档文档（`docs/verify-1.0.0.md` / `1.1.0` / `1.2.0` / `review-1.1.0.md`）**不改** ——
+  那是当时的事实记录，改了就是篡改历史。
+
+### MCP 入口（`MemBase.exe mcp`）
+
+同一个 exe 还能当 MCP server（stdio + JSON-RPC 2.0），把 CLI 那套动词原样暴露给 AI。
+
+- **零新依赖**：只用已在编译的 `serde_json`，手写 JSON-RPC 的行分隔收发。
+  官方 Rust SDK 会带进 tokio + async-trait，把 CLI 的编译量从 15 个第三方小库抬到几十个。
+- **16 个工具**：`mem_status` / `mem_list` / `mem_plan` / `mem_trim` / `mem_slim` /
+  `mem_restart` / `mem_kill` / `mem_svc` / `mem_feature` / `mem_startup` / `mem_protect` /
+  `mem_collect` / `mem_compare` / `mem_transient` / `mem_baseline` / `mem_commands`。
+- **护栏与命令行完全一致**：动手类工具的 `execute` 与 `yes` 必须**同时**为 true，
+  只给 `execute` 直接拒绝；两者都 false（默认）时只输出预演结果。
+  `Tier::Blocked` 的关键服务仍然被拒，保护名单仍然生效。
+- **实现手法**：工具直接调用已有 CLI 动词（起子进程跑自己），不重写业务逻辑 ——
+  也避免了某个动词调 `std::process::exit` 把 MCP 服务端带走。
+- **协议版本**：支持 `2024-11-05` / `2025-03-26` / `2025-06-18` / `2025-11-25` / `2026-07-28`。
+  2026-07-28 去掉了 `initialize` 握手（版本号改走每个请求的 `_meta`），
+  但老客户端仍占多数，所以握手必须留着，同时支持新版的 `server/discover`。
+- **实测**：`tools/mcp_selftest.py` 是真的起进程发 JSON-RPC（不是 mock），
+  18 项断言全过；便携版（GUI 子系统）和控制台版都验过。
+  管道捕获实测正常（13884 字节）—— GUI 子系统丢 stdout 只是 PowerShell 的怪癖，
+  MCP 客户端用管道 spawn 不受影响。
+
+**验收**：`python tools/verify.py --fast` **111 项 0 失败**（含 4 项 MCP 断言）。
 
 ---
 

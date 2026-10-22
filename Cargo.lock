@@ -303,49 +303,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "deskkit-cli"
-version = "1.2.1"
-dependencies = [
- "anyhow",
- "chrono",
- "deskkit-core",
- "deskkit-win",
-]
-
-[[package]]
-name = "deskkit-core"
-version = "1.2.1"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "deskkit-ui"
-version = "1.2.1"
-dependencies = [
- "chrono",
- "deskkit-cli",
- "deskkit-core",
- "deskkit-win",
- "eframe",
- "rfd",
- "winres",
-]
-
-[[package]]
-name = "deskkit-win"
-version = "1.2.1"
-dependencies = [
- "anyhow",
- "chrono",
- "deskkit-core",
- "image",
-]
-
-[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1026,6 +983,50 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "membase-cli"
+version = "1.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "membase-core",
+ "membase-win",
+ "serde_json",
+]
+
+[[package]]
+name = "membase-core"
+version = "1.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "membase-ui"
+version = "1.2.1"
+dependencies = [
+ "chrono",
+ "eframe",
+ "membase-cli",
+ "membase-core",
+ "membase-win",
+ "rfd",
+ "winres",
+]
+
+[[package]]
+name = "membase-win"
+version = "1.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "image",
+ "membase-core",
+]
 
 [[package]]
 name = "memchr"

@@ -1,13 +1,8 @@
 # MemBase 1.2.1 验收报告
 
-由 `tools/verify.py` 自动生成，2026-10-22 09:05:36
+由 `tools/verify.py` 自动生成，2026-10-22 11:37:11
 
-**共 107 项，通过 107 项，失败 0 项。**
-
-> 本次用 `--fast` 跑（跳过 10 页界面截图与黑屏层那两项，避免抢占前台），
-> 覆盖全部命令行动词、产物断言、配置/布局/计划任务往返与环境复原。
-> 含界面截图的全量 124 项见 [docs/verify-1.2.0.md](verify-1.2.0.md)；
-> 1.2.1 相对 1.2.0 只改了品牌串、分发打包与文档，界面渲染逻辑未动。
+**共 128 项，通过 128 项，失败 0 项。**
 
 验收原则：写盘一律写到临时目录；危险动作只验护栏（演练 / 拒绝）；改过的配置、主题、保护名单、计划任务全部还原。
 
@@ -16,7 +11,7 @@
 
 | 项目 | 命令 | 期望 | 实际 | 结论 | 备注 |
 |---|---|---|---|---|---|
-| MemBase.exe | `C:\Users\Administrator\Desktop\项目集合\MemBase\dist\MemBase.exe` | 存在 | 7313920 字节 | 通过 |  |
+| MemBase.exe | `C:\Users\Administrator\Desktop\项目集合\MemBase\dist\MemBase.exe` | 存在 | 7491584 字节 | 通过 |  |
 | 只有一个 exe | `dist/*.exe` | 仅 MemBase.exe | 仅 MemBase.exe | 通过 |  |
 | 版本号 | `MemBase.exe version` | 0 / MemBase 1.2.1 | 0 / MemBase 1.2.1 | 通过 |  |
 
@@ -28,28 +23,28 @@
 | status | `MemBase.exe status` | 0 | 0 | 通过 | 基准快照 : C:\ProgramData\MemBaseline\run_20261022_082929\T+300s |
 | list | `MemBase.exe list` | 0 | 0 | 通过 | 基准：C:\ProgramData\MemBaseline\run_20261022_082929\T+300s |
 | list --json | `MemBase.exe list --json` | 0 | 0 | 通过 | {"baseline":{"dir":"C:\\ProgramData\\MemBaseline\\run_20261022_0 |
-| plan | `MemBase.exe plan` | 0 | 0 | 通过 | 线外 14 项，可处理 9 项（预计回收约 757 MB） |
+| plan | `MemBase.exe plan` | 0 | 0 | 通过 | 线外 21 项，可处理 15 项（预计回收约 1457 MB） |
 | plan --json 带宿主字段 | `MemBase.exe plan --json` | 0 | 0 | 通过 | {"mode":"plan","baseline":"C:\\ProgramData\\MemBaseline\\run_202 |
 | status --json 带自愈记录 | `MemBase.exe status --json` | 0 | 0 | 通过 | {"baseline":{"dir":"C:\\ProgramData\\MemBaseline\\run_20261022_0 |
-| plan --to | `MemBase.exe plan --to C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\plan.csv` | 0 | 0 | 通过 | 计划已写入 C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0 |
+| plan --to | `MemBase.exe plan --to C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\plan.csv` | 0 | 0 | 通过 | 计划已写入 C:\Users\Administrator\AppData\Local\Temp\membase_verify_8 |
 | trim（演练） | `MemBase.exe trim` | 0 | 0 | 通过 | 演练，不动进程 |
 | trim --execute 无 --yes | `MemBase.exe trim --execute` | 5 | 5 | 通过 | 非交互环境被正确拒绝 |
 | kill 不存在的目标 | `MemBase.exe kill no-such-proc-MemBase.exe` | 2 | 2 | 通过 | 没找到匹配的进程：no-such-proc-MemBase.exe |
 | svc stop（演练） | `MemBase.exe svc stop Spooler` | (0, 4) | 0 | 通过 | [dry-run] 将停止服务 Spooler（加 --execute 才执行） |
 | compare | `MemBase.exe compare` | 0 | 0 | 通过 | [..] 基准：C:\ProgramData\MemBaseline\run_20261022_082929\T+300s |
 | protect list | `MemBase.exe protect list --json` | 0 | 0 | 通过 | {"file":"C:\\ProgramData\\MemBaseline\\protect.txt","count":0,"p |
-| protect add | `MemBase.exe protect add 进程:__deskkit_verify__` | 0 | 0 | 通过 | 保护名单（1 项，C:\ProgramData\MemBaseline\protect.txt）： |
+| protect add | `MemBase.exe protect add 进程:__membase_verify__` | 0 | 0 | 通过 | 保护名单（1 项，C:\ProgramData\MemBaseline\protect.txt）： |
 | protect add 生效 | `MemBase.exe protect list --json` | 0 | 0 | 通过 | {"file":"C:\\ProgramData\\MemBaseline\\protect.txt","count":1,"p |
-| protect remove | `MemBase.exe protect remove 进程:__deskkit_verify__` | 0 | 0 | 通过 | 保护名单为空（C:\ProgramData\MemBaseline\protect.txt） |
+| protect remove | `MemBase.exe protect remove 进程:__membase_verify__` | 0 | 0 | 通过 | 保护名单为空（C:\ProgramData\MemBaseline\protect.txt） |
 | protect remove 生效 | `MemBase.exe protect list` | 0 | 0 | 通过 | 保护名单为空（C:\ProgramData\MemBaseline\protect.txt） |
-| collect --out 临时目录 | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\collect --at 0` | 0 | 0 | 通过 | [OK] 采集完成：128 个进程 / 338 个服务，开机第 2219 秒 |
-| collect --json | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\collect2 --at 0 --json` | 0 | 0 | 通过 | {"ok":true,"dir":"C:\\Users\\Administrator\\AppData\\Local\\Temp |
-| collect --keep | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\collect3 --at 0 --keep 99` | 0 | 0 | 通过 | [OK] 采集完成：128 个进程 / 338 个服务，开机第 2219 秒 |
-| baseline capture | `MemBase.exe baseline capture --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\baseline` | 0 | 0 | 通过 | 已扫描当前状态并设为基准 |
-| baseline info | `MemBase.exe baseline info --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\baseline` | 0 | 0 | 通过 | 当前基准 : C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_ |
-| baseline verify | `MemBase.exe baseline verify --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\baseline` | 0 | 0 | 通过 | 当前基准 : C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_ |
-| baseline export | `MemBase.exe baseline export --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\baseline --to C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\b.mbz` | 0 | 0 | 通过 | 已导出基准线 |
-| baseline import | `MemBase.exe baseline import C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\b.mbz --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\baseline2` | 0 | 0 | 通过 | 已导入基准线（5 个文件，crc32 57acb8af） |
+| collect --out 临时目录 | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\collect --at 0` | 0 | 0 | 通过 | [OK] 采集完成：144 个进程 / 338 个服务，开机第 11292 秒 |
+| collect --json | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\collect2 --at 0 --json` | 0 | 0 | 通过 | {"ok":true,"dir":"C:\\Users\\Administrator\\AppData\\Local\\Temp |
+| collect --keep | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\collect3 --at 0 --keep 99` | 0 | 0 | 通过 | [OK] 采集完成：144 个进程 / 338 个服务，开机第 11292 秒 |
+| baseline capture | `MemBase.exe baseline capture --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\baseline` | 0 | 0 | 通过 | 已扫描当前状态并设为基准 |
+| baseline info | `MemBase.exe baseline info --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\baseline` | 0 | 0 | 通过 | 当前基准 : C:\Users\Administrator\AppData\Local\Temp\membase_verify_ |
+| baseline verify | `MemBase.exe baseline verify --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\baseline` | 0 | 0 | 通过 | 当前基准 : C:\Users\Administrator\AppData\Local\Temp\membase_verify_ |
+| baseline export | `MemBase.exe baseline export --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\baseline --to C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\b.mbz` | 0 | 0 | 通过 | 已导出基准线 |
+| baseline import | `MemBase.exe baseline import C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\b.mbz --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\baseline2` | 0 | 0 | 通过 | 已导入基准线（5 个文件，crc32 8b4a9069） |
 
 ## 瘦身与启动项
 
@@ -73,15 +68,15 @@
 | restart（演练） | `MemBase.exe restart explorer` | 0 | 0 | 通过 | 只报计划 |
 | restart explorer 无 --yes | `MemBase.exe restart explorer --execute` | 5 | 5 | 通过 | 会闪任务栏的动作被拦下 |
 | restart 不存在的目标 | `MemBase.exe restart no-such-proc-MemBase.exe` | 2 | 2 | 通过 | 没找到进程或服务：no-such-proc-MemBase.exe |
-| transient（先造单采样） | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\transient_single --at 0` | 0 | 0 | 通过 | 只采一次，不注册双采样 |
-| transient（无双采样） | `MemBase.exe transient --out C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\transient_single --json` | 2 | 2 | 通过 | {"ok":false,"error":"no_dual_sample","hint":"先注册双采样：MemBase.exe  |
+| transient（先造单采样） | `MemBase.exe collect --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\transient_single --at 0` | 0 | 0 | 通过 | 只采一次，不注册双采样 |
+| transient（无双采样） | `MemBase.exe transient --out C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\transient_single --json` | 2 | 2 | 通过 | {"ok":false,"error":"no_dual_sample","hint":"先注册双采样：MemBase.exe  |
 
 ## 配置与外观
 
 | 项目 | 命令 | 期望 | 实际 | 结论 | 备注 |
 |---|---|---|---|---|---|
 | config get | `MemBase.exe config get --json` | 0 | 0 | 通过 | {"ok":true,"config_file":"C:\\Users\\Administrator\\AppData\\Roa |
-| config set | `MemBase.exe config set C:\Users\Administrator\AppData\Local\Temp\deskkit_verify_0efnd5wd\cfgroot` | 0 | 0 | 通过 | 已设置数据目录：C:\Users\Administrator\AppData\Local\Temp\deskkit_verify |
+| config set | `MemBase.exe config set C:\Users\Administrator\AppData\Local\Temp\membase_verify_8lvvstq7\cfgroot` | 0 | 0 | 通过 | 已设置数据目录：C:\Users\Administrator\AppData\Local\Temp\membase_verify |
 | theme get | `MemBase.exe theme get --json` | 0 | 0 | 通过 | {"ok":true,"theme":"dark","file":"C:\\Users\\Administrator\\AppD |
 | theme set light | `MemBase.exe theme set light` | 0 | 0 | 通过 | 当前外观 : 浅色 |
 | theme set dark | `MemBase.exe theme set dark` | 0 | 0 | 通过 | 当前外观 : 深色 |
@@ -96,14 +91,14 @@
 | layout dir | `MemBase.exe layout dir --json` | 0 | 0 | 通过 | {"dir":"C:\\Users\\Administrator\\AppData\\Roaming\\DesktopIconP |
 | layout repair（演练） | `MemBase.exe layout repair --json` | 0 | 0 | 通过 | 演练，不动注册表 |
 | 演练未改注册表 | `layout repair（无 --execute）` | 4582 字节 | 4582 字节 | 通过 | 缓存大小前后一致 |
-| layout save | `MemBase.exe layout save __deskkit_verify__` | 0 | 0 | 通过 | 已保存 85 个图标的位置 -> C:\Users\Administrator\AppData\Roaming\DesktopI |
-| layout show | `MemBase.exe layout show __deskkit_verify__ --json` | 0 | 0 | 通过 | {"name":"__deskkit_verify__","created":"2026-10-22 09:05:32","sc |
-| layout diff | `MemBase.exe layout diff __deskkit_verify__ --json` | 0 | 0 | 通过 | {"layout":"__deskkit_verify__","total":85,"to_move":0,"missing": |
-| layout diff --positions | `MemBase.exe layout diff __deskkit_verify__ --positions --json` | 0 | 0 | 通过 | {"layout":"__deskkit_verify__","total":85,"to_move":0,"missing": |
-| layout restore（演练） | `MemBase.exe layout restore __deskkit_verify__ --json` | 0 | 0 | 通过 | {"ok":true,"dry_run":true,"layout":"__deskkit_verify__","total": |
-| layout restore 无 --yes | `MemBase.exe layout restore __deskkit_verify__ --execute` | 5 | 5 | 通过 | 被正确拒绝 |
-| layout delete 无 --yes | `MemBase.exe layout delete __deskkit_verify__` | 5 | 5 | 通过 | 被正确拒绝 |
-| layout delete --yes | `MemBase.exe layout delete __deskkit_verify__ --yes` | 0 | 0 | 通过 | 已删除: __deskkit_verify__ |
+| layout save | `MemBase.exe layout save __membase_verify__` | 0 | 0 | 通过 | 已保存 85 个图标的位置 -> C:\Users\Administrator\AppData\Roaming\DesktopI |
+| layout show | `MemBase.exe layout show __membase_verify__ --json` | 0 | 0 | 通过 | {"name":"__membase_verify__","created":"2026-10-22 11:36:45","sc |
+| layout diff | `MemBase.exe layout diff __membase_verify__ --json` | 0 | 0 | 通过 | {"layout":"__membase_verify__","total":85,"to_move":0,"missing": |
+| layout diff --positions | `MemBase.exe layout diff __membase_verify__ --positions --json` | 0 | 0 | 通过 | {"layout":"__membase_verify__","total":85,"to_move":0,"missing": |
+| layout restore（演练） | `MemBase.exe layout restore __membase_verify__ --json` | 0 | 0 | 通过 | {"ok":true,"dry_run":true,"layout":"__membase_verify__","total": |
+| layout restore 无 --yes | `MemBase.exe layout restore __membase_verify__ --execute` | 5 | 5 | 通过 | 被正确拒绝 |
+| layout delete 无 --yes | `MemBase.exe layout delete __membase_verify__` | 5 | 5 | 通过 | 被正确拒绝 |
+| layout delete --yes | `MemBase.exe layout delete __membase_verify__ --yes` | 0 | 0 | 通过 | 已删除: __membase_verify__ |
 
 ## 开机采集
 
@@ -123,6 +118,15 @@
 | 每条命令的动词都存在 | `37 条 cli 解析` | 全部命中 | 未命中 0 条 | 通过 |  |
 | GUI 引用的 key 都在表里 | `扫描 main.rs 中 cli_for/with_cli` | 无缺失 | 缺失 0 | 通过 |  |
 | 仅由「命令行」页呈现的动作 | `界面按钮未单独挂提示` | 仅供清单页 | 3 | 通过 | screen_key, screen_power, slim_caution |
+
+## MCP
+
+| 项目 | 命令 | 期望 | 实际 | 结论 | 备注 |
+|---|---|---|---|---|---|
+| MCP 自测全通过 | `tools/mcp_selftest.py` | 0 失败 | 0 失败 | 通过 | 全部通过 |
+| 工具数 | `tools/list` | 16 | 16 | 通过 |  |
+| 工具集合完整 | `tools/list` | 16 个 | 缺 0 | 通过 |  |
+| 门禁位与动手属性一致 | `tools/list 的 inputSchema` | 全部一致 | 不一致 0 | 通过 |  |
 
 ## 息屏
 
@@ -154,6 +158,10 @@
 | 关显示屏开关已还原 | `screen power False` | False | False | 通过 |  |
 | 演练没改「上次息屏」 | `screen status --json` | 2026-10-21 16:53:46 | 2026-10-21 16:53:46 | 通过 |  |
 | 演练没改记录文件 | `last_screen_off.txt` | b'2026-10-21 16:53:46' | b'2026-10-21 16:53:46' | 通过 | 避免把「演练」记成真的用过 |
+| 黑屏层（全屏） | `MEMBASE_BLACKOUT_TEST=1` | ≥95% 纯黑 + 有提示文字 | 1920x1080 / 6 色 / 纯黑 99.9% | 通过 |  |
+| 黑屏层已置顶 | `MEMBASE_BLACKOUT_TEST=1` | WS_EX_TOPMOST 置位 | 置位 | 通过 |  |
+| ESC 退出（正常） | `keybd_event VK_ESCAPE` | 退出息屏（撤销置顶） | 已退出 | 通过 |  |
+| ESC 退出（最小化） | `keybd_event VK_ESCAPE` | 退出息屏（撤销置顶） | 已退出 | 通过 |  |
 
 ## 环境复原
 
@@ -163,6 +171,24 @@
 | 主题可读 | `theme get --json` | dark/light | dark | 通过 |  |
 | 数据目录可读 | `config get --json` | 非空 | C:\ProgramData\MemBaseline | 通过 |  |
 | 没有残留计划任务 | `schtasks /Query` | 非 0 | 1 | 通过 |  |
+
+## 界面
+
+| 项目 | 命令 | 期望 | 实际 | 结论 | 备注 |
+|---|---|---|---|---|---|
+| 进程（默认页） | `MEMBASE_PAGE=(默认)` | 渲染正常 | 1475x975 / 249 色 | 通过 |  |
+| 瘦身 | `MEMBASE_PAGE=slim` | 渲染正常 | 1475x975 / 79 色 | 通过 |  |
+| 启动项 | `MEMBASE_PAGE=startup` | 渲染正常 | 1475x975 / 168 色 | 通过 |  |
+| 基准 | `MEMBASE_PAGE=baseline` | 渲染正常 | 1475x975 / 147 色 | 通过 |  |
+| 桌面布局 | `MEMBASE_PAGE=layouts` | 渲染正常 | 1475x975 / 2026 色 | 通过 |  |
+| 保护名单 | `MEMBASE_PAGE=protect` | 渲染正常 | 1475x975 / 94 色 | 通过 |  |
+| 开机采集 | `MEMBASE_PAGE=boot` | 渲染正常 | 1475x975 / 101 色 | 通过 |  |
+| 工具 | `MEMBASE_PAGE=tools` | 渲染正常 | 1475x975 / 136 色 | 通过 |  |
+| 命令行 | `MEMBASE_PAGE=cli` | 渲染正常 | 1475x975 / 157 色 | 通过 |  |
+| 设置 | `MEMBASE_PAGE=settings` | 渲染正常 | 1475x975 / 127 色 | 通过 |  |
+| 各页内容互不相同 | `10 张截图 md5` | 10 | 10 | 通过 |  |
+| 确认弹窗 · 恢复基准 | `MEMBASE_SHOT_MODAL=trim` | 渲染正常 | 1475x975 / 277 色 | 通过 |  |
+| 确认弹窗 · 恢复布局 | `MEMBASE_SHOT_MODAL=layout` | 渲染正常 | 1475x975 / 1423 色 | 通过 |  |
 
 ## 环境复原记录
 

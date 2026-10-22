@@ -284,6 +284,17 @@ fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
 pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
 
+    // 交互用户取 `explorer.exe` 的属主。
+    // `snap.user` 是**采集进程自己**的 token，由计划任务拉起时永远是 SYSTEM；
+    // 两者混成一个 `LoggedOnUser` 会让人以为「这台机器没人登录」（2026-10-22 实测踩过：
+    // system.json 写着 SYSTEM，而 processes.csv 里 96/96 都是 PGG\Administrator）。
+    let interactive = snap
+        .procs
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case("explorer") && !p.user.is_empty())
+        .map(|p| p.user.clone())
+        .unwrap_or_default();
+
     // ---- system.json ----
     let mut j = String::from("{\n");
     let mut kv: Vec<(String, String)> = vec![
@@ -312,7 +323,14 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         ("PageFilePeakMB".into(), "null".into()),
         ("LogicalProcessors".into(), snap.cpus.to_string()),
         ("PhysicalProcessors".into(), "null".into()),
-        ("LoggedOnUser".into(), jstr(&snap.user)),
+        ("LoggedOnUser".into(), jstr(if interactive.is_empty() {
+            &snap.user
+        } else {
+            &interactive
+        })),
+        ("InteractiveUser".into(), jstr(&interactive)),
+        ("LoggedOn".into(), (!interactive.is_empty()).to_string()),
+        ("CollectorUser".into(), jstr(&snap.user)),
         ("SystemDrive".into(), jstr(&snap.drive)),
     ];
     let n = kv.len();
@@ -432,8 +450,15 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
         "- 上次开机：{}（采集时已运行 {} 秒）\n",
         snap.boot_time, snap.uptime_s
     ));
-    m.push_str(&format!("- 采集耗时：{} 毫秒\n", snap.collect_ms));
-    m.push_str(&format!("- 采集程序：membase {} ({})\n", deskkit_core::VERSION, deskkit_core::build_id()));
+    m.push_str(&format!(
+        "- 采集耗时：{} 毫秒（受系统负载影响，同一台机器不同时刻可能差数倍，不是性能指标）\n",
+        snap.collect_ms
+    ));
+    m.push_str(&format!(
+        "- 采集程序：membase {} ({})\n",
+        deskkit_core::VERSION,
+        deskkit_core::build_id()
+    ));
     m.push_str(&format!(
         "- 采集身份：{}（{}）\n",
         snap.user,
@@ -443,6 +468,14 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> std::io::Result<()> {
             "未提权，进程内存不完整"
         }
     ));
+    if interactive.is_empty() {
+        m.push_str("- 交互用户：无（锁屏 / 无人登录，基准里会含 LogonUI）\n");
+    } else {
+        m.push_str(&format!("- 交互用户：{}（桌面已登录）\n", interactive));
+    }
+    m.push_str(
+        "- 命令行：本版不采集（SYSTEM 身份读不到），`processes.csv` 的 CommandLine 列为空是预期，不是导出损坏\n",
+    );
     m.push_str(&format!("- 机器：{}\n\n", snap.computer));
     m.push_str("## 整机内存\n\n| 指标 | 数值 |\n| --- | ---: |\n");
     m.push_str(&format!("| 物理内存总量 | {} MB |\n", snap.total_phys_mb));

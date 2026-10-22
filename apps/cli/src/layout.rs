@@ -1,4 +1,4 @@
-//! 桌面布局子命令：`deskkit layout <动词>`
+//! 桌面布局子命令：`MemBase.exe layout <动词>`
 //!
 //! 这里的每个动词都对应界面上的一个可点操作，反过来界面上的每个按钮
 //! 也都能在 [`ACTIONS`] 表里找到自己的命令行写法 —— 这是本项目的硬约束：
@@ -38,64 +38,116 @@ pub const ACTIONS: &[Action] = &[
         key: "proc_refresh",
         page: "进程",
         label: "刷新对比",
-        cli: "deskkit compare",
+        cli: "MemBase.exe compare",
         note: "重新拍快照并与基准 diff",
     },
     Action {
         key: "proc_pick_all",
         page: "进程",
         label: "全选 N 项 / 清空勾选",
-        cli: "deskkit list --include-caution",
+        cli: "MemBase.exe list --include-caution",
         note: "命令行用 --only / --exclude 表达勾选范围",
     },
     Action {
         key: "proc_include_caution",
         page: "进程",
         label: "含系统组件",
-        cli: "deskkit trim --include-caution",
+        cli: "MemBase.exe trim --include-caution",
         note: "放开「谨慎」档，命令行对应同一个开关",
     },
     Action {
         key: "proc_trim",
         page: "进程",
         label: "恢复选中 N 项",
-        cli: "deskkit trim --execute --yes --only <名字,名字>",
+        cli: "MemBase.exe trim --execute --yes --only <名字,名字>",
         note: "界面勾选的行 = --only 列表",
     },
     Action {
         key: "proc_protect",
         page: "进程",
         label: "行首「保护」勾选框",
-        cli: "deskkit protect add <名字>",
+        cli: "MemBase.exe protect add <名字>",
         note: "取消保护用 protect remove",
     },
     Action {
         key: "proc_protect_all",
         page: "进程",
         label: "全部保护 / 取消全部保护",
-        cli: "deskkit protect add <名字...> | deskkit protect clear",
+        cli: "MemBase.exe protect add <名字...> | MemBase.exe protect clear",
         note: "整份名单一次写入或清空",
+    },
+    Action {
+        key: "proc_restart",
+        page: "进程",
+        label: "重启选中 N 项",
+        cli: "MemBase.exe restart <名字> --execute --yes",
+        note: "关掉再按原路径拉起，等 3 秒实测回收量；勾选的行 = 逐个执行",
+    },
+    // ---------------- 瘦身页 ----------------
+    Action {
+        key: "slim_execute",
+        page: "瘦身",
+        label: "处理选中 N 项",
+        cli: "MemBase.exe slim --execute --yes --only <名字,名字>",
+        note: "禁用服务 / 卸载 Store 应用 / 关功能开关；下次开机才反映到基准",
+    },
+    Action {
+        key: "slim_refresh",
+        page: "瘦身",
+        label: "重新扫描",
+        cli: "MemBase.exe slim",
+        note: "读基准服务清单 + 当前功能开关，已禁用/已卸载的自动跳过",
+    },
+    Action {
+        key: "slim_caution",
+        page: "瘦身",
+        label: "含系统组件",
+        cli: "MemBase.exe slim --include-caution",
+        note: "放开 Windows 目录下的组件，禁了可能断网，必须逐条判断",
+    },
+    // ---------------- 启动项页 ----------------
+    Action {
+        key: "startup_refresh",
+        page: "启动项",
+        label: "重新扫描",
+        cli: "MemBase.exe startup list",
+        note: "Run / 启动文件夹 / 非 Microsoft 计划任务",
+    },
+    Action {
+        key: "startup_toggle",
+        page: "启动项",
+        label: "行尾「禁用 / 启用」",
+        cli: "MemBase.exe startup disable|enable <名称> --execute --yes",
+        note: "只改批准记录或任务状态，不删原始命令行",
+    },
+    // ---------------- 开机采集页 ----------------
+    Action {
+        key: "boot_dual",
+        page: "开机采集",
+        label: "双采样",
+        cli: "MemBase.exe install --at <秒> --also <秒>",
+        note: "一次开机采两点，用来分辨短命项；配合 MemBase.exe transient",
     },
     // ---------------- 基准页 ----------------
     Action {
         key: "baseline_capture",
         page: "基准",
         label: "扫描当前状态设为基准",
-        cli: "deskkit baseline capture",
+        cli: "MemBase.exe baseline capture",
         note: "不用重启，立刻把当前态立成基准",
     },
     Action {
         key: "baseline_export",
         page: "基准",
         label: "导出基准",
-        cli: "deskkit baseline export --to <文件.mbz>",
+        cli: "MemBase.exe baseline export --to <文件.mbz>",
         note: "打包成单文件，可拷到别的机器",
     },
     Action {
         key: "baseline_import",
         page: "基准",
         label: "导入基准",
-        cli: "deskkit baseline import <文件.mbz>",
+        cli: "MemBase.exe baseline import <文件.mbz>",
         note: "先校验 crc 再落地，坏包不动",
     },
     // ---------------- 保护名单页 ----------------
@@ -103,14 +155,14 @@ pub const ACTIONS: &[Action] = &[
         key: "protect_remove",
         page: "保护名单",
         label: "行尾「移除」",
-        cli: "deskkit protect remove <名字>",
+        cli: "MemBase.exe protect remove <名字>",
         note: "只删这一条，通配规则原样保留",
     },
     Action {
         key: "protect_clear",
         page: "保护名单",
         label: "清空全部",
-        cli: "deskkit protect clear",
+        cli: "MemBase.exe protect clear",
         note: "删掉 protect.txt 里所有规则",
     },
     // ---------------- 桌面布局页 ----------------
@@ -118,63 +170,63 @@ pub const ACTIONS: &[Action] = &[
         key: "layout_save",
         page: "桌面布局",
         label: "保存当前桌面",
-        cli: "deskkit layout save <名字>",
+        cli: "MemBase.exe layout save <名字>",
         note: "记下每个图标的名字与像素坐标",
     },
     Action {
         key: "layout_restore",
         page: "桌面布局",
         label: "恢复选中布局",
-        cli: "deskkit layout restore <名字> --execute --yes",
+        cli: "MemBase.exe layout restore <名字> --execute --yes",
         note: "不加 --execute 就是演练，只报会动哪些",
     },
     Action {
         key: "layout_diff",
         page: "桌面布局",
         label: "差异预览",
-        cli: "deskkit layout diff <名字>",
+        cli: "MemBase.exe layout diff <名字>",
         note: "只读：几个会动 / 几个已消失 / 几个新增",
     },
     Action {
         key: "layout_delete",
         page: "桌面布局",
         label: "删除布局",
-        cli: "deskkit layout delete <名字> --yes",
+        cli: "MemBase.exe layout delete <名字> --yes",
         note: "删布局文件，不动桌面",
     },
     Action {
         key: "layout_ghost",
         page: "桌面布局",
         label: "叠加当前位置",
-        cli: "deskkit layout diff <名字> --positions",
+        cli: "MemBase.exe layout diff <名字> --positions",
         note: "界面画蓝色虚线；命令行打印当前坐标",
     },
     Action {
         key: "layout_probe",
         page: "桌面布局",
         label: "接口诊断",
-        cli: "deskkit layout probe",
+        cli: "MemBase.exe layout probe",
         note: "检查 shell 官方接口能不能用（决定能否持久化）",
     },
     Action {
         key: "layout_repair",
         page: "桌面布局",
         label: "修复布局缓存",
-        cli: "deskkit layout repair --execute --yes",
+        cli: "MemBase.exe layout repair --execute --yes",
         note: "备份并删除 IconLayouts，重启后系统重建",
     },
     Action {
         key: "layout_open_dir",
         page: "桌面布局",
         label: "打开布局目录",
-        cli: "deskkit layout dir --open",
+        cli: "MemBase.exe layout dir --open",
         note: "不加 --open 只打印路径",
     },
     Action {
         key: "layout_refresh",
         page: "桌面布局",
         label: "刷新",
-        cli: "deskkit layout list",
+        cli: "MemBase.exe layout list",
         note: "重新读布局目录 + 桌面状态",
     },
     // ---------------- 开机采集页 ----------------
@@ -182,14 +234,14 @@ pub const ACTIONS: &[Action] = &[
         key: "boot_install",
         page: "开机采集",
         label: "安排下次开机采集",
-        cli: "deskkit install --at <秒>",
+        cli: "MemBase.exe install --at <秒>",
         note: "SYSTEM 权限、无窗口，采完自动销毁",
     },
     Action {
         key: "boot_uninstall",
         page: "开机采集",
         label: "取消安排",
-        cli: "deskkit uninstall",
+        cli: "MemBase.exe uninstall",
         note: "删掉开机计划任务",
     },
     // ---------------- 工具页 ----------------
@@ -197,28 +249,28 @@ pub const ACTIONS: &[Action] = &[
         key: "screen_off",
         page: "工具",
         label: "息屏",
-        cli: "deskkit screen off --seconds <秒> --exit-key esc",
+        cli: "MemBase.exe screen off --seconds <秒> --exit-key esc",
         note: "全屏黑；按热键退出，到点自动亮（0 秒 = 不定时）",
     },
     Action {
         key: "screen_duration",
         page: "工具",
         label: "息屏时长（时:分:秒）",
-        cli: "deskkit screen duration <1:05:09>",
+        cli: "MemBase.exe screen duration <1:05:09>",
         note: "界面三个输入框改一下就落盘，两边同一个文件",
     },
     Action {
         key: "screen_key",
         page: "工具",
         label: "退出热键",
-        cli: "deskkit screen key <esc|space|enter|any>",
+        cli: "MemBase.exe screen key <esc|space|enter|any>",
         note: "默认 ESC；界面下拉框与这条命令同一个文件",
     },
     Action {
         key: "screen_power",
         page: "工具",
         label: "同时关闭显示器",
-        cli: "deskkit screen power <on|off>",
+        cli: "MemBase.exe screen power <on|off>",
         note: "默认关：只盖全屏黑窗，不动显示器电源（关了可能叫不醒）",
     },
     // ---------------- 设置页 ----------------
@@ -226,28 +278,28 @@ pub const ACTIONS: &[Action] = &[
         key: "settings_open_dir",
         page: "设置",
         label: "打开数据目录",
-        cli: "deskkit config get --open",
+        cli: "MemBase.exe config get --open",
         note: "先告诉你目录在哪，再打开它",
     },
     Action {
         key: "settings_choose_dir",
         page: "设置",
         label: "更改数据目录…",
-        cli: "deskkit config set <目录>",
+        cli: "MemBase.exe config set <目录>",
         note: "写入 %APPDATA%\\MemBase\\config.json",
     },
     Action {
         key: "theme_light",
         page: "设置",
         label: "外观 · 浅色",
-        cli: "deskkit theme set light",
+        cli: "MemBase.exe theme set light",
         note: "落在 theme.txt，重启后保持",
     },
     Action {
         key: "theme_dark",
         page: "设置",
         label: "外观 · 深色",
-        cli: "deskkit theme set dark",
+        cli: "MemBase.exe theme set dark",
         note: "落在 theme.txt，重启后保持",
     },
 ];
@@ -285,7 +337,7 @@ fn resolve(args: &[String]) -> Result<String, i32> {
     match store::latest() {
         Some(n) => Ok(n),
         None => {
-            eprintln!("[x] 还没有任何布局，先执行：deskkit layout save <名字>");
+            eprintln!("[x] 还没有任何布局，先执行：MemBase.exe layout save <名字>");
             Err(EXIT_NO_BASELINE)
         }
     }
@@ -311,7 +363,7 @@ fn jstr_arr(list: &[String]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// 入口：`deskkit layout <动词> [参数]`
+/// 入口：`MemBase.exe layout <动词> [参数]`
 pub fn cmd_layout(args: &[String]) -> i32 {
     // 读桌面要 DPI 感知，走 shell 接口要 COM 套间；和 GUI 用同一份初始化
     deskkit_win::init();
@@ -347,7 +399,7 @@ pub fn cmd_layout(args: &[String]) -> i32 {
 
 pub fn layout_usage() -> String {
     let mut s = String::from(
-        "deskkit layout —— 桌面图标布局（保存 / 差异 / 恢复 / 修复）\n\n用法: deskkit layout <动词> [名字] [选项]\n\n",
+        "MemBase.exe layout —— 桌面图标布局（保存 / 差异 / 恢复 / 修复）\n\n用法: MemBase.exe layout <动词> [名字] [选项]\n\n",
     );
     for (n, d, a) in LAYOUT_COMMANDS {
         s.push_str(&format!("  {:<8} {:<34} {}\n", n, d, a));
@@ -359,7 +411,7 @@ pub fn layout_usage() -> String {
     s.push_str("  --open               dir 时顺便打开资源管理器\n");
     s.push_str("  --json               结构化输出\n");
     s.push_str("\n注意: 恢复依赖「自动排列图标」处于关闭状态，检测到会自动帮你关掉；\n");
-    s.push_str("      想看 shell 官方接口能不能用，跑 deskkit layout probe。");
+    s.push_str("      想看 shell 官方接口能不能用，跑 MemBase.exe layout probe。");
     s
 }
 
@@ -390,7 +442,7 @@ fn layout_list(args: &[String]) -> i32 {
     }
     if items.is_empty() {
         println!("还没有任何布局（目录: {}）", store::dir().display());
-        println!("存一份看看：deskkit layout save 工作");
+        println!("存一份看看：MemBase.exe layout save 工作");
         return 0;
     }
     println!("布局目录: {}", store::dir().display());
@@ -584,7 +636,7 @@ fn layout_diff(args: &[String]) -> i32 {
     }
     if plan.to_move > 0 {
         println!(
-            "\n正式恢复：deskkit layout restore {} --execute --yes",
+            "\n正式恢复：MemBase.exe layout restore {} --execute --yes",
             name
         );
     }
@@ -670,7 +722,7 @@ fn layout_restore(args: &[String]) -> i32 {
             plan.missing.len()
         );
         println!(
-            "\n真正动手：deskkit layout restore {} --execute --yes",
+            "\n真正动手：MemBase.exe layout restore {} --execute --yes",
             name
         );
         return 0;
@@ -733,7 +785,7 @@ fn layout_restore(args: &[String]) -> i32 {
             }
         );
         if !r.failed.is_empty() || !r.used_shell_api {
-            println!("  提示：先跑一次 deskkit layout repair --execute --yes 清理系统布局缓存");
+            println!("  提示：先跑一次 MemBase.exe layout repair --execute --yes 清理系统布局缓存");
         }
     }
     if r.failed.is_empty() {
@@ -745,7 +797,7 @@ fn layout_restore(args: &[String]) -> i32 {
 
 fn layout_delete(args: &[String]) -> i32 {
     let Some(name) = name_of(args) else {
-        eprintln!("用法: deskkit layout delete <名字> --yes");
+        eprintln!("用法: MemBase.exe layout delete <名字> --yes");
         return EXIT_USAGE;
     };
     if !store::exists(&name) {
@@ -900,7 +952,7 @@ fn layout_repair(args: &[String]) -> i32 {
             );
         } else {
             println!("[演练] {}", msg);
-            println!("真正动手：deskkit layout repair --execute --yes");
+            println!("真正动手：MemBase.exe layout repair --execute --yes");
         }
         return 0;
     }
@@ -934,7 +986,7 @@ fn layout_repair(args: &[String]) -> i32 {
                 println!("已删除 IconLayouts（系统下次启动会重建一份干净的）");
                 println!("\n接着做两步：");
                 println!("  1. 重启电脑 —— 桌面会先变成默认排列，这是正常的");
-                println!("  2. 重启后执行：deskkit layout restore <名字> --execute --yes");
+                println!("  2. 重启后执行：MemBase.exe layout restore <名字> --execute --yes");
             }
             0
         }

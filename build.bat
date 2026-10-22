@@ -12,15 +12,16 @@ if errorlevel 1 (
 
 echo [2/2] 收产物到 dist
 if not exist dist mkdir dist
-copy /y target\release\deskkit.exe    dist\ >nul
+rem 只分发一个 exe：带参数是命令行，无参数开界面
 copy /y target\release\MemBase.exe    dist\ >nul
+rem 老的纯控制台版不再分发，残留一并清掉
+if exist dist\deskkit.exe del /q dist\deskkit.exe
 
 echo.
-for %%F in (dist\deskkit.exe dist\MemBase.exe) do (
+for %%F in (dist\MemBase.exe) do (
   echo   %%~nxF  %%~zF 字节
 )
 echo.
 echo 用法：
 echo   dist\MemBase.exe                    开界面
 echo   dist\MemBase.exe layout list        同一个 exe 当命令行用
-echo   dist\deskkit.exe layout status      纯控制台版

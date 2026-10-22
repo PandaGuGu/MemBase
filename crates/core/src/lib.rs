@@ -5,8 +5,11 @@
 
 pub mod bundle;
 pub mod config;
+pub mod feature;
 pub mod layout;
 pub mod layout_store;
+pub mod selfheal;
+pub mod startup;
 
 /// crate 版本（用于 CLI 自描述与包 manifest）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -487,6 +490,14 @@ pub enum TrimAction {
     DisableService,
     /// 卸载 Store 应用（`Remove-AppxPackage`），比禁用服务更彻底
     UninstallAppx,
+    /// 关掉一个已知功能开关（只写 HKCU，见 [`feature::FEATURE_SWITCHES`]）
+    FeatureOff,
+    /// 停掉进程并禁用它的启动项（Run / 启动文件夹 / 计划任务）
+    ///
+    /// 补的是「开机后才起、既不是服务也不是 appx」这一类：VS 安装器的
+    /// `BackgroundDownload` 一开机 339 MB（2026-10-22 实测），
+    /// `trim` 只认线外、`slim` 只认服务、`startup` 又跳过 `\Microsoft\`，四条路全漏。
+    StopAndDisableStartup,
 }
 
 impl TrimAction {
@@ -494,12 +505,16 @@ impl TrimAction {
         match self {
             TrimAction::DisableService => "disable-service",
             TrimAction::UninstallAppx => "uninstall-appx",
+            TrimAction::FeatureOff => "feature-off",
+            TrimAction::StopAndDisableStartup => "stop-and-disable-startup",
         }
     }
     pub fn label(&self) -> &'static str {
         match self {
             TrimAction::DisableService => "禁用服务",
             TrimAction::UninstallAppx => "卸载应用",
+            TrimAction::FeatureOff => "关功能开关",
+            TrimAction::StopAndDisableStartup => "停用自启",
         }
     }
 }
@@ -511,14 +526,23 @@ pub struct TrimItem {
     pub action: TrimAction,
     /// `UninstallAppx` 时的包全名
     pub appx: Option<String>,
+    /// `FeatureOff` 时对应的开关键（见 [`feature::FEATURE_SWITCHES`]）
+    pub feature: Option<&'static str>,
     /// 宿主机进程内存（同宿主上多个服务会重复显示，合计时要按 pid 去重）
     pub mem_mb: f64,
     pub host_pid: u32,
     pub host: String,
+    /// 宿主上还有别的服务在跑：停掉这一项本身不会让宿主退出，实际回收接近 0
+    pub shared_host: bool,
+    /// 宿主上 `Running` 的服务数（1 = 这一项独占宿主）
+    pub host_service_count: u32,
     pub start_mode: String,
     pub path: String,
     pub tier: Tier,
     pub reason: String,
+    /// `StopAndDisableStartup` 时的启动项来源 / 名字（其余动作为 `None` / 空串）
+    pub startup_source: Option<startup::StartupSource>,
+    pub startup_name: String,
 }
 
 /// 以「开机基准」为输入，列出值得砍掉的服务。
@@ -531,6 +555,16 @@ pub struct TrimItem {
 ///   * Windows 目录下的组件 → `Caution`（要 `include_caution` 才给）
 ///   * Store 应用（WindowsApps）与第三方 → `Suggested`
 pub fn build_trim_plan(rows: &[SvcRowAgg], min_mb: f64, include_caution: bool) -> Vec<TrimItem> {
+    // 每个宿主上跑了几个服务：用来区分「独占宿主」与「共享宿主」。
+    // 共享宿主上停掉一个服务，宿主进程还在，工作集基本不变——这一栏不标出来，
+    // 用户会把「宿主全量」当成「停掉它就能省这么多」（2026-10-22 实测：PID 1716 承载 16 个）。
+    let mut host_count: BTreeMap<u32, u32> = BTreeMap::new();
+    for r in rows {
+        if r.state == "Running" && r.pid > 0 {
+            *host_count.entry(r.pid).or_insert(0) += 1;
+        }
+    }
+
     let mut out: Vec<TrimItem> = Vec::new();
     for r in rows {
         if r.state != "Running" {
@@ -560,27 +594,48 @@ pub fn build_trim_plan(rows: &[SvcRowAgg], min_mb: f64, include_caution: bool) -
         } else {
             TrimAction::DisableService
         };
+        let cnt = if r.pid > 0 {
+            host_count.get(&r.pid).copied().unwrap_or(1)
+        } else {
+            1
+        };
+        let shared = cnt > 1;
         let reason = match action {
             TrimAction::UninstallAppx => format!(
                 "Store 应用随系统装上，卸载比禁用干净（禁用服务会被重新挂起来）· {}",
                 r.start_mode
             ),
+            TrimAction::DisableService if shared => format!(
+                "开机自启（{}）· 与另外 {} 个服务共享宿主 {}（PID {}），停它本身不释放宿主内存",
+                r.start_mode,
+                cnt - 1,
+                r.host,
+                r.pid
+            ),
             TrimAction::DisableService => {
-                format!("开机自启（{}）· 内存按宿主 {} 计", r.start_mode, r.host)
+                format!("开机自启（{}）· 独占宿主 {}", r.start_mode, r.host)
             }
+            // 服务清单里不会产出这两个动作，分支只为让 match 穷尽
+            TrimAction::FeatureOff => format!("功能开关 · {}", r.start_mode),
+            TrimAction::StopAndDisableStartup => format!("启动项 · {}", r.start_mode),
         };
         out.push(TrimItem {
             name: r.name.clone(),
             display: r.display.clone(),
             action,
             appx,
+            feature: None,
             mem_mb: (mem * 100.0).round() / 100.0,
             host_pid: r.pid,
             host: r.host.clone(),
+            shared_host: shared,
+            host_service_count: cnt,
             start_mode: r.start_mode.clone(),
             path: r.path.clone(),
             tier,
             reason,
+            startup_source: None,
+            startup_name: String::new(),
         });
     }
     out.sort_by(|a, b| {
@@ -596,16 +651,144 @@ pub fn build_trim_plan(rows: &[SvcRowAgg], min_mb: f64, include_caution: bool) -
     out
 }
 
-/// 合计可省内存：同一 svchost 宿主上挂 N 个服务，只能算一次。
-pub fn trim_savings(items: &[TrimItem]) -> f64 {
-    let mut seen: BTreeMap<u32, f64> = BTreeMap::new();
+/// 把「功能开关还开着、证据进程还在跑」的项折成瘦身清单的一行。
+///
+/// 只有 [`feature::FeatureVerdict::Active`] 才进清单：开关已经关了的项列出来
+/// 没有可执行的动作，只会让用户以为「还没处理」。
+pub fn build_feature_items(
+    switches: &[feature::FeatureSwitch],
+    states: &BTreeMap<&'static str, feature::SwitchState>,
+    evidence: &BTreeMap<&'static str, feature::FeatureEvidence>,
+) -> Vec<TrimItem> {
+    let mut out = Vec::new();
+    for sw in switches {
+        let state = states.get(sw.key).copied().unwrap_or(feature::SwitchState::Missing);
+        let ev = evidence.get(sw.key).copied().unwrap_or_default();
+        if feature::feature_verdict(state, &ev) != feature::FeatureVerdict::Active {
+            continue;
+        }
+        out.push(TrimItem {
+            name: sw.key.to_string(),
+            display: sw.label.to_string(),
+            action: TrimAction::FeatureOff,
+            appx: None,
+            feature: Some(sw.key),
+            mem_mb: ev.mem_mb,
+            host_pid: 0,
+            host: sw.host_proc.to_string(),
+            shared_host: false,
+            host_service_count: 0,
+            start_mode: String::new(),
+            path: String::new(),
+            tier: Tier::Suggested,
+            reason: format!(
+                "功能开关开着，{} 个 {} 在跑（宿主 {}）· 关掉后下次开机不再拉起",
+                ev.instances,
+                sw.evidence_proc,
+                if sw.host_proc.is_empty() { "进程自身" } else { sw.host_proc }
+            ),
+            startup_source: None,
+            startup_name: String::new(),
+        });
+    }
+    out
+}
+
+/// 把「确实已经占了内存的启动项」折成瘦身清单的一行。
+///
+/// 与 [`build_trim_plan`] 的分工：那边只认服务配置，这边认 Run / 启动文件夹 / 计划任务。
+/// 2026-10-22 的教训：VS 安装器的 `BackgroundDownload` 一开机就吃 339 MB，
+/// 既不是服务也不是 appx，`trim` / `slim` / `feature` / `startup` 四条路全够不着。
+///
+/// 只收「启用中 + 进程真的在跑 + 内存过阈值」的项：系统任务有 250 多个，
+/// 绝大多数根本没跑起来，按实证内存过滤是唯一能压住噪音的判据。
+///
+/// `mem_by_exe` 的键必须是小写进程名（不含 `.exe` 也可以，见 `command_exe`），
+/// 值是该名字下所有实例的工作集合计。
+pub fn build_startup_trim_items(
+    items: &[startup::StartupItem],
+    mem_by_exe: &BTreeMap<String, f64>,
+    min_mb: f64,
+    include_caution: bool,
+) -> Vec<TrimItem> {
+    let mut out: Vec<TrimItem> = Vec::new();
     for it in items {
-        // pid 0 = 拿不到宿主（多半是停止态或读不到），按名字单独算
-        let key = if it.host_pid == 0 { 1_000_000 + it.name.len() as u32 } else { it.host_pid };
+        if !it.enabled || it.exe.is_empty() {
+            continue;
+        }
+        if it.tier == Tier::Blocked {
+            continue;
+        }
+        if it.tier == Tier::Caution && !include_caution {
+            continue;
+        }
+        let mem = mem_by_exe
+            .get(&it.exe.to_lowercase())
+            .copied()
+            .unwrap_or(0.0);
+        if mem < min_mb {
+            continue;
+        }
+        out.push(TrimItem {
+            name: it.name.clone(),
+            display: if it.exe.is_empty() {
+                it.name.clone()
+            } else {
+                format!("{} ({})", it.name, it.exe)
+            },
+            action: TrimAction::StopAndDisableStartup,
+            appx: None,
+            feature: None,
+            mem_mb: (mem * 100.0).round() / 100.0,
+            host_pid: 0,
+            host: it.exe.clone(),
+            shared_host: false,
+            host_service_count: 0,
+            start_mode: String::new(),
+            path: it.command.clone(),
+            tier: it.tier,
+            reason: format!(
+                "{} 正在占 {:.0} MB · 来源 {} · 停进程并禁用启动项（可逆）",
+                it.exe,
+                mem,
+                it.source.label()
+            ),
+            startup_source: Some(it.source),
+            startup_name: it.name.clone(),
+        });
+    }
+    out.sort_by(|a, b| {
+        b.mem_mb
+            .partial_cmp(&a.mem_mb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// 合计可省内存：同一 svchost 宿主上挂 N 个服务，只能算一次。
+///
+/// 没有宿主 PID 的项（功能开关、读不到宿主的服务）按名字各算一次——
+/// 不能拿「名字长度」当键，那样两个同长度的条目会被并成一条。
+pub fn trim_savings(items: &[TrimItem]) -> f64 {
+    let refs: Vec<&TrimItem> = items.iter().collect();
+    trim_savings_of(&refs)
+}
+
+/// [`trim_savings`] 的借用版：界面上勾选项本来就是 `Vec<&TrimItem>`，
+/// 不需要为了求个合计把整张清单 clone 一遍。
+pub fn trim_savings_of(items: &[&TrimItem]) -> f64 {
+    let mut seen: BTreeMap<String, f64> = BTreeMap::new();
+    for it in items {
+        let key = if it.host_pid == 0 {
+            format!("name:{}", it.name)
+        } else {
+            format!("pid:{}", it.host_pid)
+        };
         seen.insert(key, it.mem_mb);
     }
     let total: f64 = seen.values().sum();
-    (total * 100.0).round() / 100.0
+    // 空集合的 f64 sum 是 -0.0：不加这个 0.0，JSON 里会原样输出 `-0.0`
+    ((total + 0.0) * 100.0).round() / 100.0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -838,6 +1021,13 @@ pub struct PlanItem {
     /// 命中的保护条目原文（空串 = 没被保护）；形如 `进程:MuMu*`
     pub protect_by: String,
     pub start_mode: String,
+    /// 服务项的宿主 PID（进程项在单实例时填自己的 PID，多实例填 0）。
+    /// 合计时按它去重：同一宿主上的多项指向的是同一块内存。
+    pub host_pid: u32,
+    /// 服务项的宿主上还跑着别的服务 —— 停这一项不会让宿主退出，回收接近 0
+    pub shared_host: bool,
+    /// 真正能兑现的回收量：进程项 = 自身工作集；服务项独占宿主时 = 宿主工作集，共享宿主时 = 0
+    pub reclaim_mb: f64,
 }
 
 impl PlanItem {
@@ -869,6 +1059,14 @@ pub fn build_plan(
     whitelist: &[String],
     min_mb: f64,
 ) -> Vec<PlanItem> {
+    // 宿主上跑了几个服务：共享宿主停掉其中一个，工作集基本不动
+    let mut host_count: BTreeMap<u32, u32> = BTreeMap::new();
+    for s in live_svcs {
+        if s.state == "Running" && s.pid > 0 {
+            *host_count.entry(s.pid).or_insert(0) += 1;
+        }
+    }
+
     let mut agg: BTreeMap<String, (u32, f64, Vec<Instance>, String)> = BTreeMap::new();
     for p in live_procs {
         let e = agg
@@ -899,6 +1097,9 @@ pub fn build_plan(
             continue;
         }
         let by = protect_pattern(whitelist, Kind::Process, &name).unwrap_or_default();
+        // 单实例才填 PID：多实例的进程项没有单一宿主，
+        // 合计时按名字各算一次（由 plan_totals 的 host_pid == 0 分支处理）
+        let host_pid = if members.len() == 1 { members[0].pid } else { 0 };
         out.push(PlanItem {
             kind: Kind::Process,
             name: name.clone(),
@@ -911,6 +1112,9 @@ pub fn build_plan(
             protect: !by.is_empty(),
             protect_by: by,
             start_mode: String::new(),
+            host_pid,
+            shared_host: false,
+            reclaim_mb: ws,
         });
     }
 
@@ -926,6 +1130,22 @@ pub fn build_plan(
             tier = Tier::Caution;
         }
         let by = protect_pattern(whitelist, Kind::Service, &s.name).unwrap_or_default();
+        let cnt = if s.pid > 0 {
+            host_count.get(&s.pid).copied().unwrap_or(1)
+        } else {
+            1
+        };
+        let shared = cnt > 1;
+        let reason = if shared {
+            format!(
+                "开机时未运行 · 启动方式 {} · 与另外 {} 个服务共享宿主（PID {}），停它本身不释放宿主内存",
+                s.start_mode,
+                cnt - 1,
+                s.pid
+            )
+        } else {
+            format!("开机时未运行 · 启动方式 {}", s.start_mode)
+        };
         out.push(PlanItem {
             kind: Kind::Service,
             name: s.name.clone(),
@@ -942,10 +1162,13 @@ pub fn build_plan(
             mem_mb: s.ws_mb,
             path: s.path.clone(),
             tier,
-            reason: format!("开机时未运行 · 启动方式 {}", s.start_mode),
+            reason,
             protect: !by.is_empty(),
             protect_by: by,
             start_mode: s.start_mode.clone(),
+            host_pid: s.pid,
+            shared_host: shared,
+            reclaim_mb: if shared { 0.0 } else { s.ws_mb },
         });
     }
 
@@ -968,14 +1191,62 @@ pub fn plan_actionable(plan: &[PlanItem], include_caution: bool) -> Vec<&PlanIte
     plan.iter().filter(|p| p.actionable(include_caution)).collect()
 }
 
+/// 把可处理项折成「真正能兑现的回收量」。
+///
+/// 两条规则，缺一条就会虚高（2026-10-22 实测报 204.4 MB，实际 175.7）：
+///   * 同一宿主 PID 只算一次 —— 进程项与同名服务项常指向同一个进程，
+///     `sppsvc` 既在进程清单又在服务清单里；
+///   * 共享宿主的服务项 `reclaim_mb` 已经是 0 —— 宿主上还有别的服务，
+///     停掉这一个不会让宿主退出。
+///
+/// 不能简单 `sum(mem_mb)`：`mem_mb` 对服务项存的是宿主全量，那个数只适合展示。
+pub fn plan_reclaim(items: &[&PlanItem]) -> f64 {
+    let mut by_pid: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut loose = 0.0;
+    for it in items {
+        if it.host_pid == 0 {
+            // 多实例进程项 / 读不到宿主的项：按条目各算一次
+            loose += it.reclaim_mb;
+            continue;
+        }
+        let e = by_pid.entry(it.host_pid).or_insert(0.0);
+        if it.reclaim_mb > *e {
+            *e = it.reclaim_mb;
+        }
+    }
+    let total: f64 = by_pid.values().sum::<f64>() + loose;
+    // 空集合的 f64 sum 是 -0.0，不加这个 0.0 会打印成「约 -0 MB」
+    ((total + 0.0) * 100.0).round() / 100.0
+}
+
 pub fn plan_totals(plan: &[PlanItem], include_caution: bool) -> (usize, f64) {
     let items = plan_actionable(plan, include_caution);
-    let mb = items.iter().map(|p| p.mem_mb).sum();
+    let mb = plan_reclaim(&items);
     (items.len(), mb)
 }
 
-pub fn tier_name(t: Tier) -> &'static str {
-    match t {
+/// 算出该轮换掉的旧 `run_*` 目录名，保留最新的 `keep` 个。
+///
+/// 数据目录里只有 `run_*` 会无限增长：每次开机一个目录，双采样时目录下还有
+/// `T+60s` / `T+300s` 两个子目录（2026-10-22 实测已堆到 11 个）。
+/// 这里只算名字，不碰文件系统 —— 删除交给平台层，而且必须走回收站。
+///
+/// `run_YYYYMMDD_HHMMSS` 的字典序就是时间序，所以直接按字符串排序，
+/// 不用解析时间戳（`_import` 后缀的目录名同样有序）。
+pub fn plan_rotation(run_names: &[String], keep: usize) -> Vec<String> {
+    let mut runs: Vec<&String> = run_names.iter().filter(|n| n.starts_with("run_")).collect();
+    runs.sort();
+    let keep = keep.max(1);
+    if runs.len() <= keep {
+        return Vec::new();
+    }
+    runs[..runs.len() - keep]
+        .iter()
+        .map(|s| (*s).clone())
+        .collect()
+}
+
+pub fn tier_name(t: Tier) -> &'static str {    match t {
         Tier::Suggested => "suggested",
         Tier::Caution => "caution",
         Tier::Blocked => "blocked",
@@ -1148,6 +1419,170 @@ mod tests {
         assert_eq!(plan.len(), 3);
         // 两个服务共用一个宿主，只能算 60，不是 120
         assert_eq!(trim_savings(&plan), 80.0);
+        // 共享宿主要标出来：停掉 A1 本身不释放这 60 MB
+        let a1 = plan.iter().find(|i| i.name == "A1").unwrap();
+        assert!(a1.shared_host);
+        assert_eq!(a1.host_service_count, 2);
+        let b1 = plan.iter().find(|i| i.name == "B1").unwrap();
+        assert!(!b1.shared_host);
+    }
+
+    // ---- 线外计划：可回收量 ----
+
+    fn live_proc(name: &str, pid: u32, ws: f64) -> LiveProc {
+        LiveProc {
+            name: name.into(),
+            pid,
+            ws_mb: ws,
+            priv_mb: 0.0,
+            path: r"F:\app\a.exe".into(),
+            created: 0,
+            unknown: 0,
+        }
+    }
+
+    fn live_svc(name: &str, pid: u32, ws: f64) -> LiveSvc {
+        LiveSvc {
+            name: name.into(),
+            state: "Running".into(),
+            start_mode: "Manual".into(),
+            pid,
+            ws_mb: ws,
+            path: r"F:\app\a.exe".into(),
+        }
+    }
+
+    /// 2026-10-22 实测的账目虚高：同一个 PID 上的进程项 + 两个共享服务项，
+    /// 曾经按 28.7 × 3 报出去，实际只有一份 28.7。
+    #[test]
+    fn plan_reclaim_counts_same_host_once() {
+        let procs = vec![live_proc("SensorService", 1368, 28.7)];
+        let svcs = vec![
+            live_svc("SensorService", 1368, 28.7),
+            live_svc("WdiSystemHost", 1368, 28.7),
+        ];
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &procs,
+            &svcs,
+            &[],
+            &[],
+            0.0,
+        );
+        assert_eq!(plan.len(), 3);
+        // 两个服务与宿主上的另一个服务共享内存 → 服务项可回收 0
+        assert!(plan.iter().filter(|p| p.kind == Kind::Service).all(|p| p.reclaim_mb == 0.0));
+        let (n, mb) = plan_totals(&plan, true);
+        assert_eq!(n, 3);
+        assert_eq!(mb, 28.7);
+    }
+
+    /// 独占宿主的服务：停掉它宿主就退场，宿主工作集可以整份算进来
+    #[test]
+    fn plan_reclaim_keeps_exclusive_host_memory() {
+        let svcs = vec![live_svc("Solo", 900, 50.0)];
+        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &[], &svcs, &[], &[], 0.0);
+        assert_eq!(plan.len(), 1);
+        assert!(!plan[0].shared_host);
+        assert_eq!(plan_totals(&plan, true).1, 50.0);
+    }
+
+    /// 空清单不能算成 -0.0（JSON 里会原样输出，界面上是「约 -0 MB」）
+    #[test]
+    fn plan_totals_never_negative_zero() {
+        let (n, mb) = plan_totals(&[], false);
+        assert_eq!(n, 0);
+        assert!(mb == 0.0 && mb.is_sign_positive(), "got {}", mb);
+    }
+
+    // ---- 基准目录轮换 ----
+
+    #[test]
+    fn rotation_keeps_newest_and_ignores_other_files() {
+        let names: Vec<String> = vec![
+            "exports",
+            "protect.txt",
+            "run_20261018_144420",
+            "run_20261020_214745",
+            "run_20261021_224225",
+            "run_20261022_072728",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        // 保留 2 个 → 删掉最早的两个，非 run_ 的一个都不动
+        assert_eq!(
+            plan_rotation(&names, 2),
+            vec!["run_20261018_144420", "run_20261020_214745"]
+        );
+        // 数量不够时一个都不删
+        assert!(plan_rotation(&names, 10).is_empty());
+        // keep=0 也要至少留一份，否则最新基准就没了
+        assert_eq!(plan_rotation(&names, 0).len(), 3);
+    }
+
+    /// 没有宿主 PID 的两条同长度名字，不能被当成同一条
+    #[test]
+    fn trim_savings_keeps_no_host_items_apart() {
+        let mut items = build_feature_items(
+            &feature::FEATURE_SWITCHES,
+            &{
+                let mut m = BTreeMap::new();
+                for sw in feature::FEATURE_SWITCHES {
+                    m.insert(sw.key, feature::SwitchState::On);
+                }
+                m
+            },
+            &{
+                let mut m = BTreeMap::new();
+                for sw in feature::FEATURE_SWITCHES {
+                    m.insert(
+                        sw.key,
+                        feature::FeatureEvidence {
+                            instances: 1,
+                            mem_mb: 10.0,
+                            foreign: 0,
+                            host_running: true,
+                        },
+                    );
+                }
+                m
+            },
+        );
+        // 两条都是 host_pid=0，各自 10 MB
+        assert_eq!(items.len(), feature::FEATURE_SWITCHES.len());
+        let total = trim_savings(&items);
+        assert_eq!(total, 10.0 * feature::FEATURE_SWITCHES.len() as f64);
+        items.clear();
+        assert_eq!(trim_savings(&items), 0.0);
+    }
+
+    #[test]
+    fn feature_items_only_for_active_switches() {
+        let mut states = BTreeMap::new();
+        let mut ev = BTreeMap::new();
+        for sw in feature::FEATURE_SWITCHES {
+            states.insert(sw.key, feature::SwitchState::Off);
+            ev.insert(
+                sw.key,
+                feature::FeatureEvidence {
+                    instances: 6,
+                    mem_mb: 369.0,
+                    foreign: 0,
+                    host_running: true,
+                },
+            );
+        }
+        // 开关都关着 → 不该有任何可执行项（哪怕实例还在跑）
+        assert!(build_feature_items(&feature::FEATURE_SWITCHES, &states, &ev).is_empty());
+
+        states.insert("search-highlights", feature::SwitchState::On);
+        let items = build_feature_items(&feature::FEATURE_SWITCHES, &states, &ev);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, TrimAction::FeatureOff);
+        assert_eq!(items[0].feature, Some("search-highlights"));
+        assert_eq!(items[0].mem_mb, 369.0);
     }
 
     #[test]

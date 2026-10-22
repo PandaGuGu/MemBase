@@ -56,8 +56,17 @@ pub const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_USER_CLASS: u32 = 1;
 
 const HKEY_LOCAL_MACHINE: HANDLE = 0x8000_0002isize as HANDLE;
+const HKEY_CURRENT_USER: HANDLE = 0x8000_0001isize as HANDLE;
 const KEY_READ: u32 = 0x0002_0019;
+const KEY_SET_VALUE: u32 = 0x0002;
+const KEY_WOW64_64KEY: u32 = 0x0100;
+const KEY_WOW64_32KEY: u32 = 0x0200;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const REG_BINARY: u32 = 3;
 const REG_DWORD: u32 = 4;
+const REG_OPTION_NON_VOLATILE: u32 = 0;
+const ERROR_FILE_NOT_FOUND: i32 = 2;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -380,6 +389,37 @@ extern "system" {
         lpData: *mut u8,
         lpcbData: *mut u32,
     ) -> i32;
+    fn RegSetValueExW(
+        hKey: HANDLE,
+        lpValueName: *const u16,
+        Reserved: u32,
+        dwType: u32,
+        lpData: *const u8,
+        cbData: u32,
+    ) -> i32;
+    fn RegCreateKeyExW(
+        hKey: HANDLE,
+        lpSubKey: *const u16,
+        Reserved: u32,
+        lpClass: *const u16,
+        dwOptions: u32,
+        samDesired: u32,
+        lpSecurityAttributes: *mut c_void,
+        phkResult: *mut HANDLE,
+        lpdwDisposition: *mut u32,
+    ) -> i32;
+    fn RegDeleteValueW(hKey: HANDLE, lpValueName: *const u16) -> i32;
+    fn RegEnumValueW(
+        hKey: HANDLE,
+        dwIndex: u32,
+        lpValueName: *mut u16,
+        lpcchValueName: *mut u32,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+    fn ExpandEnvironmentStringsW(lpSrc: *const u16, lpDst: *mut u16, nSize: u32) -> u32;
     fn RegCloseKey(hKey: HANDLE) -> i32;
 }
 
@@ -622,6 +662,13 @@ pub fn process_memory(h: HANDLE) -> Option<PROCESS_MEMORY_COUNTERS> {
     } else {
         Some(pmc)
     }
+}
+
+/// 单个进程当前的工作集（MB）。读不到返回 `None`——「读不到」不等于 0。
+pub fn process_ws_mb(pid: u32) -> Option<f64> {
+    let h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
+    let pmc = process_memory(h.0)?;
+    Some((pmc.WorkingSetSize as f64 / 1_048_576.0 * 100.0).round() / 100.0)
 }
 
 pub fn session_id(pid: u32) -> u32 {
@@ -1080,6 +1127,18 @@ pub fn start_service(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 服务宿主进程 PID（停止态返回 None）。重启服务时用来量宿主的前后工作集。
+pub fn service_pid(name: &str) -> Option<u32> {
+    let scm = open_scm()?;
+    let svc = open_service(scm.0, name, SERVICE_QUERY_STATUS)?;
+    let st = service_status(svc.0)?;
+    if st.dwProcessId == 0 {
+        None
+    } else {
+        Some(st.dwProcessId)
+    }
+}
+
 /// 当前进程是否已提权（UAC 提升过）。
 ///
 /// 采集口径依赖这个：没有提权就拿不到别的账户进程的内存，
@@ -1344,6 +1403,296 @@ fn reg_dword(key: &str, name: &str) -> Option<u32> {
     }
 }
 
+// ---------------- 枚举注册表值（启动项扫描用） ----------------
+
+/// 一个注册表值的原始数据。`kind` 是 REG_* 类型，`data` 是原始字节。
+pub struct RegValue {
+    pub name: String,
+    pub kind: u32,
+    pub data: Vec<u8>,
+}
+
+impl RegValue {
+    /// REG_SZ / REG_EXPAND_SZ 解成字符串；别的类型返回空串
+    pub fn as_string(&self) -> String {
+        if self.kind != REG_SZ && self.kind != REG_EXPAND_SZ {
+            return String::new();
+        }
+        let words: Vec<u16> = self
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|w| *w != 0)
+            .collect();
+        String::from_utf16_lossy(&words)
+    }
+}
+
+fn enum_values(hive: HANDLE, path: &str, extra: u32) -> Vec<RegValue> {
+    let mut out = Vec::new();
+    let Some(key) = open_hive_key(hive, path, KEY_READ | extra, false) else {
+        return out;
+    };
+    let mut idx: u32 = 0;
+    loop {
+        let mut name_buf = [0u16; 512];
+        let mut name_len: u32 = name_buf.len() as u32;
+        let mut data = vec![0u8; 32768];
+        let mut data_len: u32 = data.len() as u32;
+        let mut kind: u32 = 0;
+        let rc = unsafe {
+            RegEnumValueW(
+                key.0,
+                idx,
+                name_buf.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null_mut(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut data_len,
+            )
+        };
+        if rc != 0 {
+            // 259 = ERROR_NO_MORE_ITEMS，其余（如 234 数据太大）就跳过这一条继续
+            if rc != 259 {
+                idx += 1;
+                if idx > 4096 {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        data.truncate(data_len as usize);
+        let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+        out.push(RegValue {
+            name,
+            kind,
+            data,
+        });
+        idx += 1;
+    }
+    out
+}
+
+/// 枚举 HKCU 下某个子键的全部值
+pub fn enum_user_values(path: &str) -> Vec<RegValue> {
+    enum_values(HKEY_CURRENT_USER, path, 0)
+}
+
+/// 枚举 HKLM 下某个子键的全部值。`view32 = true` 时读 Wow6432Node 视图。
+pub fn enum_machine_values(path: &str, view32: bool) -> Vec<RegValue> {
+    enum_values(
+        HKEY_LOCAL_MACHINE,
+        path,
+        if view32 { KEY_WOW64_32KEY } else { KEY_WOW64_64KEY },
+    )
+}
+
+/// 读 HKCU 下的二进制值（StartupApproved 用它记「启用/禁用」）
+pub fn user_reg_binary(path: &str, value: &str) -> Option<Vec<u8>> {
+    enum_user_values(path)
+        .into_iter()
+        .find(|v| v.name.eq_ignore_ascii_case(value))
+        .filter(|v| v.kind == REG_BINARY)
+        .map(|v| v.data)
+}
+
+/// 写 HKCU 下的二进制值
+pub fn set_user_reg_binary(path: &str, value: &str, bytes: &[u8]) -> Result<(), String> {
+    let key = open_user_key(path, KEY_READ | KEY_SET_VALUE, true)
+        .ok_or_else(|| format!("打不开注册表子键 HKCU\\{}", path))?;
+    let name = wide(value);
+    let rc = unsafe {
+        RegSetValueExW(
+            key.0,
+            name.as_ptr(),
+            0,
+            REG_BINARY,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "写 HKCU\\{}\\{} 失败，错误码 {}",
+            path,
+            value,
+            if rc > 0 { rc as u32 } else { last_error() }
+        ));
+    }
+    Ok(())
+}
+
+/// 展开 `%ProgramFiles%` 这类环境变量；展开不了就原样返回
+pub fn expand_env(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let w = wide(s);
+    let mut buf = vec![0u16; 32768];
+    let n = unsafe { ExpandEnvironmentStringsW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize > buf.len() {
+        return s.to_string();
+    }
+    String::from_utf16_lossy(&buf[..n as usize - 1])
+}
+
+// ---------------- 当前用户注册表（功能开关只写 HKCU） ----------------
+struct UserKey(HANDLE);
+
+impl Drop for UserKey {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+/// 打开（必要时创建）某个 hive 下的子键。只用于读用户自己的设置，不碰策略。
+fn open_hive_key(hive: HANDLE, path: &str, access: u32, create: bool) -> Option<UserKey> {
+    let w = wide(path);
+    let mut hk: HANDLE = std::ptr::null_mut();
+    let rc = unsafe {
+        if create {
+            let mut disp: u32 = 0;
+            RegCreateKeyExW(
+                hive,
+                w.as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                access,
+                std::ptr::null_mut(),
+                &mut hk,
+                &mut disp,
+            )
+        } else {
+            RegOpenKeyExW(hive, w.as_ptr(), 0, access, &mut hk)
+        }
+    };
+    if rc != 0 || hk.is_null() {
+        None
+    } else {
+        Some(UserKey(hk))
+    }
+}
+
+/// 打开（必要时创建）HKCU 下的子键
+fn open_user_key(path: &str, access: u32, create: bool) -> Option<UserKey> {
+    open_hive_key(HKEY_CURRENT_USER, path, access, create)
+}
+
+/// 读 HKCU 下的 DWORD。值不存在返回 None（「没设过」和「设成 0」不是一回事）。
+pub fn user_reg_dword(path: &str, value: &str) -> Option<u32> {
+    let key = open_user_key(path, KEY_READ, false)?;
+    let name = wide(value);
+    let mut val: u32 = 0;
+    let mut len: u32 = 4;
+    let mut typ: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key.0,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut typ,
+            &mut val as *mut u32 as *mut u8,
+            &mut len,
+        )
+    };
+    if rc == 0 && typ == REG_DWORD {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// 写 HKCU 下的 DWORD；子键不存在就建。
+pub fn set_user_reg_dword(path: &str, value: &str, val: u32) -> Result<(), String> {
+    let key = open_user_key(path, KEY_READ | KEY_SET_VALUE, true)
+        .ok_or_else(|| format!("打不开注册表子键 HKCU\\{}，错误码 {}", path, last_error()))?;
+    let name = wide(value);
+    let rc = unsafe {
+        RegSetValueExW(
+            key.0,
+            name.as_ptr(),
+            0,
+            REG_DWORD,
+            &val as *const u32 as *const u8,
+            4,
+        )
+    };
+    if rc != 0 {
+        let code = if rc > 0 { rc as u32 } else { last_error() };
+        return Err(match code {
+            // 5 = ERROR_ACCESS_DENIED。实测：Win11 的 SearchSettings / Search 子树
+            // 会让管理员也写不进去（不是提权能解决的事），所以别只说「需要管理员」。
+            5 => format!(
+                "拒绝访问：HKCU\\{}\\{} 被系统或安全软件保护，管理员也写不进去（可改走系统设置界面）",
+                path, value
+            ),
+            _ => format!("写 HKCU\\{}\\{} 失败，错误码 {}", path, value, code),
+        });
+    }
+    Ok(())
+}
+
+/// 删掉 HKCU 下的一个值（回到系统默认）。值本来就不在时算成功。
+pub fn delete_user_reg_value(path: &str, value: &str) -> Result<(), String> {
+    let key = match open_user_key(path, KEY_READ | KEY_SET_VALUE, false) {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+    let name = wide(value);
+    let rc = unsafe { RegDeleteValueW(key.0, name.as_ptr()) };
+    if rc != 0 && rc != ERROR_FILE_NOT_FOUND {
+        return Err(format!(
+            "删 HKCU\\{}\\{} 失败，错误码 {}",
+            path, value, rc
+        ));
+    }
+    Ok(())
+}
+
+/// 卸载一个 Store 应用（包全名来自 [`deskkit_core::appx_from_path`]）。
+///
+/// 路径落在 `\WindowsApps\` 下的服务，只禁服务会被重新挂起来，必须真卸。
+/// 界面和命令行共用这一份，不许各写一套。
+pub fn remove_appx(full_name: &str) -> Result<(), String> {
+    if full_name.is_empty()
+        || !full_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(format!("包名不合法: {}", full_name));
+    }
+    let script = format!("Remove-AppxPackage -Package '{}'", full_name);
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("调 powershell 失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if msg.is_empty() {
+            "Remove-AppxPackage 返回非 0".to_string()
+        } else {
+            msg
+        })
+    }
+}
+
 /// Win11 的注册表 ProductName 仍常写「Windows 10」，按 build 号纠正一次。
 fn caption_for(product: &str, build: u32) -> String {
     if build >= 22000 {
@@ -1426,7 +1775,7 @@ pub fn protected_pids() -> Vec<u32> {
     // 0) 按名字保护本工具自己的所有实例（用户可能同时开着桌面版和命令行版，
     //    它们不在彼此的父进程链里，但仍然绝不该被清理）
     for (&pid, n) in names.iter() {
-        if n == "deskkit" || n == "membase" {
+        if n.eq_ignore_ascii_case("membase") {
             if !out.contains(&pid) {
                 out.push(pid);
             }
@@ -1493,3 +1842,60 @@ pub fn protected_pids() -> Vec<u32> {
 }
 
 
+
+// ---------------- 删除到回收站 ----------------
+
+#[repr(C)]
+struct ShFileOpStructW {
+    hwnd: HANDLE,
+    w_func: u32,
+    p_from: *const u16,
+    p_to: *const u16,
+    f_flags: u16,
+    f_any_operations_aborted: BOOL,
+    h_name_mappings: *mut c_void,
+    lpsz_progress_title: *const u16,
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHFileOperationW(lp_file_op: *mut ShFileOpStructW) -> i32;
+}
+
+/// 把文件或目录移到回收站（`FOF_ALLOWUNDO`）。
+///
+/// 数据目录里的旧基准快照一律走这条路，不做硬删除：轮换是自动行为，
+/// 万一删错了，用户还能从回收站翻回来。目录需要存在，不存在直接返回错误。
+pub fn recycle_path(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("路径不存在：{}", path.display()));
+    }
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.push(0);
+    from.push(0); // SHFileOperationW 要求双 null 结尾
+
+    const FO_DELETE: u32 = 3;
+    const FOF_ALLOWUNDO: u16 = 0x0040;
+    const FOF_NOCONFIRMATION: u16 = 0x0010;
+    const FOF_SILENT: u16 = 0x0004;
+    const FOF_NOERRORUI: u16 = 0x0400;
+
+    let mut op = ShFileOpStructW {
+        hwnd: std::ptr::null_mut(),
+        w_func: FO_DELETE,
+        p_from: from.as_ptr(),
+        p_to: std::ptr::null(),
+        f_flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        f_any_operations_aborted: 0,
+        h_name_mappings: std::ptr::null_mut(),
+        lpsz_progress_title: std::ptr::null(),
+    };
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc != 0 {
+        return Err(format!("移到回收站失败（错误码 0x{:X}）：{}", rc, path.display()));
+    }
+    if op.f_any_operations_aborted != 0 {
+        return Err(format!("移到回收站时被中断：{}", path.display()));
+    }
+    Ok(())
+}

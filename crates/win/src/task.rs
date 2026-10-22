@@ -22,6 +22,8 @@ pub struct TaskInfo {
     pub installed: bool,
     /// 从任务参数里解析出的开机偏移秒数；解析不到为 0
     pub at_sec: u64,
+    /// 双采样时第二次采集的开机偏移秒数（没有就是单点采集）
+    pub also_sec: Option<u64>,
     /// 任务实际执行的 exe
     pub exe: String,
 }
@@ -40,19 +42,35 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn task_xml(exe: &Path, out: &Path, at_sec: u64, task: &str) -> String {
+fn task_xml(exe: &Path, out: &Path, at_sec: u64, also_sec: Option<u64>, task: &str) -> String {
     let exe_s = xml_escape(&exe.to_string_lossy());
+    let also_arg = match also_sec {
+        Some(s) => format!(" --also {}", s),
+        None => String::new(),
+    };
     let args_s = xml_escape(&format!(
-        "collect --out \"{}\" --at {} --self-destruct --task {} --json",
+        "collect --out \"{}\" --at {}{} --self-destruct --task {} --json",
         out.display(),
         at_sec,
+        also_arg,
         task
     ));
+    let description = match also_sec {
+        Some(s) => format!(
+            "开机第 {at} 秒与第 {s} 秒各采集一次内存/进程/服务基准线（双采样），采集完成后自毁（membase）",
+            at = at_sec,
+            s = s
+        ),
+        None => format!(
+            "开机第 {at} 秒采集一次内存/进程/服务基准线，采集完成后自毁（membase）",
+            at = at_sec
+        ),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>开机第 {at} 秒采集一次内存/进程/服务基准线，采集完成后自毁（membase）</Description>
+    <Description>{desc}</Description>
   </RegistrationInfo>
   <Triggers>
     <BootTrigger><Enabled>true</Enabled></BootTrigger>
@@ -77,13 +95,13 @@ fn task_xml(exe: &Path, out: &Path, at_sec: u64, task: &str) -> String {
   </Actions>
 </Task>
 "#,
-        at = at_sec,
+        desc = xml_escape(&description),
         exe = exe_s,
         args = args_s
     )
 }
 
-/// 注册开机采集任务，并把 `src_exe` 复制成 `<out>\deskkit.exe`。
+/// 注册开机采集任务，并把 `src_exe` 复制成 `<out>\membase.exe`。
 ///
 /// 界面版和命令行版是同一个程序（带参数走命令行、无参数开界面），
 /// 所以这里不需要再区分 PE 子系统：任务参数 `collect ...` 不会开窗口。
@@ -91,6 +109,7 @@ pub fn install(
     src_exe: &Path,
     out: &Path,
     at_sec: u64,
+    also_sec: Option<u64>,
     task: &str,
 ) -> Result<PathBuf, String> {
     let task = if task.trim().is_empty() {
@@ -102,7 +121,7 @@ pub fn install(
         return Err(format!("找不到可执行文件：{}", src_exe.display()));
     }
     fs::create_dir_all(out).map_err(|e| format!("建目录失败: {e}"))?;
-    let target = out.join("deskkit.exe");
+    let target = out.join("membase.exe");
 
     // 自己拷自己会失败（win 上占用），先比路径
     let same = match (src_exe.canonicalize(), target.canonicalize()) {
@@ -113,7 +132,7 @@ pub fn install(
         fs::copy(src_exe, &target).map_err(|e| format!("复制 exe 失败: {e}"))?;
     }
 
-    let xml = task_xml(&target, out, at_sec, task);
+    let xml = task_xml(&target, out, at_sec, also_sec, task);
     let tmp = std::env::temp_dir().join(format!("membase_task_{}.xml", std::process::id()));
     let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
     for u in xml.encode_utf16() {
@@ -196,8 +215,16 @@ fn tag_text(xml: &str, tag: &str) -> Option<String> {
 }
 
 fn extract_at(args: &str) -> Option<u64> {
-    let i = args.find("--at")?;
-    args[i + 4..]
+    extract_flag(args, "--at")
+}
+
+fn extract_also(args: &str) -> Option<u64> {
+    extract_flag(args, "--also")
+}
+
+fn extract_flag(args: &str, flag: &str) -> Option<u64> {
+    let i = args.find(flag)?;
+    args[i + flag.len()..]
         .trim_start()
         .split(|c: char| !c.is_ascii_digit())
         .next()
@@ -231,6 +258,7 @@ pub fn query(task: &str) -> TaskInfo {
     info.exe = tag_text(&text, "Command").unwrap_or_default();
     if let Some(a) = tag_text(&text, "Arguments") {
         info.at_sec = extract_at(&a).unwrap_or(0);
+        info.also_sec = extract_also(&a);
     }
     info
 }
@@ -245,6 +273,10 @@ mod tests {
         assert_eq!(extract_at(a), Some(60));
         assert_eq!(extract_at("collect --at 45"), Some(45));
         assert_eq!(extract_at("collect --json"), None);
+        assert_eq!(extract_also(a), None);
+        let d = r#"collect --out "C:\x" --at 30 --also 300 --json"#;
+        assert_eq!(extract_at(d), Some(30));
+        assert_eq!(extract_also(d), Some(300));
     }
 
     #[test]

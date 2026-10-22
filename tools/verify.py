@@ -14,6 +14,7 @@
 import hashlib
 import ctypes
 import json
+import math
 import os
 import re
 import shutil
@@ -24,8 +25,9 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, 'dist', 'deskkit.exe')
-GUI = os.path.join(ROOT, 'dist', 'MemBase.exe')
+# 1.2.x 起只有一个可执行文件：带参数是命令行，无参数开界面。
+EXE = os.path.join(ROOT, 'dist', 'MemBase.exe')
+GUI = EXE
 
 results = []      # (分组, 项目, 命令, 期望, 实际, 结论, 备注)
 notes = []
@@ -97,7 +99,7 @@ def case(group, item, args, expect=0, note='', verify=None, show=None):
             else:
                 ok = ok and bool(v)
     shown = show if show else detail[:64]
-    add(group, item, 'deskkit ' + ' '.join(args), expect, code, ok, shown + (' ' + note if note else ''))
+    add(group, item, 'MemBase.exe ' + ' '.join(args), expect, code, ok, shown + (' ' + note if note else ''))
     return code, out, err
 
 
@@ -138,14 +140,27 @@ def shot(page, modal=None, name=None, env_extra=None):
 # =====================================================================
 # 0. 前置：产物存在 + 版本
 # =====================================================================
+def workspace_version():
+    """从 Cargo.toml 读工作区版本，版本号升级时这里不用手改"""
+    text = open(os.path.join(ROOT, 'Cargo.toml'), encoding='utf-8').read()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else '0.0.0'
+
+
 def check_artifacts():
-    for f in (EXE, GUI):
-        ok = os.path.isfile(f)
-        size = os.path.getsize(f) if ok else 0
-        add('产物', os.path.basename(f), f, '存在', '%d 字节' % size, ok and size > 200_000)
+    ok = os.path.isfile(GUI)
+    size = os.path.getsize(GUI) if ok else 0
+    add('产物', os.path.basename(GUI), GUI, '存在', '%d 字节' % size, ok and size > 200_000)
+    # 单文件分发：dist 里不许再出现第二个 exe
+    extra = [f for f in os.listdir(os.path.join(ROOT, 'dist'))
+             if f.lower().endswith('.exe') and f.lower() != 'membase.exe']
+    add('产物', '只有一个 exe', 'dist/*.exe', '仅 MemBase.exe',
+        ', '.join(extra) if extra else '仅 MemBase.exe', not extra)
+    want = workspace_version()
     code, out, _ = run(['version'])
-    add('产物', '版本号', 'deskkit version', '0 / 1.0.0', '%d / %s' % (code, out.strip()),
-        code == 0 and out.strip().startswith('deskkit 1.0.0'))
+    add('产物', '版本号', 'MemBase.exe version', '0 / MemBase %s' % want,
+        '%d / %s' % (code, out.strip()),
+        code == 0 and out.strip() == 'MemBase %s' % want)
     return out.strip().split()[-1]
 
 
@@ -160,6 +175,13 @@ def check_mem(tmp):
     case(G, 'list --json', ['list', '--json'], 0,
          verify=lambda o, e, c: json.loads(o) is not None and 'items' in json.loads(o))
     case(G, 'plan', ['plan'], 0)
+    # 可回收量必须按宿主去重：同一 PID 上的进程项 + 服务项只算一份（2026-10-22 修）
+    case(G, 'plan --json 带宿主字段', ['plan', '--json'], 0,
+         verify=lambda o, e, c: all(
+             'reclaim_mb' in i and 'shared_host' in i and 'host_pid' in i
+             for i in jload(o).get('items', [])))
+    case(G, 'status --json 带自愈记录', ['status', '--json'], 0,
+         verify=lambda o, e, c: isinstance(jload(o).get('self_heal'), list))
 
     csv = os.path.join(tmp, 'plan.csv')
     case(G, 'plan --to', ['plan', '--to', csv], 0,
@@ -169,7 +191,7 @@ def check_mem(tmp):
     case(G, 'trim --execute 无 --yes', ['trim', '--execute'], 5,
          show='非交互环境被正确拒绝')
 
-    case(G, 'kill 不存在的目标', ['kill', 'no-such-proc-deskkit'], 2)
+    case(G, 'kill 不存在的目标', ['kill', 'no-such-proc-MemBase.exe'], 2)
     case(G, 'svc stop（演练）', ['svc', 'stop', 'Spooler'], (0, 4))
     case(G, 'compare', ['compare'], 0)
 
@@ -197,6 +219,10 @@ def check_mem(tmp):
              f.endswith('.json') for _, _, fs in os.walk(out_dir) for f in fs))
     case(G, 'collect --json', ['collect', '--out', os.path.join(tmp, 'collect2'), '--at', '0', '--json'], 0,
          verify=lambda o, e, c: json.loads(o).get('ok') is True)
+    # --keep 只是参数：真正的轮换规则由 core 的单测覆盖，
+    # 这里用大 keep 值跑一遍，确认参数被接受、且不误删（不往回收站扔临时垃圾）
+    case(G, 'collect --keep', ['collect', '--out', os.path.join(tmp, 'collect3'), '--at', '0', '--keep', '99'], 0,
+         verify=lambda o, e, c: '采集完成' in o)
 
     # 基准线本体：在临时目录里走一遍 capture -> verify -> export -> import
     root = os.path.join(tmp, 'baseline')
@@ -212,7 +238,77 @@ def check_mem(tmp):
 
 
 # =====================================================================
-# 2. 配置 / 主题（改完还原）
+# 2. 瘦身 / 启动项 / 功能开关 / 局部重启（只读与护栏）
+# =====================================================================
+def check_maint(tmp):
+    G = '瘦身与启动项'
+
+    # 瘦身：演练即可，执行会真改服务配置/卸应用
+    case(G, 'slim（演练）', ['slim'], 0,
+         verify=lambda o, e, c: ('预计' in o or '没有' in o), show='不动系统')
+    case(G, 'slim --json', ['slim', '--json'], 0,
+         verify=lambda o, e, c: isinstance(jload(o).get('items'), list))
+    # 空清单的 f64 sum 曾经是 -0.0，JSON 里会原样写成 `"savings_mb":-0.0`
+    case(G, 'slim --json 不输出 -0.0', ['slim', '--json'], 0,
+         verify=lambda o, e, c: not (
+             jload(o).get('savings_mb') == 0
+             and math.copysign(1.0, jload(o).get('savings_mb', 0)) < 0),
+         show='sum 空集合不能是负零')
+    case(G, 'slim --include-caution', ['slim', '--include-caution', '--json'], 0,
+         verify=lambda o, e, c: isinstance(jload(o).get('items'), list))
+    case(G, 'slim --execute 无 --yes', ['slim', '--execute'], 5,
+         show='非交互环境被正确拒绝')
+
+    # 启动项：只读 + 护栏（不真禁用任何项）
+    case(G, 'startup list', ['startup', 'list'], 0,
+         verify=lambda o, e, c: '启动项' in o)
+    case(G, 'startup list --json', ['startup', 'list', '--json'], 0,
+         verify=lambda o, e, c: isinstance(jload(o).get('items'), list))
+    # `\Microsoft\` 下的系统任务要能被看到（VS 安装器的 BackgroundDownload 就在里面），
+    # 但默认不展开：默认视图 system_hidden > 0，--all 之后为 0
+    def sys_hidden(o, e, c):
+        d = jload(o)
+        return d.get('system_hidden', 0) > 0 and d.get('count', 0) > 0
+
+    def sys_all(o, e, c):
+        d = jload(o)
+        return d.get('system_hidden') == 0 and d.get('count', 0) > 0
+
+    case(G, 'startup list 系统任务默认隐藏', ['startup', 'list', '--json'], 0, verify=sys_hidden)
+    case(G, 'startup list --all 列出系统任务', ['startup', 'list', '--all', '--json'], 0, verify=sys_all)
+    case(G, 'startup disable 不存在', ['startup', 'disable', 'no-such-startup-item'], 2)
+    case(G, 'startup disable 无 --yes', ['startup', 'disable', '__none__', '--execute'], 2,
+         show='名字不存在，先于 --yes 校验被拒')
+
+    # 功能开关：只读 + 护栏
+    case(G, 'feature list', ['feature', 'list'], 0,
+         verify=lambda o, e, c: '开关' in o)
+    case(G, 'feature list --json', ['feature', 'list', '--json'], 0,
+         verify=lambda o, e, c: isinstance(jload(o).get('items'), list))
+    case(G, 'feature off 未知 key', ['feature', 'off', 'no-such-key', '--execute', '--yes'], 1)
+    case(G, 'feature off 无 --yes', ['feature', 'off', 'cross-device-resume', '--execute'], 5,
+         show='没 --yes 不写注册表')
+
+    # 局部重启：演练 + 两条护栏
+    case(G, 'restart（演练）', ['restart', 'explorer'], 0,
+         verify=lambda o, e, c: 'dry-run' in o, show='只报计划')
+    case(G, 'restart explorer 无 --yes', ['restart', 'explorer', '--execute'], 5,
+         show='会闪任务栏的动作被拦下')
+    case(G, 'restart 不存在的目标', ['restart', 'no-such-proc-MemBase.exe'], 2)
+
+    # 双采样：没有双采样快照时应给出结构化错误。
+    # 不能直接用真实数据目录 —— 那台机器上恰好有 T+60s/T+300s 双采样，
+    # 用例会「因为环境正确而失败」。这里指向一个只采过一次的临时目录。
+    single = os.path.join(tmp, 'transient_single')
+    case(G, 'transient（先造单采样）',
+         ['collect', '--out', single, '--at', '0'], 0,
+         show='只采一次，不注册双采样')
+    case(G, 'transient（无双采样）', ['transient', '--out', single, '--json'], 2,
+         verify=lambda o, e, c: jload(o).get('error') == 'no_dual_sample')
+
+
+# =====================================================================
+# 3. 配置 / 主题（改完还原）
 # =====================================================================
 def check_config(tmp):
     G = '配置与外观'
@@ -490,24 +586,29 @@ def check_task():
     G = '开机采集'
     code, out, err = run(['install', '--at', '60', '--json'])
     ok = code == 0 and jload(out).get('ok') is True
-    add(G, 'install', 'deskkit install --at 60', 0, code, ok, first_line(out)[:60])
+    add(G, 'install', 'MemBase.exe install --at 60', 0, code, ok, first_line(out)[:60])
 
     q = subprocess.run(['schtasks', '/Query', '/TN', 'MemBaseline_CollectOnBoot'],
                        capture_output=True)
     add(G, '计划任务已注册', 'schtasks /Query', 0, q.returncode, q.returncode == 0)
 
     code2, out2, _ = run(['uninstall', '--json'], timeout=60)
-    add(G, 'uninstall', 'deskkit uninstall', 0, code2,
+    add(G, 'uninstall', 'MemBase.exe uninstall', 0, code2,
         code2 == 0 and jload(out2).get('ok') is True, first_line(out2)[:60])
 
     q2 = subprocess.run(['schtasks', '/Query', '/TN', 'MemBaseline_CollectOnBoot'],
                         capture_output=True)
     add(G, '计划任务已删除', 'schtasks /Query', '非 0', q2.returncode, q2.returncode != 0)
 
-    leftover = r'C:\ProgramData\MemBaseline\deskkit.exe'
+    leftover = r'C:\ProgramData\MemBaseline\membase.exe'
     if os.path.isfile(leftover):
-        os.remove(leftover)
-        notes.append('已清理 install 留下的程序副本 ' + leftover)
+        try:
+            os.remove(leftover)
+            notes.append('已清理 install 留下的程序副本 ' + leftover)
+        except OSError as e:
+            # 有 safe-delete 钩子 / 杀软占用时删不掉：记一笔就走，
+            # 别让「清理失败」把整轮验收打断（各用例已经跑完了）
+            notes.append('未能清理 {}（{}），请手动删除'.format(leftover, e))
 
 
 # =====================================================================
@@ -520,6 +621,8 @@ def check_gui_pages():
 
     pages = [
         (None, '进程（默认页）'),
+        ('slim', '瘦身'),
+        ('startup', '启动项'),
         ('baseline', '基准'),
         ('layouts', '桌面布局'),
         ('protect', '保护名单'),
@@ -539,8 +642,8 @@ def check_gui_pages():
             bmp2png.bmp_to_png(path, os.path.join(tempfile.gettempdir(), 'deskkit_verify_%s.png' % (slug or 'processes')))
             os.remove(path)
 
-    # 七页截图必须互不相同 —— 否则说明 DESKKIT_PAGE 没生效，七张都是同一页
-    add(G, '各页内容互不相同', '7 张截图 md5', len(pages), len(set(hashes.values())),
+    # 每页截图必须互不相同 —— 否则说明 DESKKIT_PAGE 没生效，全都截成了同一页
+    add(G, '各页内容互不相同', '%d 张截图 md5' % len(pages), len(pages), len(set(hashes.values())),
         len(set(hashes.values())) == len(pages))
 
     for modal, label in [('trim', '确认弹窗 · 恢复基准'), ('layout', '确认弹窗 · 恢复布局')]:
@@ -563,7 +666,10 @@ def check_consistency():
     names = {c['name'] for c in doc['commands']}
     actions = doc['gui_actions']
 
-    add(G, 'gui_actions 数量', 'commands --json', 30, len(actions), len(actions) == 30)
+    # 界面动作表条数：加/删按钮时同步这个数（表的用途是防「加了按钮忘了配命令」）
+    expect_actions = 37
+    add(G, 'gui_actions 数量', 'commands --json', expect_actions, len(actions),
+        len(actions) == expect_actions)
     keys = [a['key'] for a in actions]
     add(G, '动作 key 不重复', 'commands --json', len(keys), len(set(keys)), len(keys) == len(set(keys)))
 
@@ -663,6 +769,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix='deskkit_verify_')
     try:
         check_mem(tmp)
+        check_maint(tmp)
         check_config(tmp)
         check_layout()
         check_task()

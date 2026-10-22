@@ -664,7 +664,7 @@ impl Watch {
         let flag = stop.clone();
         // 用一个「自己会退出」的线程，避免 join 卡死界面
         let th = match std::thread::Builder::new()
-            .name("deskkit-blackout-watch".into())
+            .name("membase-blackout-watch".into())
             .spawn(move || {
                 watch_loop(key, mouse, block, on_hit);
                 flag.store(true, Ordering::SeqCst);

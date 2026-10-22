@@ -14,14 +14,18 @@ Windows 开机久了，内存被谁吃了、桌面图标被谁弄乱了？MemBas
 | 功能 | 说明 |
 |---|---|
 | 开机内存基准线 | 开机第 N 秒由 SYSTEM 计划任务采集快照；之后随时对比，列出基准之外的进程与服务 |
-| 基线瘦身 | 以基准为输入，找出「开机就有、但根本不需要」的服务：禁用自启 / 卸载 Store 应用，下次开机生效 |
+| 基线瘦身 | 以基准为输入，找出「开机就有、但根本不需要」的服务 / 启动项 / 功能开关：禁用自启 / 卸载 Store 应用 / 停进程并禁用启动项 / 关功能开关，下次开机生效 |
+| 局部重启 | 关掉再按原路径拉起，等 3 秒**实测**回收了多少；自愈型进程（杀了就回来）会明确标出来，不冒充收益 |
+| 启动项扫描 | Run（用户/本机/32 位）、启动文件夹、计划任务（含 `\Microsoft\` 下的系统任务）；**还没跑起来就先看见**，禁用可逆 |
 | 桌面图标布局 | 保存 / 对比 / 恢复图标位置，带真实预览、差异条和当前位置叠加 |
 | 息屏 | 全屏纯黑，ESC / 空格 / 回车 / 任意键退出；时长精确到秒；默认不动显示器电源 |
 
 ## 瘦身：让开机基线本身变小
 
 `trim` 关的是「基准里没有、现在却在跑」的线外项，当场见效；
-`slim` 关的是「基准里就有、但开机不需要」的服务，**改的是下一次开机的起点**。两者方向相反，别混。
+`slim` 关的是「基准里就有、但开机不需要」的服务 / Store 应用 / 功能开关，**改的是下一次开机的起点**。两者方向相反，别混。
+
+界面上这两件事分在两页：「进程」页管线外项与局部重启，「瘦身」页管基准内部的裁减。
 
 同一台 16 GB 机器，开机第 30 秒实测：
 
@@ -35,26 +39,88 @@ Windows 开机久了，内存被谁吃了、桌面图标被谁弄乱了？MemBas
 一条 `slim --execute --yes` 卸掉 Store 版电脑管家（141 MB）、禁用 Office 与模拟器的自启服务（66 MB），
 另有运行中被连带清掉的崩溃上报进程。
 
-- 动作只有两种：`disable-service`（改服务启动类型）与 `uninstall-appx`
-  （路径落在 `\WindowsApps\` 下的按包名卸载——只禁服务会被重新挂起来）
+- 动作只有三种：`disable-service`（改服务启动类型）、`uninstall-appx`
+  （路径落在 `\WindowsApps\` 下的按包名卸载——只禁服务会被重新挂起来）、
+  `feature-off`（关一个已知功能开关，只写 HKCU）
 - 默认只给第三方与 Store 应用；`--include-caution` 才带上 Windows 目录下的组件，
   那里面 `iphlpsvc` / `IKEEXT` / `nsi` 禁了会断网，必须逐条判断
 - 合计按宿主 PID 去重：同一个 svchost 上挂 10 个服务只有一份内存，相加是假账
 - 基准是历史快照，已禁用/已卸载的项会自动跳过，重复执行不会反复建议同一批
+- 功能开关只收录「想清楚了」的项，每项都带证据进程（按父进程链归属，不把 Edge 的
+  webview2 算成搜索的）和撤销写法，不开放任意注册表编辑
+
+## 局部重启：拿回进程工作集，不重启整机
+
+整机重启不可替代的只有内核池碎片、句柄泄漏、驱动累积状态；可回收量的大头在进程工作集。
+
+```bash
+MemBase.exe restart explorer                    # 演练：报实例数、内存、可执行路径
+MemBase.exe restart explorer --execute --yes    # 真做：关掉 → 拉起 → 等 3 秒实测
+```
+
+- 关闭复用 `trim` 的同一套「先礼后兵 + 身份校验（PID + 创建时间）」，不另写一份
+- 只动有明确 `Path` 的进程；`svchost` / `dllhost` / `WmiPrvSE` / `RuntimeBroker` 是共享宿主，
+  拒绝走进程重启，改走服务（`stop` + `start`，标注「共享宿主，变化不全是这个服务」）
+- `explorer` / `SearchHost` 会闪任务栏、关掉已打开的窗口，必须显式 `--yes`
+- 报的是**实测值**：2026-10-21 真机实测 `Notepad` 162.6 → 163.2 MB（负收益照实报）、
+  `SearchHost` 147.0 → 156.6 MB 且 2 秒内自愈（标 `revived`，不重复拉起）
+
+自愈型进程（外壳托管的 `SearchHost`、`explorer` 之类）杀掉会被系统重建，对它们做重启没有收益 —
+工具会把这种情况标出来，而不是把「关掉又回来」算成省了内存。
+
+## 启动项：还没跑起来就先看见
+
+进程要等它跑起来才看得见，启动项**还没跑**就已经写在系统里了。MuMu 三件套、`crashpad_handler` 这类东西，
+等它们出现在快照里就晚了。
+
+![启动项页](docs/screenshots/startup.png)
+
+```bash
+MemBase.exe startup list                      # 来源 / 名称 / 目标进程 / 是否在基准里 / 建议动作
+MemBase.exe startup list --all                # 连 `\Microsoft\` 下的系统计划任务一起列
+MemBase.exe startup disable RtkAudUService --execute --yes
+MemBase.exe startup enable  RtkAudUService --execute --yes
+```
+
+- 三路来源：注册表 `Run`（HKCU / HKLM / 32 位视图）、启动文件夹、计划任务
+- `\Microsoft\` 下的系统任务照收但打 `system` 标记，默认不展开 —— VS 安装器的
+  `\Microsoft\VisualStudio\Updates\BackgroundDownload` 就在里面，实测开机 300 秒时占 339 MB
+- `.lnk` 的目标用 shell 自己的 `IShellLinkW` 解，不猜二进制
+- 命令解析覆盖引号路径、无引号带空格、`rundll32 <dll>,<entry>`、`%ProgramFiles%` 展开，
+  以及 `by user disabled` 这种占位串（Google Updater 会把任务的 Command 改写成这句话）
+- **禁用不删原值**：Run 与启动文件夹走 `Explorer\StartupApproved\...` 的批准记录（任务管理器那个开关），
+  计划任务走 `schtasks /change /disable`，都能一条命令恢复
+- 每条标注「基准里出现过没有」，把「装了但没常驻」和「真常驻」分开
+
+## 双采样：分清「短命项」和「真常驻」
+
+单点采集分不清「起了又退」和「一直挂着」：C 里 `TabTip` 没起、A 里它占了 77 MB，就是典型噪音。
+
+```bash
+MemBase.exe install --at 30 --also 300     # 一次开机采两点，同一个 run_* 目录下
+MemBase.exe transient                      # 先出现、后消失的项单独成组
+MemBase.exe compare --label T+300s         # 用第二个采样点当基准
+MemBase.exe status                         # 会列出这次开机的所有采样点
+```
+
+- 两条命令都写在一个 `run_<时间戳>\` 下：`T+30s\` 与 `T+300s\`，采集仍是同一个计划任务、采完自毁
+- `transient` 判据是「早的那份有、晚的那份没有」，收益计算时要先扣掉这批
 
 ## 界面
 
-左侧导航八页：
+左侧导航十页：
 
 | 页面 | 内容 |
 |---|---|
-| 进程 | 线外清单（名称 / 类型 / 分级 / 内存 / 保护 / 恢复），内存列按用量热力着色 |
+| 进程 | 线外清单（名称 / 类型 / 分级 / 内存 / 保护 / 恢复），内存列按用量热力着色；勾选后可「重启」回收工作集 |
+| 瘦身 | 基准内部可砍的服务 / Store 应用 / 功能开关，勾选后确认执行；弹窗写明**下次开机**才反映到基准 |
+| 启动项 | Run / 启动文件夹 / 计划任务，行尾直接「禁用 / 启用」，悬停看完整命令行 |
 | 基准 | 快照时间、采集于开机第 N 秒、已用内存，导出 / 导入 `.mbz` |
 | 桌面布局 | 布局清单、真实预览、差异条、保存 / 恢复 / 删除 / 修复缓存 |
 | 保护名单 | `protect.txt` 的全部规则，可单条移除或整份清空 |
-| 开机采集 | 开机第 N 秒采集，SYSTEM 权限、无窗口，采完自动销毁任务 |
+| 开机采集 | 开机第 N 秒采集，可勾「双采样」再采一次；SYSTEM 权限、无窗口，采完自动销毁任务 |
 | 工具 | 息屏（可配热键和时长）+ 显示器与路径信息 |
-| 命令行 | 30 个界面动作与等价命令，逐条可复制 |
+| 命令行 | 37 个界面动作与等价命令，逐条可复制 |
 | 设置 | 数据目录、布局目录、运行身份、浅色 / 深色外观 |
 
 ### 桌面布局
@@ -83,33 +149,42 @@ Windows 开机久了，内存被谁吃了、桌面图标被谁弄乱了？MemBas
 
 ## 命令行
 
-同一个程序两种身份：双击 `MemBase.exe` 开界面，带参数就是命令行；`deskkit.exe` 是纯控制台版，给脚本和计划任务用。
+只有一个 `MemBase.exe`，两种身份：双击开界面，带参数就是命令行 —— 界面上的每一个按钮都能在命令行里发一遍，不需要第二个程序。
 
 ```bash
+# 下面的示例都直接写 MemBase.exe：
+#   PowerShell 里写 .\MemBase.exe status（或把目录加进 PATH）
+#   Git Bash 里写 ./MemBase.exe status
+
 # 基准线
-deskkit status
-deskkit list
-deskkit trim --execute --yes
-deskkit slim --execute --yes      # 基准内部瘦身：禁用自启服务 / 卸载 Store 应用
-deskkit svc disable ClickToRunSvc --execute
-deskkit baseline capture
-deskkit install --at 60
+MemBase.exe status
+MemBase.exe list
+MemBase.exe trim --execute --yes
+MemBase.exe slim --execute --yes      # 基准内部瘦身：禁用自启服务 / 卸载 Store 应用 / 关功能开关
+MemBase.exe svc disable ClickToRunSvc --execute
+MemBase.exe restart explorer --execute --yes   # 局部重启，报告实测回收量
+MemBase.exe feature list                       # 已知功能开关 + 证据进程 + 结论
+MemBase.exe feature off cross-device-resume --execute --yes
+MemBase.exe startup list                       # 启动项（Run / 启动文件夹 / 计划任务）
+MemBase.exe transient                          # 双采样短命项
+MemBase.exe baseline capture
+MemBase.exe install --at 30 --also 300         # 双采样：一次开机采两点
 
 # 桌面布局
-deskkit layout list
-deskkit layout save 工作
-deskkit layout diff 工作 --positions
-deskkit layout restore 工作 --execute --yes
-deskkit layout repair --execute --yes
+MemBase.exe layout list
+MemBase.exe layout save 工作
+MemBase.exe layout diff 工作 --positions
+MemBase.exe layout restore 工作 --execute --yes
+MemBase.exe layout repair --execute --yes
 
 # 息屏
-deskkit screen off --seconds 90 --exit-key space
-deskkit screen duration 0:05:30
-deskkit screen status
+MemBase.exe screen off --seconds 90 --exit-key space
+MemBase.exe screen duration 0:05:30
+MemBase.exe screen status
 ```
 
-- 所有命令支持 `--json`；`deskkit commands --json` 会导出完整的「界面动作 → 命令」表
-- 危险动作默认只报计划：`trim` / `slim` / `layout restore` / `layout repair` / `layout delete` 需要 `--execute`，删除类还要 `--yes`
+- 所有命令支持 `--json`；`MemBase.exe commands --json` 会导出完整的「界面动作 → 命令」表
+- 危险动作默认只报计划：`trim` / `slim` / `restart` / `feature off` / `layout restore` / `layout repair` / `layout delete` 需要 `--execute`，删除类与改系统的还要 `--yes`
 - `trim` 关的是「基准里没有、现在却在跑」的线外项，当场见效；`slim` 关的是「基准里就有、但开机不需要」的服务，**下次开机**才反映到基准上
 - 退出码：`0` 成功 / `1` 参数 / `2` 没有基准或布局 / `3` 读写 / `4` 动作失败 / `5` 被拒绝
 
@@ -139,16 +214,17 @@ deskkit screen status
 
 ```bash
 cargo build --workspace --release
-# target\release\MemBase.exe   界面（带参数即命令行）
-# target\release\deskkit.exe    控制台版
+# target\release\MemBase.exe   唯一产物：界面（带参数即命令行）
 
-cargo test -p deskkit-core    # 45 个纯逻辑测试
-cargo test -p deskkit-win     # 11 个平台层测试（1 个需真实桌面会话的用例默认忽略）
-python tools/verify.py        # 99 项端到端验收
+cargo test -p deskkit-core    # 70 个纯逻辑测试
+cargo test -p deskkit-win     # 15 个平台层测试（1 个需真实桌面会话的用例默认忽略）
+python tools/verify.py        # 124 项全量验收（命令行动词 + 每页截图 + 动作表一致性）
+python tools/verify.py --fast # 跳过 10 页截图与黑屏层，只验命令行，约 10 秒
 ```
 
 `tools/verify.py` 会真跑每个命令和每一页：写盘指向临时目录，危险动作只验护栏，改过的配置全部还原。
-最新结果见 [docs/verify-1.0.0.md](docs/verify-1.0.0.md)。
+最新结果：[docs/verify-1.2.1.md](docs/verify-1.2.1.md)（107 项 `--fast`）、
+[docs/verify-1.2.0.md](docs/verify-1.2.0.md)（124 项全量）。
 
 ## 已知限制
 
@@ -158,6 +234,15 @@ python tools/verify.py        # 99 项端到端验收
 - 在别的分辨率或缩放下保存的布局，坐标可能被网格吸附
 - 动态壁纸的预览取到的是当前帧
 - 未提权采集时大量进程内存读不到，这类基准只能看名单、不能比内存（`system.json` 的 `Elevated` 会标出来）
+- 部分杀软的行为监控会把本程序判成 `Behavior:Win32/Persistence.A!ml`：它会注册开机计划任务、
+  改服务启动类型、写启动批准记录 —— 行为特征确实像持久化，但每一条都是用户显式触发或可逆的。
+  被隔离后连命令行都会拒绝执行，加一条目录排除即可
+- 部分系统设置子树（如 `HKCU\...\SearchSettings`）连管理员都写不进去，`feature off` 会明确报「拒绝访问」并建议改走系统设置界面；实测搜索界面的 6 个 `msedgewebview2`（约 369 MB）不是开关能关掉的
+- 外壳托管的进程（`SearchHost` 等）杀掉会在 2 秒内自愈，`restart` 对它们没有收益，会标 `revived`
+- 启动项暂不覆盖 `RunOnce` 与服务自启（服务属于 `slim` 的服务侧）；
+  32 位 Run 项的批准记录单列在 `StartupApproved\Run32`，个别系统上任务管理器只显示其中一半
+- 服务内存按「宿主工作集」展示：同一 `svchost` 上 N 个服务共享一份内存，`plan` 的合计已按宿主去重，
+  单项旁边标 `← 共享宿主`，意思是「停这一项本身不释放内存」
 - 剩余待办与「明确不做」的项见 [docs/ROADMAP.md](docs/ROADMAP.md)
 
 ## License

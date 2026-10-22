@@ -57,6 +57,15 @@ fn col(header: &[String], name: &str) -> Option<usize> {
 }
 
 pub fn find_latest_baseline(root: &Path) -> Option<PathBuf> {
+    find_baseline(root, None)
+}
+
+/// 按 label 取基准（`T+30s` / `T+60s` / `now` …）。`label = None` 时退回「最新的」。
+///
+/// 双采样之后一个 `run_*` 目录下会有两个子目录，默认取最新的那个（通常是 T+300s）；
+/// 想看冷态就用 `--label T+30s` 明确指定。
+pub fn find_baseline(root: &Path, label: Option<&str>) -> Option<PathBuf> {
+    let want = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     let rd = fs::read_dir(root).ok()?;
     for e in rd.flatten() {
@@ -73,6 +82,12 @@ pub fn find_latest_baseline(root: &Path) -> Option<PathBuf> {
                 let sp = s.path();
                 if !sp.is_dir() {
                     continue;
+                }
+                if let Some(w) = &want {
+                    let got = sp.file_name().and_then(|v| v.to_str()).unwrap_or("");
+                    if !got.eq_ignore_ascii_case(w) {
+                        continue;
+                    }
                 }
                 let sj = sp.join("system.json");
                 if sj.exists() {
@@ -100,11 +115,27 @@ pub struct ProcDiff {
     pub pct: Option<f64>,
 }
 
-pub fn compare(root: &Path, min_mb: f64, excludes: &[String], exclude_self: bool) -> std::io::Result<()> {
-    let base_dir = match find_latest_baseline(root) {
+pub fn compare(
+    root: &Path,
+    min_mb: f64,
+    excludes: &[String],
+    exclude_self: bool,
+    label: Option<&str>,
+) -> std::io::Result<()> {
+    let base_dir = match find_baseline(root, label) {
         Some(p) => p,
         None => {
-            eprintln!("[x] 在 {} 下找不到基准快照（run_*\\system.json）", root.display());
+            match label {
+                Some(l) => eprintln!(
+                    "[x] 找不到 label 为 {} 的快照（在 {} 下）",
+                    l,
+                    root.display()
+                ),
+                None => eprintln!(
+                    "[x] 在 {} 下找不到基准快照（run_*\\system.json）",
+                    root.display()
+                ),
+            }
             std::process::exit(2);
         }
     };

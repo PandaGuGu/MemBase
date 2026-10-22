@@ -1,4 +1,4 @@
-//! 息屏相关命令：`deskkit screen <动词>`
+//! 息屏相关命令：`MemBase.exe screen <动词>`
 //!
 //! 只做一件事：关显示器，不锁屏、不睡眠。
 //! 界面与之对应：「全屏黑 + 退出热键 + 到点自动亮」，命令行这边：
@@ -22,7 +22,7 @@ pub const SCREEN_COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 pub fn screen_usage() -> String {
-    let mut s = String::from("deskkit screen —— 息屏（只关显示器，不锁屏）\n\n用法: deskkit screen <动词> [选项]\n\n");
+    let mut s = String::from("MemBase.exe screen —— 息屏（只关显示器，不锁屏）\n\n用法: MemBase.exe screen <动词> [选项]\n\n");
     for (n, d, a) in SCREEN_COMMANDS {
         s.push_str(&format!("  {:<9} {:<30} {}\n", n, d, a));
     }
@@ -117,7 +117,7 @@ fn screen_off(args: &[String]) -> i32 {
                 key.label()
             );
             println!(
-                "真正关屏：deskkit screen off --seconds {} --exit-key {}",
+                "真正关屏：MemBase.exe screen off --seconds {} --exit-key {}",
                 secs,
                 key.as_str()
             );
@@ -256,7 +256,7 @@ fn screen_duration(args: &[String], sub: &str) -> i32 {
                     },
                     secs
                 );
-                println!("设置方法     : deskkit screen duration 0:05:30");
+                println!("设置方法     : MemBase.exe screen duration 0:05:30");
                 println!("               也认 90s / 5m / 1h / 330（纯数字=秒）");
             }
             0
@@ -312,7 +312,7 @@ fn screen_power(args: &[String]) -> i32 {
                     "同时关闭显示器 : {}",
                     if on { "开（退出时会尝试叫醒）" } else { "关（只盖全屏黑窗）" }
                 );
-                println!("设置方法       : deskkit screen power on | off");
+                println!("设置方法       : MemBase.exe screen power on | off");
             }
             0
         }
@@ -321,7 +321,7 @@ fn screen_power(args: &[String]) -> i32 {
                 "1" | "on" | "true" | "yes" | "开" => true,
                 "0" | "off" | "false" | "no" | "关" => false,
                 _ => {
-                    eprintln!("用法: deskkit screen power on|off（默认 off：只盖全屏黑窗）");
+                    eprintln!("用法: MemBase.exe screen power on|off（默认 off：只盖全屏黑窗）");
                     return EXIT_USAGE;
                 }
             };
@@ -361,7 +361,7 @@ fn screen_key(args: &[String]) -> i32 {
             } else {
                 println!("当前退出热键 : {}", k.label());
                 println!("可选项       : esc / space / enter / any");
-                println!("设置方法     : deskkit screen key space");
+                println!("设置方法     : MemBase.exe screen key space");
             }
             0
         }
@@ -381,7 +381,7 @@ fn screen_key(args: &[String]) -> i32 {
                 }
             },
             None => {
-                eprintln!("用法: deskkit screen key esc|space|enter|any");
+                eprintln!("用法: MemBase.exe screen key esc|space|enter|any");
                 EXIT_USAGE
             }
         },

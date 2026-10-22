@@ -13,7 +13,7 @@ use deskkit_core::{Kind, Tier};
 use deskkit_win::gui_icon::{self, IconProvider};
 use deskkit_win::task::{self as boot, TaskInfo};
 use deskkit_win::desktop::Desktop;
-use deskkit_win::{actions, close, repair, shellview::ShellView, snapshot, win};
+use deskkit_win::{actions, close, repair, restart, shellview::ShellView, snapshot, startup, win};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -121,7 +121,7 @@ fn pal() -> Palette {
     }
 }
 
-/// 主题偏好落在 %APPDATA%\MemBase\theme.txt，读写都走 cli crate（与 `deskkit theme` 同源）
+/// 主题偏好落在 %APPDATA%\MemBase\theme.txt，读写都走 cli crate（与 `MemBase.exe theme` 同源）
 fn load_theme() -> bool {
     deskkit_cli::read_theme()
 }
@@ -161,6 +161,8 @@ struct Scan {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Processes,
+    Slim,
+    Startup,
     Baseline,
     Layouts,
     Protect,
@@ -174,6 +176,8 @@ impl Page {
     fn label(self) -> &'static str {
         match self {
             Page::Processes => "进程",
+            Page::Slim => "瘦身",
+            Page::Startup => "启动项",
             Page::Baseline => "基准",
             Page::Layouts => "桌面布局",
             Page::Protect => "保护名单",
@@ -271,6 +275,32 @@ struct App {
     confirm_restore: bool,
     /// 删除布局前的确认弹窗
     confirm_delete: bool,
+
+    // ---------------- 瘦身页（基准内部可砍项） ----------------
+    /// `core::build_trim_plan` + `build_feature_items` 的结果
+    slim_items: Vec<core::TrimItem>,
+    /// 与 `slim_items` 一一对应：这一轮要不要处理
+    slim_pick: Vec<bool>,
+    /// 是否放开「谨慎」档（Windows 目录下的组件）
+    slim_caution: bool,
+    /// 已经读过一次没有（没读过就先显示「正在读取」）
+    slim_loaded: bool,
+    slim_msg: String,
+    /// 执行前的确认弹窗
+    confirm_slim: bool,
+
+    // ---------------- 启动项页 ----------------
+    startup_items: Vec<core::startup::StartupItem>,
+    startup_loaded: bool,
+    /// 只显示建议处理的（把 15 项已禁用折叠起来）
+    startup_only_actionable: bool,
+
+    // ---------------- 进程页：局部重启 ----------------
+    confirm_restart: bool,
+
+    // ---------------- 开机采集：双采样 ----------------
+    boot_also: bool,
+    boot_also_at: u64,
 
     // ---------------- 工具页（息屏） ----------------
     /// 显示器台数
@@ -390,6 +420,22 @@ fn fmt_dur(ms: u64) -> String {
     }
 }
 
+/// 界面里手动采集后同样做轮换：只留最近 10 份 `run_*`，老的移进回收站。
+/// 与 `collect` 命令（`--keep`）共用 `core::plan_rotation` 的规则。
+fn rotate_runs(root: &std::path::Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    let names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    for name in core::plan_rotation(&names, keep) {
+        let _ = win::recycle_path(&root.join(&name));
+    }
+}
+
 /// 说「多久之后完成」：不足 1 秒就不硬凑成「第 61 秒」
 fn finish_hint(ms: u64) -> String {
     if ms < 1000 {
@@ -397,6 +443,88 @@ fn finish_hint(ms: u64) -> String {
     } else {
         format!("约 {:.1} 秒后", ms as f64 / 1000.0)
     }
+}
+
+/// 读一条功能开关在注册表里的当前状态（值不存在 = 从没设过，不能当「已关」）
+fn feature_state(sw: &core::feature::FeatureSwitch) -> core::feature::SwitchState {
+    let states: Vec<core::feature::SwitchState> = sw
+        .values
+        .iter()
+        .map(|v| match win::user_reg_dword(v.key_path, v.value) {
+            None => core::feature::SwitchState::Missing,
+            Some(x) if x == v.off => core::feature::SwitchState::Off,
+            Some(_) => core::feature::SwitchState::On,
+        })
+        .collect();
+    core::feature::combine_state(&states)
+}
+
+/// 关掉一条开关，并顺带把证据进程关掉（否则下一次开机才会生效）
+fn apply_feature_off(sw: &core::feature::FeatureSwitch) -> Result<(), String> {
+    for v in sw.values {
+        win::set_user_reg_dword(v.key_path, v.value, v.off)?;
+    }
+    let host = if sw.host_proc.is_empty() {
+        sw.evidence_proc
+    } else {
+        sw.host_proc
+    };
+    if !restart::processes_named(host).is_empty() {
+        if sw.host_proc.is_empty() {
+            restart::close_only(
+                host,
+                close::CloseOptions::default(),
+                &win::protected_pids(),
+                2000,
+            );
+        } else if let Some(path) = restart::processes_named(host)
+            .into_iter()
+            .map(|p| p.path)
+            .find(|p| !p.is_empty())
+        {
+            restart::restart_process(
+                host,
+                &path,
+                close::CloseOptions::default(),
+                &win::protected_pids(),
+                3000,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 停掉启动项拉起的进程，再禁用启动项本身（与 `slim` 命令同一套动作）。
+///
+/// 两步都必要：只禁用启动项，现在这一份进程还在跑；只停进程，下次开机它又回来。
+/// 禁用走 `StartupApproved` / `schtasks /change /disable`，不删原值，可撤销。
+fn apply_stop_and_disable_startup(it: &core::TrimItem) -> Result<(), String> {
+    let Some(src) = it.startup_source else {
+        return Err("启动项来源缺失（清单构造有误）".into());
+    };
+    if !it.host.is_empty() {
+        let snap = snapshot::snapshot_now(true);
+        let protected = win::protected_pids();
+        let targets: Vec<close::Target> = snap
+            .procs
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(&it.host))
+            .map(|p| close::Target {
+                pid: p.pid,
+                created: p.created,
+            })
+            .collect();
+        if !targets.is_empty() {
+            // 停不掉不算失败：启动项禁用才是持久的那一步
+            let _ = close::close_group(
+                &it.host,
+                &targets,
+                close::CloseOptions::default(),
+                &protected,
+            );
+        }
+    }
+    startup::set_enabled(src, &it.startup_name, false)
 }
 
 impl App {
@@ -413,6 +541,8 @@ impl App {
         } else {
             60
         };
+        // boot 马上会被 move 进 App，双采样的初值先取出来
+        let boot_also_sec = boot.also_sec;
         let mut app = App {
             root,
             base_line: String::from("（没有找到基准快照）"),
@@ -459,6 +589,18 @@ impl App {
             copied: None,
             confirm_restore: false,
             confirm_delete: false,
+            slim_items: Vec::new(),
+            slim_pick: Vec::new(),
+            slim_caution: false,
+            slim_loaded: false,
+            slim_msg: String::new(),
+            confirm_slim: false,
+            startup_items: Vec::new(),
+            startup_loaded: false,
+            startup_only_actionable: false,
+            confirm_restart: false,
+            boot_also: boot_also_sec.is_some(),
+            boot_also_at: boot_also_sec.unwrap_or(300).max(60),
             scr_monitors: 0,
             scr_channel: false,
             scr_last: String::new(),
@@ -478,6 +620,8 @@ impl App {
                 "layouts" | "layout" | "desk" => Page::Layouts,
                 "cli" | "commands" => Page::Cli,
                 "baseline" => Page::Baseline,
+                "slim" | "trim" => Page::Slim,
+                "startup" | "start" | "autorun" => Page::Startup,
                 "protect" => Page::Protect,
                 "boot" => Page::Boot,
                 "tools" | "tool" => Page::Tools,
@@ -540,7 +684,7 @@ impl App {
         };
         let Some(base_dir) = deskkit_win::compare::find_latest_baseline(root) else {
             out.missing = Some(format!(
-                "没有基准快照，先跑一次 deskkit collect（{}）",
+                "没有基准快照，先跑一次 MemBase.exe collect（{}）",
                 root.display()
             ));
             return out;
@@ -880,13 +1024,14 @@ impl App {
                     )
                 } else {
                     format!(
-                        "已把当前状态设为基准：{} 进程 / {} MB / 占用率 {}% · 采集耗时 {}",
+                        "已把当前状态设为基准：{} 进程 / {} MB / 占用率 {}% · 采集 {}（受系统负载影响，不是性能指标）",
                         snap.procs.len(),
                         snap.used_phys_mb,
                         snap.load_pct,
                         fmt_dur(snap.collect_ms)
                     )
                 };
+                rotate_runs(&self.root, 10);
                 self.reload();
             }
             Err(e) => self.status = format!("设基准失败：{e}"),
@@ -903,14 +1048,27 @@ impl App {
                 return;
             }
         };
-        match boot::install(&src, &self.root, self.boot_at, core::DEFAULT_TASK) {
+        let also = if self.boot_also {
+            Some(self.boot_also_at.max(self.boot_at + 10))
+        } else {
+            None
+        };
+        match boot::install(&src, &self.root, self.boot_at, also, core::DEFAULT_TASK) {
             Ok(target) => {
                 self.boot = boot::query(core::DEFAULT_TASK);
-                self.status = format!(
-                    "已安排：下次开机第 {} 秒采集一次（程序 {}）",
-                    self.boot_at,
-                    target.display()
-                );
+                self.status = match also {
+                    Some(s) => format!(
+                        "已安排：下次开机第 {} 秒与第 {} 秒各采一次（程序 {}）",
+                        self.boot_at,
+                        s,
+                        target.display()
+                    ),
+                    None => format!(
+                        "已安排：下次开机第 {} 秒采集一次（程序 {}）",
+                        self.boot_at,
+                        target.display()
+                    ),
+                };
             }
             Err(e) => self.status = format!("安排失败：{}", e),
         }
@@ -923,6 +1081,219 @@ impl App {
             Ok(()) => "已取消开机采集任务".to_string(),
             Err(e) => format!("取消失败：{}", e),
         };
+    }
+
+    // ---------------- 瘦身页 ----------------
+
+    /// 读基准服务清单 + 当前功能开关，算出这一轮能砍的项。
+    ///
+    /// 和 `slim` 命令同一套逻辑（`core::build_trim_plan` / `build_feature_items`），
+    /// 只是把「已禁用 / 已卸载」的项过滤掉，保证重复打开不会反复建议同一批。
+    fn refresh_slim(&mut self) {
+        self.slim_loaded = true;
+        self.slim_items.clear();
+        self.slim_pick.clear();
+        let Some(dir) = deskkit_win::compare::find_latest_baseline(&self.root) else {
+            self.slim_msg = "没有基准快照：先在「基准」页采集或导入一份".to_string();
+            return;
+        };
+        let svc = std::fs::read_to_string(dir.join("services.csv")).unwrap_or_default();
+        let rows = core::parse_service_rows(&svc);
+        let mut items = core::build_trim_plan(&rows, 5.0, self.slim_caution);
+        items.retain(|it| match it.action {
+            core::TrimAction::FeatureOff | core::TrimAction::StopAndDisableStartup => true,
+            _ => matches!(win::service_start_mode(&it.name), Some(m) if m != "Disabled"),
+        });
+
+        let snap = snapshot::snapshot_now(true);
+
+        // 启动项：既不是服务、也不是 appx 的那一类。
+        // 2026-10-22 实测的缺口：VS 安装器的 BackgroundDownload 一开机 339 MB，
+        // 挂在 `\Microsoft\...` 下被旧过滤规则跳过，trim / slim / feature 三条路也都够不着。
+        // 只认「进程真的在跑 + 内存过 5 MB」，系统任务里的空挂项不会挤进来。
+        let mut mem_by_exe: std::collections::BTreeMap<String, f64> = Default::default();
+        for p in &snap.procs {
+            if let Some(ws) = p.ws_mb {
+                *mem_by_exe.entry(p.name.to_lowercase()).or_insert(0.0) += ws;
+            }
+        }
+        let startup_raw = deskkit_win::startup::scan();
+        let no_baseline: std::collections::BTreeSet<String> = Default::default();
+        let startup_items = core::startup::build_startup_items(&startup_raw, &no_baseline);
+        let startup_items = core::build_startup_trim_items(
+            &startup_items,
+            &mem_by_exe,
+            5.0,
+            self.slim_caution,
+        );
+        let startup_count = startup_items.len();
+        items.extend(startup_items);
+
+        // 功能开关：以当前开关值 + 证据进程为准
+        let nodes: Vec<core::feature::ProcNode> = snap
+            .procs
+            .iter()
+            .map(|p| core::feature::ProcNode {
+                pid: p.pid,
+                ppid: p.ppid,
+                name: p.name.clone(),
+                ws_mb: p.ws_mb,
+            })
+            .collect();
+        let states: std::collections::BTreeMap<&'static str, core::feature::SwitchState> =
+            core::feature::FEATURE_SWITCHES
+                .iter()
+                .map(|sw| (sw.key, feature_state(sw)))
+                .collect();
+        let evs: std::collections::BTreeMap<&'static str, core::feature::FeatureEvidence> =
+            core::feature::FEATURE_SWITCHES
+                .iter()
+                .map(|sw| (sw.key, core::feature::feature_evidence(sw, &nodes)))
+                .collect();
+        items.extend(core::build_feature_items(
+            core::feature::FEATURE_SWITCHES,
+            &states,
+            &evs,
+        ));
+
+        self.slim_msg = if items.is_empty() {
+            format!("基准 {} 里没有值得砍的自启项（阈值 5 MB）", dir.display())
+        } else {
+            format!(
+                "基准 {} · 预计开机少占 ≤{:.0} MB（同一宿主只算一次，含 {} 项启动项）",
+                dir.display(),
+                core::trim_savings(&items),
+                startup_count
+            )
+        };
+        // 默认勾上建议档；谨慎档要用户自己勾
+        self.slim_pick = items.iter().map(|it| it.tier == Tier::Suggested).collect();
+        self.slim_items = items;
+    }
+
+    /// 执行勾选项。卸载类与禁用类都是「下次开机才反映到基准」，
+    /// 功能开关改完会顺带关掉证据进程，当场见效。
+    fn execute_slim(&mut self) {
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        let mut first_err = String::new();
+        let items = std::mem::take(&mut self.slim_items);
+        let picks = std::mem::take(&mut self.slim_pick);
+        for (i, it) in items.iter().enumerate() {
+            if !picks.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let r = match it.action {
+                core::TrimAction::DisableService => win::disable_service_start(&it.name),
+                core::TrimAction::UninstallAppx => {
+                    win::remove_appx(it.appx.as_deref().unwrap_or_default())
+                }
+                core::TrimAction::FeatureOff => {
+                    match it.feature.and_then(core::feature::feature_by_key) {
+                        Some(sw) => apply_feature_off(sw),
+                        None => Err(format!("开关键不存在: {}", it.name)),
+                    }
+                }
+                core::TrimAction::StopAndDisableStartup => apply_stop_and_disable_startup(it),
+            };
+            match r {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    if first_err.is_empty() {
+                        first_err = format!("{}: {}", it.name, e);
+                    }
+                }
+            }
+        }
+        self.status = if fail == 0 {
+            format!("已处理 {} 项，下次开机生效（功能开关当场生效）", ok)
+        } else {
+            format!("成功 {} 项，失败 {} 项（{}）", ok, fail, first_err)
+        };
+        self.refresh_slim();
+        self.reload();
+    }
+
+    // ---------------- 启动项页 ----------------
+
+    fn refresh_startup(&mut self) {
+        let raw = startup::scan();
+        let mut baseline: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(dir) = deskkit_win::compare::find_latest_baseline(&self.root) {
+            let text =
+                std::fs::read_to_string(dir.join("processes_by_name.csv")).unwrap_or_default();
+            for (name, _) in core::parse_by_name(&text) {
+                baseline.insert(name);
+            }
+        }
+        self.startup_items = core::startup::build_startup_items(&raw, &baseline);
+        self.startup_loaded = true;
+        self.status = format!("启动项：{} 项", self.startup_items.len());
+    }
+
+    /// 禁用 / 启用一项，然后重扫（注册表与任务状态是唯一真相）
+    fn set_startup_enabled(&mut self, idx: usize, enable: bool) {
+        let Some(it) = self.startup_items.get(idx) else {
+            return;
+        };
+        let (source, name) = (it.source, it.name.clone());
+        match startup::set_enabled(source, &name, enable) {
+            Ok(()) => {
+                self.status = format!(
+                    "已{}：{}（下次登录生效）",
+                    if enable { "启用" } else { "禁用" },
+                    name
+                );
+                self.refresh_startup();
+            }
+            Err(e) => self.status = format!("操作失败：{e}"),
+        }
+    }
+
+    // ---------------- 进程页：局部重启 ----------------
+
+    /// 勾选里能重启的项：有路径、不是关键组件、不是共享宿主
+    fn restartable(&self) -> Vec<(String, String, f64)> {
+        self.rows
+            .iter()
+            .filter(|r| r.pick && r.kind == Kind::Process)
+            .filter_map(|r| {
+                let chk = core::feature::restart_check(
+                    core::feature::RestartKind::Process,
+                    &r.name,
+                    &r.path,
+                    r.tier,
+                );
+                if chk.allowed {
+                    Some((r.name.clone(), r.path.clone(), r.mem_mb))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn do_restart(&mut self) {
+        let items = self.restartable();
+        if items.is_empty() {
+            self.status = "没有可重启的项（需要勾选、有可执行路径、且不是关键组件）".into();
+            return;
+        }
+        let protected = win::protected_pids();
+        let mut lines: Vec<String> = Vec::new();
+        for (name, path, _) in &items {
+            let rep = restart::restart_process(
+                name,
+                path,
+                close::CloseOptions::default(),
+                &protected,
+                3000,
+            );
+            lines.push(rep.message);
+        }
+        self.status = lines.join("；");
+        self.reload();
     }
 
     fn export_baseline(&mut self) {
@@ -1089,22 +1460,33 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
 // ---------- 浅色基元（对齐 Windows 11 任务管理器的观感）----------
 
 /// 卡片页头：左边标题 + 副标题，右边动作；底下一根分隔线
+/// 页头：标题与摘要在第一行，动作按钮单独一行并自动换行。
+///
+/// 为什么分两行：按钮多的时候（进程页 7 个）原来挤在同一行右对齐，
+/// 窗口一窄就从右侧往左压，直接把摘要文字盖掉。宁可多占一行，也不遮信息。
 fn page_head<F: FnOnce(&mut egui::Ui)>(ui: &mut egui::Ui, title: &str, sub: &str, actions: F) {
     let r = ui.available_rect_before_wrap();
-    ui.add_space(12.0);
+    ui.add_space(10.0);
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         ui.label(egui::RichText::new(title).size(16.5).strong().color(pal().text));
         if !sub.is_empty() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(sub).size(11.5).color(pal().muted));
+            ui.add_space(6.0);
+            // 摘要按剩余宽度省略，不和按钮抢位置
+            ui.add(
+                egui::Label::new(egui::RichText::new(sub).size(11.5).color(pal().muted))
+                    .truncate(),
+            );
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(16.0);
-            actions(ui);
-        });
     });
-    ui.add_space(9.0);
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.spacing_mut().item_spacing.y = 6.0;
+        actions(ui);
+    });
+    ui.add_space(8.0);
     let y = ui.cursor().top();
     ui.painter().rect_filled(
         egui::Rect::from_min_size(egui::pos2(r.left(), y), egui::vec2(r.width(), 1.0)),
@@ -1198,6 +1580,46 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
             );
             p.line_segment(
                 [egui::pos2(c.x - 0.5, c.y + 2.0), egui::pos2(c.x + 3.0, c.y - 2.5)],
+                s,
+            );
+        }
+        Page::Slim => {
+            // 向下的箭头 + 底线：把东西减下去
+            p.line_segment([egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 2.5)], s);
+            p.line_segment(
+                [egui::pos2(c.x - 3.2, c.y - 0.5), egui::pos2(c.x, c.y + 2.8)],
+                s,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + 3.2, c.y - 0.5), egui::pos2(c.x, c.y + 2.8)],
+                s,
+            );
+            p.line_segment(
+                [egui::pos2(c.x - 5.5, c.y + 6.0), egui::pos2(c.x + 5.5, c.y + 6.0)],
+                s,
+            );
+        }
+        Page::Startup => {
+            // 一行方块 + 向上的箭头：随开机起来
+            p.rect_stroke(
+                egui::Rect::from_center_size(
+                    egui::pos2(c.x - 3.5, c.y + 3.5),
+                    egui::vec2(7.0, 6.0),
+                ),
+                egui::CornerRadius::same(1),
+                s,
+                egui::StrokeKind::Middle,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + 3.0, c.y + 1.0), egui::pos2(c.x + 3.0, c.y - 5.5)],
+                s,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + 0.6, c.y - 3.2), egui::pos2(c.x + 3.0, c.y - 5.8)],
+                s,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + 5.4, c.y - 3.2), egui::pos2(c.x + 3.0, c.y - 5.8)],
                 s,
             );
         }
@@ -1341,6 +1763,8 @@ impl App {
         ui.add_space(6.0);
         for p in [
             Page::Processes,
+            Page::Slim,
+            Page::Startup,
             Page::Baseline,
             Page::Layouts,
             Page::Protect,
@@ -1512,6 +1936,30 @@ impl App {
             if resp.clicked() {
                 self.reload();
                 self.status = format!("已刷新：线外 {} 项", self.rows.len());
+            }
+            ui.add_space(8.0);
+            let targets = self.restartable();
+            let n = targets.len();
+            let mb: f64 = targets.iter().map(|t| t.2).sum();
+            let ron = n > 0 && self.is_admin;
+            let rlabel = if n == 0 {
+                "无可重启项".to_string()
+            } else {
+                format!("重启选中 {} 项 · {}", n, fmt_mb(mb))
+            };
+            let resp = ui.add_enabled(ron, btn(&rlabel, 12.5, 168.0));
+            let resp = if ron {
+                resp.on_hover_text(format!(
+                    "关掉再按原路径拉起，等 3 秒实测回收量（任务栏可能闪一下）\n同 CLI：{}",
+                    cli_map::cli_for("proc_restart").unwrap_or("")
+                ))
+            } else if n == 0 {
+                resp.on_hover_text("勾选要重启的进程：需要有可执行路径，且不是关键组件 / 共享宿主")
+            } else {
+                resp.on_hover_text("需要以管理员身份运行")
+            };
+            if resp.clicked() {
+                self.confirm_restart = true;
             }
         });
 
@@ -1766,6 +2214,317 @@ impl App {
     }
 
     /// 基准页：基准线本体
+    /// 瘦身页：基准内部能砍的服务 / Store 应用 / 功能开关
+    fn page_slim(&mut self, ui: &mut egui::Ui) {
+        // 首次进页面才扫（含一次进程树枚举，几十毫秒）
+        if !self.slim_loaded {
+            self.refresh_slim();
+        }
+        let picked = self.slim_pick.iter().filter(|p| **p).count();
+        let picked_mb: f64 = {
+            let v: f64 = self
+                .slim_items
+                .iter()
+                .zip(self.slim_pick.iter())
+                .filter(|(_, p)| **p)
+                .map(|(it, _)| it.mem_mb)
+                .sum();
+            // 空集合的 f64 sum 是 -0.0，直接格式化会显示「约 -0 MB」
+            (v * 100.0).round() / 100.0 + 0.0
+        };
+        let sub = if self.slim_items.is_empty() {
+            "没有可砍的自启项".to_string()
+        } else {
+            format!(
+                "{} 项 · 已勾 {} 项 / 约 {:.0} MB · 下次开机生效",
+                self.slim_items.len(),
+                picked,
+                picked_mb
+            )
+        };
+        page_head(ui, "瘦身", &sub, |ui| {
+            let on = picked > 0 && self.is_admin;
+            let text = if picked == 0 {
+                "未勾选任何项".to_owned()
+            } else {
+                format!("处理选中 {} 项 · {}", picked, fmt_mb(picked_mb))
+            };
+            let resp = ui.add_enabled(on, btn_primary(&text, 186.0, on));
+            let resp = if on {
+                resp.on_hover_text(format!(
+                    "禁用服务 / 卸载 Store 应用 / 关功能开关\n同 CLI：{}",
+                    cli_map::cli_for("slim_execute").unwrap_or("")
+                ))
+            } else if picked == 0 {
+                resp.on_hover_text("先在列表里勾上要处理的项")
+            } else {
+                resp.on_hover_text("需要以管理员身份运行")
+            };
+            if resp.clicked() {
+                self.confirm_slim = true;
+            }
+            ui.add_space(8.0);
+            if ui
+                .checkbox(&mut self.slim_caution, "含系统组件")
+                .on_hover_text(
+                    "放开 Windows 目录下的组件（iphlpsvc / IKEEXT / nsi 这类，禁了会断网，必须逐条判断）",
+                )
+                .changed()
+            {
+                self.refresh_slim();
+            }
+            ui.add_space(8.0);
+            let resp = ui.add(btn("重新扫描", 12.5, 84.0));
+            let resp = with_cli(resp, "slim_refresh");
+            if resp.clicked() {
+                self.refresh_slim();
+            }
+        });
+        ui.add_space(8.0);
+        if !self.slim_msg.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new(&self.slim_msg)
+                        .size(11.5)
+                        .color(pal().muted),
+                );
+            });
+            ui.add_space(6.0);
+        }
+
+        let items = std::mem::take(&mut self.slim_items);
+        let mut picks = std::mem::take(&mut self.slim_pick);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if items.is_empty() {
+                    ui.add_space(26.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new("基准里没有值得砍的项；要减少开机常驻，去「启动项」页看")
+                                .size(12.5)
+                                .color(pal().grey),
+                        );
+                    });
+                    return;
+                }
+                for (i, it) in items.iter().enumerate() {
+                    let w = ui.available_width();
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, 32.0), egui::Sense::hover());
+                    let on = picks.get(i).copied().unwrap_or(false);
+                    let fill = if on {
+                        pal().card_hl
+                    } else if resp.hovered() {
+                        pal().row_hover
+                    } else {
+                        pal().card
+                    };
+                    let c = egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + 26.0, rect.center().y),
+                        egui::vec2(18.0, 18.0),
+                    );
+                    // 先画底与文字，再放勾选框：painter 的生命周期不能和 ui.put 交叉借用
+                    {
+                        let p = ui.painter();
+                        p.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), rect.bottom() - 1.0),
+                                egui::vec2(rect.width(), 1.0),
+                            ),
+                            egui::CornerRadius::ZERO,
+                            pal().line,
+                        );
+                        p.text(
+                            egui::pos2(rect.left() + 48.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            it.action.label(),
+                            egui::FontId::proportional(12.5),
+                            pal().muted,
+                        );
+                        p.text(
+                            egui::pos2(rect.left() + 148.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            elide(&it.name, 34),
+                            egui::FontId::proportional(13.0),
+                            if it.tier == Tier::Caution {
+                                pal().amber
+                            } else {
+                                pal().text
+                            },
+                        );
+                        p.text(
+                            egui::pos2(rect.right() - 250.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            fmt_mb(it.mem_mb),
+                            egui::FontId::proportional(12.5),
+                            pal().text,
+                        );
+                        p.text(
+                            egui::pos2(rect.right() - 176.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            core::tier_name(it.tier),
+                            egui::FontId::proportional(12.0),
+                            pal().muted,
+                        );
+                    }
+                    let mut v = on;
+                    if ui.put(c, egui::Checkbox::without_text(&mut v)).changed() {
+                        if let Some(slot) = picks.get_mut(i) {
+                            *slot = v;
+                        }
+                    }
+                    resp.on_hover_text(format!("{}
+{}", it.reason, it.path));
+                    ui.add_space(2.0);
+                }
+            });
+        self.slim_items = items;
+        self.slim_pick = picks;
+    }
+
+    /// 启动项页：还没跑起来就先看见
+    fn page_startup(&mut self, ui: &mut egui::Ui) {
+        if !self.startup_loaded {
+            self.refresh_startup();
+        }
+        let total = self.startup_items.len();
+        let on = self.startup_items.iter().filter(|i| i.enabled).count();
+        let actionable = self
+            .startup_items
+            .iter()
+            .filter(|i| i.enabled && i.suggestion == "disable")
+            .count();
+        let sub = format!(
+            "共 {} 项 · 启用 {} · 已禁用 {} · 建议处理 {}",
+            total,
+            on,
+            total - on,
+            actionable
+        );
+        page_head(ui, "启动项", &sub, |ui| {
+            if ui
+                .checkbox(&mut self.startup_only_actionable, "只看建议处理")
+                .on_hover_text("折叠已禁用项，只留还需要判断的")
+                .changed()
+            {
+                // 只是过滤，不用重扫
+            }
+            ui.add_space(8.0);
+            let resp = ui.add(btn("重新扫描", 12.5, 84.0));
+            let resp = with_cli(resp, "startup_refresh");
+            if resp.clicked() {
+                self.refresh_startup();
+            }
+        });
+        ui.add_space(8.0);
+
+        let mut toggle: Option<(usize, bool)> = None;
+        let items = std::mem::take(&mut self.startup_items);
+        let only = self.startup_only_actionable;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let shown: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| !only || (i.enabled && i.suggestion != "keep"))
+                    .map(|(idx, _)| idx)
+                    .collect();
+                if shown.is_empty() {
+                    ui.add_space(26.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new("没有符合条件的启动项")
+                                .size(12.5)
+                                .color(pal().grey),
+                        );
+                    });
+                    return;
+                }
+                for idx in shown {
+                    let it = &items[idx];
+                    let w = ui.available_width();
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, 32.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(
+                        rect,
+                        egui::CornerRadius::ZERO,
+                        if resp.hovered() { pal().row_hover } else { pal().card },
+                    );
+                    p.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(rect.left(), rect.bottom() - 1.0),
+                            egui::vec2(rect.width(), 1.0),
+                        ),
+                        egui::CornerRadius::ZERO,
+                        pal().line,
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 16.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        if it.enabled { "启用" } else { "已禁用" },
+                        egui::FontId::proportional(12.5),
+                        if it.enabled { pal().accent } else { pal().grey },
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 76.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        elide(it.source.label(), 20),
+                        egui::FontId::proportional(11.5),
+                        pal().muted,
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 236.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        elide(&it.name, 38),
+                        egui::FontId::proportional(12.5),
+                        pal().text,
+                    );
+                    p.text(
+                        egui::pos2(rect.right() - 420.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        elide(if it.exe.is_empty() { "—" } else { &it.exe }, 22),
+                        egui::FontId::proportional(12.0),
+                        pal().muted,
+                    );
+                    p.text(
+                        egui::pos2(rect.right() - 196.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        it.suggestion_cn(),
+                        egui::FontId::proportional(12.0),
+                        match it.suggestion {
+                            "disable" => pal().amber,
+                            "review" => pal().muted,
+                            _ => pal().grey,
+                        },
+                    );
+                    let c = egui::Rect::from_center_size(
+                        egui::pos2(rect.right() - 46.0, rect.center().y),
+                        egui::vec2(72.0, 24.0),
+                    );
+                    let label = if it.enabled { "禁用" } else { "启用" };
+                    let r = ui.put(c, btn(label, 12.0, 72.0));
+                    let r = with_cli(r, "startup_toggle");
+                    if r.clicked() {
+                        toggle = Some((idx, !it.enabled));
+                    }
+                    resp.on_hover_text(format!("{}
+{}", it.command, it.detail));
+                    ui.add_space(2.0);
+                }
+            });
+        self.startup_items = items;
+        if let Some((idx, enable)) = toggle {
+            self.set_startup_enabled(idx, enable);
+        }
+    }
+
     fn page_baseline(&mut self, ui: &mut egui::Ui) {
         page_head(ui, "基准", "刚开机那一刻的参照物", |ui| {
             let resp = ui.add(btn_primary("扫描当前状态设为基准", 168.0, true));
@@ -1931,7 +2690,7 @@ impl App {
         }
     }
 
-    /// 开机采集页：把 `deskkit install --at N` 做成按钮
+    /// 开机采集页：把 `MemBase.exe install --at N` 做成按钮
     fn page_boot(&mut self, ui: &mut egui::Ui) {
         let sub = if self.boot.installed { "已安排" } else { "未安排" };
         page_head(ui, "开机采集", sub, |ui| {
@@ -1994,6 +2753,33 @@ impl App {
                         .size(11.5)
                         .color(pal().muted),
                     );
+                });
+                ui.add_space(8.0);
+                // 双采样：一次开机采两点，用来分「起了又退」和「真常驻」
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    if ui
+                        .checkbox(&mut self.boot_also, "双采样")
+                        .on_hover_text(format!(
+                            "同一个计划任务里再采一次，用来分辨短命项\n同 CLI：{}",
+                            cli_map::cli_for("boot_dual").unwrap_or("")
+                        ))
+                        .changed()
+                        && !self.boot_also
+                    {
+                        self.boot_also_at = 300;
+                    }
+                    if self.boot_also {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("第二次在第").size(12.0).color(pal().muted));
+                        ui.add(
+                            egui::DragValue::new(&mut self.boot_also_at)
+                                .range((self.boot_at + 10)..=1800)
+                                .speed(10.0)
+                                .suffix(" 秒"),
+                        )
+                        .on_hover_text("通常 T+300s：桌面启动项都起来了，短命的已经退出");
+                    }
                 });
                 ui.add_space(12.0);
                 kv_row(ui, "计划任务", core::DEFAULT_TASK);
@@ -2108,10 +2894,10 @@ impl App {
                     }
                     if self.dark != dark_mode() {
                         set_dark_mode(self.dark);
-                        // 与 `deskkit theme set` 同一个实现，界面和命令不会各写各的
+                        // 与 `MemBase.exe theme set` 同一个实现，界面和命令不会各写各的
                         let _ = deskkit_cli::write_theme(self.dark);
                         self.status = format!(
-                            "外观已切到{}（同 CLI：deskkit theme set {}）",
+                            "外观已切到{}（同 CLI：MemBase.exe theme set {}）",
                             if self.dark { "深色" } else { "浅色" },
                             if self.dark { "dark" } else { "light" }
                         );
@@ -2203,7 +2989,7 @@ impl App {
                         self.icons.invalidate();
                         self.icon_tex.clear();
                         self.status = format!(
-                            "已保存「{}」· {} 个图标 · 同 CLI：deskkit layout save {}",
+                            "已保存「{}」· {} 个图标 · 同 CLI：MemBase.exe layout save {}",
                             name,
                             layout.icons.len(),
                             name
@@ -2450,7 +3236,7 @@ impl App {
         }
         self.refresh_screen_status();
         self.status = format!(
-            "已退出息屏（{}）· 同 CLI：deskkit screen off --seconds {} --exit-key {}",
+            "已退出息屏（{}）· 同 CLI：MemBase.exe screen off --seconds {} --exit-key {}",
             reason,
             self.bo_secs,
             self.bo_key.as_str()
@@ -3063,7 +3849,7 @@ impl App {
         );
         page_head(ui, "工具", &sub, |ui| {
             let r = ui.add(btn("刷新", 12.5, 64.0));
-            let r = r.on_hover_text("重新读显示器与息屏状态\n同 CLI：deskkit screen status");
+            let r = r.on_hover_text("重新读显示器与息屏状态\n同 CLI：MemBase.exe screen status");
             if r.clicked() {
                 self.refresh_screen_status();
                 self.status = "已刷新工具页状态".into();
@@ -3140,7 +3926,7 @@ impl App {
                         self.bo_secs = hh * 3600 + mm * 60 + ss;
                         let _ = deskkit_win::screen::set_default_secs(self.bo_secs);
                         self.status = format!(
-                            "默认息屏时长已设为 {} · 同 CLI：deskkit screen duration {}",
+                            "默认息屏时长已设为 {} · 同 CLI：MemBase.exe screen duration {}",
                             if self.bo_secs == 0 {
                                 "不定时".to_string()
                             } else {
@@ -3162,7 +3948,7 @@ impl App {
                         if ui
                             .add(btn_small(label, 64.0))
                             .on_hover_text(format!(
-                                "一键设为 {}\n同 CLI：deskkit screen duration {}",
+                                "一键设为 {}\n同 CLI：MemBase.exe screen duration {}",
                                 label,
                                 deskkit_win::screen::fmt_hms(secs)
                             ))
@@ -3192,7 +3978,7 @@ impl App {
                     if self.bo_key != before {
                         let _ = deskkit_win::screen::set_exit_key(self.bo_key);
                         self.status = format!(
-                            "退出热键已改为 {} · 同 CLI：deskkit screen key {}",
+                            "退出热键已改为 {} · 同 CLI：MemBase.exe screen key {}",
                             self.bo_key.label(),
                             self.bo_key.as_str()
                         );
@@ -3258,7 +4044,7 @@ impl App {
                     ui,
                     "等价命令",
                     &format!(
-                        "deskkit screen off --seconds {} --exit-key {}  ·  deskkit screen duration {}",
+                        "MemBase.exe screen off --seconds {} --exit-key {}  ·  MemBase.exe screen duration {}",
                         self.bo_secs,
                         self.bo_key.as_str(),
                         deskkit_win::screen::fmt_hms(self.bo_secs)
@@ -3345,10 +4131,10 @@ impl App {
             ui.add_space(8.0);
             if ui
                 .add(btn("打开接口说明", 12.5, 112.0))
-                .on_hover_text("deskkit help 的完整文本")
+                .on_hover_text("MemBase.exe help 的完整文本")
                 .clicked()
             {
-                self.status = "命令行速查：deskkit help / deskkit commands --json".into();
+                self.status = "命令行速查：MemBase.exe help / MemBase.exe commands --json".into();
             }
         });
 
@@ -3698,6 +4484,8 @@ impl eframe::App for App {
             )
             .show(ui, |ui| match self.page {
                 Page::Processes => self.page_processes(ui),
+                Page::Slim => self.page_slim(ui),
+                Page::Startup => self.page_startup(ui),
                 Page::Baseline => self.page_baseline(ui),
                 Page::Layouts => self.page_layouts(ui),
                 Page::Protect => self.page_protect(ui),
@@ -3775,7 +4563,7 @@ impl eframe::App for App {
                         }
                     }
                     let cli = format!(
-                        "deskkit trim --execute --yes{} --only {}",
+                        "MemBase.exe trim --execute --yes{} --only {}",
                         if self.include_caution { " --include-caution" } else { "" },
                         if names.is_empty() { "<名字>".to_string() } else { names.join(",") }
                     );
@@ -4004,6 +4792,199 @@ impl eframe::App for App {
             if do_it {
                 self.confirm_boot = false;
                 self.install_boot();
+            }
+        }
+
+        // ---------- 瘦身确认 ----------
+        if self.confirm_slim {
+            let mut do_it = false;
+            let mut cancel = false;
+            let picked: Vec<&core::TrimItem> = self
+                .slim_items
+                .iter()
+                .zip(self.slim_pick.iter())
+                .filter(|(_, p)| **p)
+                .map(|(it, _)| it)
+                .collect();
+            // 按宿主去重：两个服务共用 svchost 时只算一份，否则弹窗里的合计会虚高
+            let mb = core::trim_savings_of(&picked);
+            let svc = picked
+                .iter()
+                .filter(|it| it.action == core::TrimAction::DisableService)
+                .count();
+            let appx = picked
+                .iter()
+                .filter(|it| it.action == core::TrimAction::UninstallAppx)
+                .count();
+            let feat = picked
+                .iter()
+                .filter(|it| it.action == core::TrimAction::FeatureOff)
+                .count();
+            let start = picked
+                .iter()
+                .filter(|it| it.action == core::TrimAction::StopAndDisableStartup)
+                .count();
+            egui::Modal::new(egui::Id::unique("slim_modal"))
+                .frame(
+                    egui::Frame::new()
+                        .fill(pal().panel)
+                        .stroke(egui::Stroke::new(1.0, pal().line))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(20, 18)),
+                )
+                .show(&ctx, |ui| {
+                    ui.set_width(470.0);
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("处理这 {} 项？", picked.len()))
+                            .size(17.0)
+                            .strong()
+                            .color(pal().text),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "禁用服务 {svc} 项 · 卸载 Store 应用 {appx} 项 · 关功能开关 {feat} 项 · 停用自启 {start} 项，合计 ≤{:.0} MB。",
+                            mb
+                        ))
+                        .size(12.5),
+                    );
+                    for it in picked.iter().take(6) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "· {}（{} · {}）",
+                                it.name,
+                                it.action.label(),
+                                fmt_mb(it.mem_mb)
+                            ))
+                            .size(11.5)
+                            .color(pal().muted),
+                        );
+                    }
+                    if picked.len() > 6 {
+                        ui.label(
+                            egui::RichText::new(format!("… 另有 {} 项", picked.len() - 6))
+                                .size(11.5)
+                                .color(pal().muted),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "服务与应用要到**下次开机**才反映到基准；功能开关会当场关掉宿主进程。\n禁用只改启动类型，卸载类的要重装才能恢复 —— 逐条确认过再点。",
+                        )
+                        .size(11.5)
+                        .color(pal().amber),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("取消").size(13.5))
+                                    .min_size(egui::vec2(90.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("执行")
+                                        .size(13.5)
+                                        .color(pal().on_accent),
+                                )
+                                .fill(pal().accent)
+                                .min_size(egui::vec2(110.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            do_it = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+            if cancel {
+                self.confirm_slim = false;
+            }
+            if do_it {
+                self.confirm_slim = false;
+                self.execute_slim();
+            }
+        }
+
+        // ---------- 重启确认 ----------
+        if self.confirm_restart {
+            let mut do_it = false;
+            let mut cancel = false;
+            let targets = self.restartable();
+            egui::Modal::new(egui::Id::unique("restart_modal"))
+                .frame(
+                    egui::Frame::new()
+                        .fill(pal().panel)
+                        .stroke(egui::Stroke::new(1.0, pal().line))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(20, 18)),
+                )
+                .show(&ctx, |ui| {
+                    ui.set_width(450.0);
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("重启这 {} 个进程？", targets.len()))
+                            .size(17.0)
+                            .strong()
+                            .color(pal().text),
+                    );
+                    ui.add_space(6.0);
+                    for (name, _, mb) in targets.iter().take(8) {
+                        ui.label(
+                            egui::RichText::new(format!("· {}（{}）", name, fmt_mb(*mb)))
+                                .size(12.0)
+                                .color(pal().muted),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "会先发关闭请求、宽限 3 秒，再强制结束；随后按原路径重新拉起。\n任务栏会闪一下，未保存的内容可能丢失。执行后报的是**实测**回收量（可能是负的）。",
+                        )
+                        .size(11.5)
+                        .color(pal().amber),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("取消").size(13.5))
+                                    .min_size(egui::vec2(90.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("重启")
+                                        .size(13.5)
+                                        .color(pal().on_accent),
+                                )
+                                .fill(pal().accent)
+                                .min_size(egui::vec2(110.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            do_it = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+            if cancel {
+                self.confirm_restart = false;
+            }
+            if do_it {
+                self.confirm_restart = false;
+                self.do_restart();
             }
         }
 
@@ -4239,7 +5220,7 @@ impl eframe::App for App {
                             ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "等价命令：deskkit layout save {}",
+                                    "等价命令：MemBase.exe layout save {}",
                                     if name.trim().is_empty() { "<名字>" } else { name.trim() }
                                 ))
                                 .size(11.0)

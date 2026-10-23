@@ -1,29 +1,43 @@
 @echo off
+rem Keep this file ASCII-only.
+rem cmd tracks the batch file position in BYTES but decodes with code page 65001,
+rem so every multibyte line shifts the read position and the parser starts eating
+rem the beginning of a later line (that is where "'e.exe' is not recognized" came
+rem from). Chinese text here WILL break the build sooner or later.
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
-echo [1/2] 编译（release，opt-level=3 + lto）
+echo [1/2] build (release, opt-level=3 + lto)
 cargo build --workspace --release
 if errorlevel 1 (
-  echo [x] 编译失败
+  echo [x] build failed
   exit /b 1
 )
 
-echo [2/2] 收产物到 dist
+echo [2/2] collect to dist
 if not exist dist mkdir dist
-rem 只分发一个 exe：带参数是命令行，无参数开界面，mcp 子命令当 AI 的 MCP server
+rem One exe only: with args it is the CLI, without args it opens the GUI,
+rem "mcp" makes it an MCP server.
 copy /y target\release\MemBase.exe    dist\ >nul
-rem 老的纯控制台版不再分发，残留一并清掉
+if errorlevel 1 (
+  rem Usually a running instance or an antivirus scan holding the file.
+  ping -n 3 127.0.0.1 >nul
+  copy /y target\release\MemBase.exe    dist\ >nul
+)
+if errorlevel 1 (
+  echo [x] copy to dist failed: MemBase.exe is locked. Close it and retry.
+  exit /b 1
+)
+
+rem Old console-only builds are no longer shipped; clean leftovers.
 if exist dist\deskkit.exe del /q dist\deskkit.exe
 if exist dist\membase-cli.exe del /q dist\membase-cli.exe
 
 echo.
-for %%F in (dist\MemBase.exe) do (
-  echo   %%~nxF  %%~zF 字节
-)
+for %%F in (dist\MemBase.exe) do echo   %%~nxF  %%~zF bytes
 echo.
-echo 用法：
-echo   dist\MemBase.exe                    开界面
-echo   dist\MemBase.exe layout list        同一个 exe 当命令行用
-echo   dist\MemBase.exe mcp                同一个 exe 当 MCP server（给 AI 调用）
+echo usage:
+echo   dist\MemBase.exe                    open the GUI
+echo   dist\MemBase.exe layout list        same exe, CLI mode
+echo   dist\MemBase.exe mcp                same exe, MCP server for AI

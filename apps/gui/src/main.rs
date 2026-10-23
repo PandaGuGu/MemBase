@@ -3689,11 +3689,16 @@ impl App {
     /// 关显示器电源（SC_MONITORPOWER）是「更省电」但更危险的一步：有些机器关得上、
     /// 叫不醒，屏幕就黑在那儿按什么都没反应。所以它默认关闭，只在用户在工具页
     /// 明确打开「同时关闭显示器」时才做。
+    ///
+    /// 顺序不能反：**先按住系统，再关屏**。关屏消息发出去到面板真灭有一小段空档，
+    /// 那一段里不该让空闲计时器把机器带睡（真正会触发待机的是 `lParam = 2`，
+    /// 现在用的是低功耗的 `1`，见 `membase_win::screen` 模块头）。
     fn enter_blackout(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         let secs = self.bo_secs;
         let mut note = String::new();
         let mut powered = false;
+        membase_win::screen::hold_awake(true);
         if !self.bo_test && membase_win::screen::power_off() {
             match membase_win::screen::off() {
                 // 关不掉也不算失败：黑屏照样挡住内容，只是费点电，如实告诉用户
@@ -3758,7 +3763,11 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         if powered {
             membase_win::screen::wake();
+        } else {
+            membase_win::screen::wake_light();
         }
+        // 松开息屏期间按住的那只手：之后系统照电源计划走
+        membase_win::screen::hold_awake(false);
         self.refresh_screen_status();
         self.status = format!(
             "已退出息屏（{}）· 同 CLI：MemBase.exe screen off --seconds {} --exit-key {}",
@@ -4542,7 +4551,7 @@ impl App {
                     ui.add_space(16.0);
                     let r = ui.checkbox(&mut self.bo_power_off, "同时关闭显示器");
                     let r = r.on_hover_text(
-                        "更省电，但有些机器关得掉、叫不醒（屏幕黑着按什么都没反应）。\n默认关闭：只盖全屏黑窗，ESC 一定退得出来",
+                        "真的把面板电断掉（不是画黑），最省电。\n走低功耗关屏，系统不算「离开」，按一下就回桌面，不跳锁屏。\n个别驱动叫不醒时，按一下电源键。",
                     );
                     if r.changed() {
                         let _ = membase_win::screen::set_power_off(self.bo_power_off);
@@ -4555,7 +4564,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(if self.bo_power_off {
-                            "退出时会叫醒显示器；叫不醒时按电源键进锁屏再回来"
+                            "低功耗关屏：系统不进待机，也不会跳锁屏"
                         } else {
                             "只黑屏、不动显示器电源 —— 最不容易「退不出来」"
                         })

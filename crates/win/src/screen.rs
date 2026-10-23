@@ -1,12 +1,23 @@
 //! 息屏：立刻关掉显示器（离开座位用）
 //!
 //! 做法就是 Windows 自己的那条路：给窗口发 `WM_SYSCOMMAND / SC_MONITORPOWER`，
-//! lParam = 2 表示「关」，-1 表示「开」，1 表示「省电」。
+//! `lParam = 1` 表示「低功耗」，`2` 表示「关」，`-1` 表示「开」。
 //! 任何输入（鼠标/键盘）都会把它叫醒，所以这是一个**无损、可逆**的动作。
 //!
-//! 为什么不用 `SetThreadExecutionState` 或电源计划：那两样是「让系统别睡」，
-//! 这里是「立刻睡」，方向相反。不过**叫醒**的时候它反而是最靠谱的一招，
-//! 见 [`wake`]。
+//! ## 为什么用 1 而不是 2（2026-10-23 实测）
+//!
+//! 新型待机（S0 低电量待机）机型上，`2` 不只是关屏：系统把「屏幕关掉」当成待机
+//! 入口，3 秒后就进 S0 低电量待机。之后按键变成「从睡眠唤醒」—— 要登录（锁屏界面），
+//! 第一次按键还常常只够把机器从待机里拽出来，屏幕继续黑着，于是要按好几下。
+//!
+//! 实测记录（同一台机器、同一时刻，只换这个参数）：
+//!   * `2` → 关屏 3 秒后 Kernel-Power 506「进入新型待机」，唤醒出现锁屏；
+//!   * `1` → 面板和背光同样全灭（肉眼一致），但 30 秒内没有任何 506/507，
+//!     进程也没被冻（6 秒 sleep 准时走完）。
+//!
+//! 所以 `off()` 发 `1`：真黑，但系统不认为你离开了。`SetThreadExecutionState`
+//! 仍然要按着（[`hold_awake`]），不过它管的是**空闲计时器**（息屏一小时不该自己睡着），
+//! 拦不住 `lParam = 2` 那条待机路径 —— 那条改用参数绕开，别指望按住就能压住。
 //!
 //! ## 退出息屏靠什么（v1.2）
 //!
@@ -25,7 +36,7 @@
 
 use membase_core::config;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,7 +53,7 @@ const SC_MONITORPOWER: usize = 0xF170;
 const SM_CMONITORS: i32 = 80;
 const SM_CXSCREEN: i32 = 0;
 const SMTO_ABORTIFHUNG: u32 = 0x0002;
-const MONITOR_OFF: isize = 2;
+const MONITOR_LOW: isize = 1;
 const MONITOR_ON: isize = -1;
 
 // ---- 全局输入监听用到的常量 ----
@@ -55,6 +66,7 @@ const VK_RBUTTON: i32 = 0x02;
 const VK_MBUTTON: i32 = 0x04;
 const MOUSEEVENTF_MOVE: u32 = 0x0001;
 const ES_CONTINUOUS: u32 = 0x8000_0000;
+const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
 const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
 
 /// 武装好之后鼠标移动的宽限期：刚松开「息屏」按钮，手还在动，
@@ -199,12 +211,15 @@ pub fn set_block_keys(v: bool) -> Result<(), String> {
     write_bool("screen_block_keys.txt", v)
 }
 
-/// 息屏时要不要**顺手把显示器电源也关掉**。
+/// 息屏时要不要**顺手把面板也断掉**。
 ///
 /// 默认 **关**：只盖一层全屏纯黑窗口，显示器始终亮着。
 /// 原因很实在：一旦真发了 `SC_MONITORPOWER`，能不能再叫醒就全看驱动和电源管理，
 /// 有的机器叫不醒 —— 那就变成「屏幕上什么都没有、按什么键都不亮」的死局。
 /// 息屏助手默认也是这样（它那个「同时关闭显示器」是选项，不是默认行为）。
+///
+/// 打开后走的是 `lParam = 1`（低功耗），不是 `2`（关）：两者肉眼一致，但 `2` 会把
+/// 系统带进待机（详见模块头）。
 pub fn power_off() -> bool {
     read_bool("screen_power_off.txt", false)
 }
@@ -390,10 +405,17 @@ fn nudge_cursor() {
     }
 }
 
-/// 立刻关屏（不锁屏 —— 这是用户明确要的行为：只黑屏，不动会话）
+/// 立刻关屏（不锁屏 —— 这是用户明确要的行为：只黑屏，不动会话）。
+///
+/// 发的是 `lParam = 1`（低功耗），不是 `2`（关）：两者肉眼都是「面板+背光全灭」，
+/// 但 `2` 会让系统把它当成待机入口，唤醒就变成「从睡眠回来」，要登录、还要按好几下。
+/// 实测评据见模块头部注释。
+///
+/// 调用前**先** [`hold_awake`]：低功耗这一档系统仍认为屏幕是亮的，空闲计时器照走，
+/// 不按住的话息屏一小时后系统会自己睡过去（那又变成锁屏了）。
 pub fn off() -> Result<(), String> {
     // 给合上盖子/远程桌面这类不支持关屏的环境一点预期：没发出去就如实报错
-    if !send_power(MONITOR_OFF) {
+    if !send_power(MONITOR_LOW) {
         return Err("关屏消息没有窗口接收（远程桌面 / 虚拟显示环境常见），显示器未被关闭".into());
     }
     record_off();
@@ -402,24 +424,74 @@ pub fn off() -> Result<(), String> {
     Ok(())
 }
 
+/// 息屏期间把系统按住：**别睡，但允许屏幕关掉**。
+///
+/// 它管的是**空闲计时器**：息屏默认一小时，这一小时里系统不该按电源计划自己睡过去
+/// （一睡，醒来就是锁屏，黑窗也白盖了）。
+///
+/// 它**拦不住**「关屏 → 待机」那条路：新型待机机型上，`SC_MONITORPOWER = 2` 会让
+/// 系统把「屏幕关掉」当成待机入口，按着也没用（实测 WorkBuddy 一直按着，照样进）。
+/// 那条路是靠 [`off`] 改用 `lParam = 1` 绕开的，别指望在这里压住。
+///
+/// 状态是**线程级**的：开和关要在同一个线程上调，线程一结束自动失效。
+pub fn hold_awake(on: bool) {
+    let flags = if on {
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    unsafe {
+        SetThreadExecutionState(flags);
+    }
+}
+
+/// 上次真正叫醒显示器的时刻（毫秒时间戳），用来给重复调用去重
+static WAKE_AT: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 轻量叫醒：广播一次「开」，不重试不等待。
+/// 用在「这次没真关过电源」的退出路径上，纯粹是保险（显示器本来就亮着时等价于空操作）。
+pub fn wake_light() {
+    send_power(MONITOR_ON);
+}
+
 /// 叫醒显示器。
 ///
-/// 只有真把显示器电源关过（[`off`]）才需要它。三条路一起走，因为单独任何一条都可能不灵：
-///   1. `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` —— 重置显示器空闲计时器，
-///      这是系统认可的「我要屏幕亮着」；
-///   2. 广播 `SC_MONITORPOWER / -1` —— 关屏那条路的反向操作；
-///   3. 光标 ±2px 抖动 —— 有些驱动只认硬件级的输入事件。
+/// 只有真把显示器电源关过（[`off`]）才需要它。四件事一起做，少一件就可能「按好几下」：
+///   1. `ES_SYSTEM_REQUIRED` —— 先按住系统：面板上电那一下别让空闲计时器把机器带睡；
+///   2. `ES_DISPLAY_REQUIRED` —— 重置显示器空闲计时器，这是系统认可的「我要亮着」；
+///   3. 广播 `SC_MONITORPOWER / -1` 两轮 —— 面板刚下电时第一轮常被驱动吞掉；
+///   4. 光标 ±2px 抖动 —— 有的驱动只认硬件级的输入事件。
 ///
-/// 注意：这套并不能保证一定叫得醒（取决于显卡驱动 / 电源管理），
-/// 所以界面侧默认 **不关** 显示器电源，见 [`power_off`]。
+/// 最后等 400ms 再把请求放开：背光升起来要几百毫秒，撤早了会被空闲计时器当场收回去。
+/// 1.5 秒内的重复调用直接返回 —— 监听线程刚叫过一次，界面那边不必再等一遍。
+///
+/// 这套仍不保证一定叫得醒（取决于显卡驱动 / 电源管理），所以界面侧默认 **不关**
+/// 显示器电源，见 [`power_off`]。
 pub fn wake() {
-    unsafe {
-        SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+    let now = now_ms();
+    let last = WAKE_AT.load(Ordering::SeqCst);
+    if last != 0 && now.saturating_sub(last) < 1500 {
+        return;
     }
-    send_power(MONITOR_ON);
-    nudge_cursor();
+    WAKE_AT.store(now, Ordering::SeqCst);
+
+    unsafe {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+    }
+    for _ in 0..2 {
+        send_power(MONITOR_ON);
+        nudge_cursor();
+        std::thread::sleep(Duration::from_millis(90));
+    }
     // 让它先真的亮起来，再把「要求亮屏」的占用还回去
-    std::thread::sleep(Duration::from_millis(120));
+    std::thread::sleep(Duration::from_millis(400));
     unsafe {
         SetThreadExecutionState(ES_CONTINUOUS);
     }
@@ -489,6 +561,8 @@ pub enum Hit {
     Mouse,
     /// 按了鼠标键（左/右/中）
     Click,
+    /// 机器刚从待机/休眠里回来（监听线程被冻过一轮）
+    Resume,
 }
 
 impl Hit {
@@ -497,6 +571,7 @@ impl Hit {
             Hit::Key => "退出键",
             Hit::Mouse => "鼠标移动",
             Hit::Click => "鼠标点击",
+            Hit::Resume => "系统从待机恢复",
         }
     }
 }
@@ -505,6 +580,12 @@ const HIT_NONE: u8 = 0;
 const HIT_KEY: u8 = 1;
 const HIT_MOUSE: u8 = 2;
 const HIT_CLICK: u8 = 3;
+const HIT_RESUME: u8 = 4;
+
+/// 监听线程一轮的间隔；一轮走了远超这个数，就说明整个进程被冻过（机器睡过）
+const TICK: Duration = Duration::from_millis(20);
+/// 超过这个间隔还没走完一轮 = 机器刚从待机/休眠回来
+const RESUME_GAP: Duration = Duration::from_secs(3);
 
 // 监听状态放静态里：一个进程同时只会有一次息屏，钩子回调也只能是无捕获函数，
 // 拿不到 Arc（低级钩子是系统在我们的线程里直接调回来的）。
@@ -578,7 +659,15 @@ fn watch_loop(key: ExitKey, mouse: bool, block: bool, on_hit: Option<OnHit>) {
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     // 命中后由监听线程自己先把显示器叫醒：界面万一卡了一帧，也不至于屏幕还黑着
     let mut woke = false;
+    // 上一轮的时刻。一轮走了远超 TICK，只能是被冻过（机器睡了一觉又回来）——
+    // 这时候人已经回来了，别再让他多按一次退出键
+    let mut last_tick = Instant::now();
     while !W_STOP.load(Ordering::SeqCst) {
+        let gap = last_tick.elapsed();
+        last_tick = Instant::now();
+        if gap > RESUME_GAP {
+            W_HIT.store(HIT_RESUME, Ordering::SeqCst);
+        }
         // 挂了钩子就必须泵消息，否则系统会把整机输入卡在我们这儿
         if hook != 0 {
             unsafe {
@@ -626,7 +715,7 @@ fn watch_loop(key: ExitKey, mouse: bool, block: bool, on_hit: Option<OnHit>) {
             }
             wake();
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(TICK);
     }
 
     if hook != 0 {
@@ -687,6 +776,7 @@ impl Watch {
             HIT_KEY => Some(Hit::Key),
             HIT_MOUSE => Some(Hit::Mouse),
             HIT_CLICK => Some(Hit::Click),
+            HIT_RESUME => Some(Hit::Resume),
             _ => None,
         }
     }

@@ -35,8 +35,9 @@ pub fn screen_usage() -> String {
     s.push_str("  --json        结构化输出\n");
     s.push_str("\n时长写法: 3600 / 90s / 5m / 1h / 1:05:09 都认；0 表示不定时。\n");
     s.push_str("退出: 界面上按设定热键（默认 ESC）；命令行用 Ctrl+C。\n");
-    s.push_str("注意: `screen off` 会真关显示器电源，有的机器关得掉、叫不醒；\n");
-    s.push_str("      界面上的息屏默认不碰电源（只盖全屏黑窗），要不要关看 `screen power`。\n");
+    s.push_str("注意: `screen off` 走低功耗关屏（面板+背光全灭），系统不因此进待机，\n");
+    s.push_str("      按一下就回桌面；界面上的息屏默认不碰电源（只盖全屏黑窗），\n");
+    s.push_str("      要不要真关看 `screen power`。\n");
     s
 }
 
@@ -134,6 +135,8 @@ fn screen_off(args: &[String]) -> i32 {
         std::thread::sleep(std::time::Duration::from_secs(delay));
     }
 
+    // 先按住系统再关屏：从发消息到面板真灭有一小段空档，别让空闲计时器在那一段里睡过去
+    membase_win::screen::hold_awake(true);
     match screen::off() {
         Ok(()) => {
             if secs > 0 {
@@ -147,6 +150,7 @@ fn screen_off(args: &[String]) -> i32 {
                 // 驻留到点：这是「息屏时长」在命令行里的表达，界面版是全屏黑窗口里的倒计时
                 std::thread::sleep(std::time::Duration::from_secs(secs));
                 screen::wake();
+                membase_win::screen::hold_awake(false);
                 if want_json(args) {
                     println!(
                         "{{\"ok\":true,\"seconds\":{},\"minutes\":{},\"delay\":{},\"exit_key\":{},\"woke\":true,\"monitors\":{}}}",
@@ -172,6 +176,8 @@ fn screen_off(args: &[String]) -> i32 {
             0
         }
         Err(e) => {
+            // 没关成就不用按着了（进程退出时线程级状态也会自己失效，这里只是写明白）
+            membase_win::screen::hold_awake(false);
             if want_json(args) {
                 println!("{{\"ok\":false,\"error\":{}}}", jstr(&e));
             } else {
@@ -334,7 +340,7 @@ fn screen_power(args: &[String]) -> i32 {
                             "已把「同时关闭显示器」设为 {}；界面上的勾选框会跟着变\n{}",
                             if on { "开" } else { "关" },
                             if on {
-                                "注意：有的机器关得掉、叫不醒，退出时按电源键进锁屏再回来"
+                                "注意：走低功耗关屏（面板全灭但系统不进待机），按一下就回桌面；个别驱动叫不醒时按一下电源键"
                             } else {
                                 "只盖全屏黑窗，ESC 一定退得出来"
                             }

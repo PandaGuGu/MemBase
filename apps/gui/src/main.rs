@@ -147,8 +147,8 @@ struct Row {
 /// 进程页的第二个标签：基准内、跑久了涨上来的可回收项
 struct ReclaimRow {
     it: core::ReclaimItem,
-    /// 历史上 `restart` 判过「杀掉又回来」
-    self_heal: bool,
+    /// 历史上 `restart` 判过「杀掉又回来」——带着那次的实测时间，旧记录一眼能看出是多久以前的
+    self_heal_at: Option<String>,
     /// 这一轮要不要实测重启
     pick: bool,
 }
@@ -263,6 +263,8 @@ struct App {
     shot_path: Option<String>,
     /// 启动时后台扫描的结果接收端（None = 已经拿到或还没开始）
     scan_rx: Option<mpsc::Receiver<Scan>>,
+    /// 后台执行「实测重启」的结果接收端（每项一行报告；None = 没在跑）
+    restart_rx: Option<mpsc::Receiver<Vec<String>>>,
     /// 已经按哪个主题灌过 Visuals（None = 还没灌过）
     themed_for: Option<bool>,
     /// 当前页（左侧导航）
@@ -615,6 +617,7 @@ impl App {
             frames: 0,
             shot_path: std::env::var("MEMBASE_SHOT").ok(),
             scan_rx: None,
+            restart_rx: None,
             themed_for: None,
             page: Page::Processes,
             dark,
@@ -830,7 +833,7 @@ impl App {
         out.recover = core::build_reclaim_plan(&base_procs, &live_procs, &wl, 10.0)
             .into_iter()
             .map(|it| ReclaimRow {
-                self_heal: heal.contains_key(&it.name),
+                self_heal_at: heal.get(&it.name).cloned(),
                 pick: false,
                 it,
             })
@@ -1358,24 +1361,41 @@ impl App {
             self.status = "没有可重启的项（需要勾选、有可执行路径、且不是关键组件）".into();
             return;
         }
-        let protected = win::protected_pids();
-        let mut lines: Vec<String> = Vec::new();
-        for (name, path, _) in &items {
-            let rep = restart::restart_process(
-                name,
-                path,
-                close::CloseOptions::default(),
-                &protected,
-                3000,
-            );
-            // GUI 也要记账：自愈型进程下次进「可回收」页就能看到
-            if rep.revived {
-                membase_cli::note_selfheal(&self.root, name);
-            }
-            lines.push(rep.message);
+        self.start_restart(items);
+    }
+
+    /// 真的去重启，但**丢到后台**：关进程 + 等它回来 + 3 秒实测都在子线程里，
+    /// 界面这 3 秒还能动（不然点完按钮整窗卡死，看起来像点坏了）。
+    fn start_restart(&mut self, items: Vec<(String, String, f64)>) {
+        if self.restart_rx.is_some() {
+            return;
         }
-        self.status = lines.join("；");
-        self.reload();
+        let (tx, rx) = mpsc::channel();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let protected = win::protected_pids();
+            let mut lines: Vec<String> = Vec::new();
+            for (name, path, _mb) in items {
+                let rep = restart::restart_process(
+                    &name,
+                    &path,
+                    close::CloseOptions::default(),
+                    &protected,
+                    3000,
+                );
+                // GUI 也要记账：自愈型进程下次进「可回收」页就能看到
+                if rep.revived {
+                    membase_cli::note_selfheal(&root, &name);
+                }
+                lines.push(rep.message);
+                if name.eq_ignore_ascii_case("explorer") {
+                    lines.push("桌面图标可能被 shell 重排，去「桌面布局」页点恢复".into());
+                }
+            }
+            let _ = tx.send(lines);
+        });
+        self.restart_rx = Some(rx);
+        self.status = "正在重启：关掉 → 等它自己回来 → 实测 3 秒…".into();
     }
 
     fn export_baseline(&mut self) {
@@ -1992,7 +2012,7 @@ impl App {
                         cli_map::cli_for("proc_restart").unwrap_or("")
                     ))
                 } else if n == 0 {
-                    resp.on_hover_text("先在列表里勾选可重启的项；explorer 会闪任务栏")
+                    resp.on_hover_text("点行勾选后可批量；只想重启一项就直接点它行尾的「重启」")
                 } else {
                     resp.on_hover_text("需要以管理员身份运行")
                 };
@@ -2446,6 +2466,8 @@ impl App {
 
         let rows = std::mem::take(&mut self.recover_rows);
         let mut picks: Vec<(usize, bool)> = Vec::new();
+        // 行尾「重启」按钮只收一个：这一帧点谁就只重启谁
+        let mut one_click: Option<(String, String, f64)> = None;
         let search = self.search.to_lowercase();
         let matched = rows
             .iter()
@@ -2483,9 +2505,21 @@ impl App {
                     }
                     let w = ui.available_width();
                     let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
                     let hovered = resp.hovered();
                     let can = r.it.allowed && !r.it.protect;
+                    // 行尾「重启」按钮的位置先算出来：判断这次点击是落按钮上还是落整行
+                    let btn_rect = egui::Rect::from_center_size(
+                        cols.rect(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 16.0, rect.top()),
+                                egui::vec2(rect.width() - 24.0, rect.height()),
+                            ),
+                            5,
+                        )
+                        .center(),
+                        egui::vec2(54.0, 22.0),
+                    );
                     let fill = if r.pick {
                         pal().card_hl
                     } else if hovered {
@@ -2601,7 +2635,7 @@ impl App {
                         } else {
                             ("禁止", pal().grey)
                         }
-                    } else if r.self_heal {
+                    } else if r.self_heal_at.is_some() {
                         ("自愈型", pal().amber)
                     } else {
                         ("可重启", pal().accent)
@@ -2615,35 +2649,52 @@ impl App {
                         status_color,
                     );
 
-                    // 勾选：只允许真的能重启的项
-                    let mut pk = r.pick;
-                    let rc = egui::Rect::from_center_size(
-                        cols.rect(area, 5).center(),
-                        egui::vec2(22.0, 22.0),
-                    );
-                    let rresp = ui
+                    // 一键重启：点这一格就动手，不用先勾选再跑去顶栏找按钮
+                    let busy = self.restart_rx.is_some();
+                    let bresp = ui
                         .scope_builder(
                             egui::UiBuilder::new()
-                                .max_rect(rc)
+                                .max_rect(btn_rect)
                                 .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
-                            |ui| ui.add_enabled(can, egui::Checkbox::without_text(&mut pk)),
+                            |ui| {
+                                ui.add_enabled(
+                                    can && !busy,
+                                    egui::Button::new(
+                                        egui::RichText::new(if busy { "…" } else { "重启" })
+                                            .size(11.5)
+                                            .color(if can { pal().on_accent } else { pal().muted }),
+                                    )
+                                    .fill(if can { pal().accent } else { pal().disabled_bg })
+                                    .min_size(egui::vec2(54.0, 22.0)),
+                                )
+                            },
                         )
                         .inner;
-                    if rresp.changed() {
-                        picks.push((i, pk));
+                    if bresp.clicked() {
+                        one_click = Some((r.it.name.clone(), r.it.path.clone(), r.it.mem_mb));
                     }
-                    let _ = rresp.on_hover_text(if r.it.protect {
+                    let _ = bresp.on_hover_text(if r.it.protect {
                         format!("保护名单命中：{}", r.it.protect_by)
                     } else if !r.it.allowed {
                         r.it.reason.to_string()
                     } else {
                         format!(
-                            "实测重启：关掉再按原路径拉起，等 3 秒测回收量\n同 CLI：{}",
+                            "点一下就重启这一项：关掉 → 按原路径拉起 → 等 3 秒实测\n同 CLI：{}",
                             cli_map::cli_for("proc_restart").unwrap_or("")
                         )
                     });
 
+                    // 点行（按钮以外）= 勾选，供顶栏批量重启
+                    let pointer = ui.input(|i| i.pointer.interact_pos());
+                    let on_btn = pointer.map(|p| btn_rect.contains(p)).unwrap_or(false);
+                    if resp.clicked() && !on_btn {
+                        picks.push((i, !r.pick));
+                    }
+
                     let mut hover = String::new();
+                    if can {
+                        hover.push_str("点行 = 勾选（供顶栏批量重启）；点右侧「重启」= 只重启这一项\n");
+                    }
                     if r.it.protect {
                         hover.push_str(&format!("保护名单命中：{}\n", r.it.protect_by));
                     } else if !r.it.allowed {
@@ -2653,8 +2704,12 @@ impl App {
                     if !warn.is_empty() {
                         hover.push_str(&format!("{}\n", warn));
                     }
-                    if r.self_heal {
-                        hover.push_str("历史记录：杀掉会被外壳拉起，回收量按实测，通常很小\n");
+                    if let Some(at) = &r.self_heal_at {
+                        hover.push_str(&if at.trim().is_empty() {
+                            "历史记录：曾实测被判「杀掉会被外壳拉起」，时间未知；回收量按本次实测\n".to_string()
+                        } else {
+                            format!("历史记录：{} 实测杀掉会被外壳拉起，回收量通常很小\n", at)
+                        });
                     }
                     if !r.it.path.is_empty() {
                         hover.push_str(&r.it.path);
@@ -2696,6 +2751,10 @@ impl App {
             if let Some(r) = self.recover_rows.get_mut(i) {
                 r.pick = v && r.it.allowed && !r.it.protect;
             }
+        }
+        // 行尾按钮：点完立刻开跑，不等勾选、不弹确认（那一格就是「重启」本身）
+        if let Some((name, path, mb)) = one_click {
+            self.start_restart(vec![(name, path, mb)]);
         }
     }
 
@@ -4809,6 +4868,21 @@ impl eframe::App for App {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.scan_rx = None,
+            }
+        }
+        // 后台重启（关 → 等自愈/拉起 → 实测 3 秒）跑完了就收结果；没好的话 100ms 后再看
+        if self.restart_rx.is_some() {
+            let got = self.restart_rx.as_ref().unwrap().try_recv();
+            match got {
+                Ok(lines) => {
+                    self.restart_rx = None;
+                    self.status = lines.join("；");
+                    self.reload();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.restart_rx = None,
             }
         }
         // 每帧最多花 8ms 从系统取图标：一页几十个图标一次性取会把首帧卡住几百毫秒。

@@ -124,6 +124,36 @@ fn wait_until<F: FnMut() -> bool>(timeout_ms: u32, mut f: F) -> bool {
     }
 }
 
+/// 现在跑着的实例里，有没有「重启前不存在」的那一个。/// 判据是 (PID, 创建时间)，光看名字会把「没死」当成「又回来了」。
+fn has_new_instance(name: &str, before: &[ProcInstance]) -> bool {
+    processes_named(name)
+        .iter()
+        .any(|n| !before.iter().any(|b| b.pid == n.pid && b.created == n.created))
+}
+
+/// 重启前那批实例里，还有几个活着（可能只是换了个 PID 之外的一切都没变）
+fn live_survivors(name: &str, before: &[ProcInstance]) -> u32 {
+    processes_named(name)
+        .iter()
+        .filter(|n| before.iter().any(|b| b.pid == n.pid && b.created == n.created))
+        .count() as u32
+}
+
+/// 桌面外壳这一类：重启时必须保持中等完整性，提权版会坏掉拖放与部分扩展。
+fn is_shell_process(name: &str) -> bool {
+    [
+        "explorer",
+        "SearchHost",
+        "ShellHost",
+        "StartMenuExperienceHost",
+        "TextInputHost",
+        "ctfmon",
+        "sihost",
+    ]
+    .iter()
+    .any(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// 重启一个进程：关掉（先礼后兵）→ 必要时按快照里的 `Path` 拉起 → 等稳定 → 实测。
 ///
 /// `exe_path` 建议用快照里记的路径（和用户当初启动的是同一个），
@@ -192,30 +222,89 @@ pub fn restart_process(
         return rep;
     }
 
-    // 自愈检查：外壳级进程（SearchHost / explorer / 托盘宿主）会在几百毫秒内回来
-    let came_back = wait_until(800, || !processes_named(name).is_empty());
+    // 一个都没关掉（被保护集合跳过 / 压根没权限）：绝不当成「自愈」，
+    // 更要紧的是别在这里量前后内存差 —— 同一个进程的波动会被当成回收量报出去。
+    if cr.closed + cr.forced == 0 {
+        let after = processes_named(name);
+        let (amb, aunk) = total_ws(&after);
+        rep.after_instances = after.len() as u32;
+        rep.after_mb = amb;
+        rep.after_unknown = aunk;
+        rep.ok = rep.after_instances > 0;
+        rep.message = if cr.skipped > 0 {
+            format!(
+                "没有关掉任何实例：{} 个被跳过（{}），这一项其实没动",
+                cr.skipped,
+                cr.errors.first().cloned().unwrap_or_else(|| "保护集合".into())
+            )
+        } else if !after.is_empty() {
+            format!("没有关掉任何实例，{} 还在跑（权限不足？），这次没动它", name)
+        } else {
+            "动手之前它就已经退出了，不需要重启".to_string()
+        };
+        return rep;
+    }
+
+    // 自愈检查：只有「冒出一个**新**实例」才算自愈。
+    // 不能只看「这个名字还在」——旧进程没死透时那也成立，会把一次失败的关闭
+    // 报成「自愈重生」，还可能再拉起第二份。
+    let came_back = wait_until(800, || has_new_instance(name, &before));
     if came_back {
         rep.revived = true;
         rep.message = format!(
             "{} 被关掉后自己又起来了（外壳级自愈），没有重复拉起",
             name
         );
+    } else if live_survivors(name, &before) > 0 {
+        // 关闭报了成功但旧实例还在：宁可不动，也不要出现两个 shell
+        rep.message = format!(
+            "{} 关掉后旧实例还在跑，没有再拉一份（重启未生效）",
+            name
+        );
+        let after = processes_named(name);
+        let (amb, aunk) = total_ws(&after);
+        rep.after_instances = after.len() as u32;
+        rep.after_mb = amb;
+        rep.after_unknown = aunk;
+        rep.reclaimed_mb = round2(rep.before_mb - rep.after_mb);
+        rep.ok = rep.after_instances > 0;
+        return rep;
     } else {
-        let mut cmd = std::process::Command::new(&exe);
-        if let Some(dir) = Path::new(&exe).parent() {
-            cmd.current_dir(dir);
+        let dir = Path::new(&exe)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // 提权会话里的 CreateProcess 会让子进程继承高完整性。对 shell 来说这就是
+        // 「提权 explorer」：拖放被 UIPI 拦掉、部分扩展失效。这类进程改用同会话里
+        // 未提权的令牌拉起；借不到令牌就回退直接启动（宁可起来，也别黑着桌面）。
+        let mut launched = false;
+        if win::is_elevated() && is_shell_process(name) {
+            match win::spawn_with_user_token(&exe, &dir) {
+                Ok(_) => launched = true,
+                Err(e) => rep
+                    .errors
+                    .push(format!("借未提权令牌拉起失败，回退直接启动：{}", e)),
+            }
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(win::CREATE_NO_WINDOW);
-        }
-        match cmd.spawn() {
-            Ok(_) => rep.relaunched = true,
-            Err(e) => {
-                rep.errors.push(format!("拉起失败: {}", e));
-                rep.message = format!("已关闭，但拉起失败：{}", e);
-                return rep;
+        if launched {
+            rep.relaunched = true;
+        } else {
+            let mut cmd = std::process::Command::new(&exe);
+            if !dir.is_empty() {
+                cmd.current_dir(&dir);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(win::CREATE_NO_WINDOW);
+            }
+            match cmd.spawn() {
+                Ok(_) => rep.relaunched = true,
+                Err(e) => {
+                    rep.errors.push(format!("拉起失败: {}", e));
+                    rep.message = format!("已关闭，但拉起失败：{}", e);
+                    return rep;
+                }
             }
         }
     }
@@ -455,5 +544,23 @@ mod tests {
             ..Default::default()
         };
         assert!(r.reclaimed_text().contains("反而多占 12.3"));
+    }
+
+    /// 旧实例还在 ≠ 自愈：判据必须是 (PID, 创建时间) 变了。
+    /// 这条曾经把「根本没关掉」报成「自愈重生」，还顺带报了 7.9 MB 假回收。
+    #[test]
+    fn 同一个进程还在不算自愈() {
+        let exe = std::env::current_exe().expect("取当前 exe 路径");
+        let name = exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let before = processes_named(&name);
+        assert!(!before.is_empty(), "测试宿主自己应该在进程表里");
+        assert!(
+            !has_new_instance(&name, &before),
+            "还是那个进程，不该判成新实例"
+        );
+        assert!(live_survivors(&name, &before) >= 1, "旧实例应该还在");
     }
 }

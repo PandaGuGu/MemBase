@@ -1163,6 +1163,213 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// 进程所在会话（拿不到就当 0，调用方只做相等比较）
+fn session_of(pid: u32) -> u32 {
+    let mut sid: u32 = 0;
+    unsafe {
+        ProcessIdToSessionId(pid, &mut sid);
+    }
+    sid
+}
+
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    lpReserved: *mut u16,
+    lpDesktop: *mut u16,
+    lpTitle: *mut u16,
+    dwX: u32,
+    dwY: u32,
+    dwXSize: u32,
+    dwYSize: u32,
+    dwXCountChars: u32,
+    dwYCountChars: u32,
+    dwFillAttribute: u32,
+    dwFlags: u32,
+    wShowWindow: u16,
+    cbReserved2: u16,
+    lpReserved2: *mut u8,
+    hStdInput: HANDLE,
+    hStdOutput: HANDLE,
+    hStdError: HANDLE,
+}
+
+#[repr(C)]
+struct ProcessInfoW {
+    hProcess: HANDLE,
+    hThread: HANDLE,
+    dwProcessId: u32,
+    dwThreadId: u32,
+}
+
+/// 这些进程的令牌通常就是用户的中等完整性令牌，可以借来当模板。
+/// dwm 放最后：它一定在，但令牌里带的东西最多，成功率反而最低。
+const MEDIUM_TOKEN_HOSTS: &[&str] = &[
+    "sihost",
+    "StartMenuExperienceHost",
+    "ShellExperienceHost",
+    "TextInputHost",
+    "RuntimeBroker",
+    "ctfmon",
+    "SearchHost",
+    "dwm",
+];
+
+/// 借同会话、同账户、**未提权**的令牌创建进程，返回新进程 PID。
+///
+/// 为什么需要：MemBase 自己被提权时（右键「以管理员身份运行」），
+/// `CreateProcess` 出来的子进程会继承高完整性 —— `restart explorer` 就会造出一个
+/// 提权 shell：拖放被 UIPI 拦掉、部分 shell 扩展和输入法跟着出问题。
+/// 用中等完整性的令牌拉起，效果和任务管理器里「重新启动」一致。
+pub fn spawn_with_user_token(exe: &str, cwd: &str) -> Result<u32, String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn DuplicateTokenEx(
+            hExistingToken: HANDLE,
+            dwDesiredAccess: u32,
+            lpTokenAttributes: *mut c_void,
+            ImpersonationLevel: u32,
+            TokenType: u32,
+            phNewToken: *mut HANDLE,
+        ) -> BOOL;
+        fn CreateProcessWithTokenW(
+            hToken: HANDLE,
+            dwLogonFlags: u32,
+            lpApplicationName: *const u16,
+            lpCommandLine: *mut u16,
+            dwCreationFlags: u32,
+            lpEnvironment: *mut c_void,
+            lpCurrentDirectory: *const u16,
+            lpStartupInfo: *mut StartupInfoW,
+            lpProcessInformation: *mut ProcessInfoW,
+        ) -> BOOL;
+    }
+
+    const TOKEN_DUPLICATE: u32 = 0x0002;
+    /// 复制出来要给全权限：只给 ASSIGN_PRIMARY | DUPLICATE | QUERY 时
+    /// `CreateProcessWithTokenW` 直接返回 5（ACCESS_DENIED）—— 实测于 2026-10-23。
+    const TOKEN_ALL_ACCESS: u32 = 0x000F_01FF;
+    const SECURITY_IMPERSONATION: u32 = 2;
+    const TOKEN_PRIMARY: u32 = 1;
+    const LOGON_WITH_PROFILE: u32 = 1;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+
+    let me = std::process::id();
+    let my_session = session_of(me);
+    let my_user = open_process(me, PROCESS_QUERY_LIMITED_INFORMATION)
+        .map(|h| process_user(h.0))
+        .unwrap_or_default();
+
+    let mut tried = 0u32;
+    let mut last = String::new();
+    for pe in snapshot_processes() {
+        let pid = pe.th32ProcessID;
+        if pid == 0 || pid == 4 || pid == me {
+            continue;
+        }
+        let full = from_wide_buf(&pe.szExeFile);
+        let stem = full
+            .strip_suffix(".exe")
+            .or_else(|| full.strip_suffix(".EXE"))
+            .unwrap_or(&full);
+        if !MEDIUM_TOKEN_HOSTS.iter().any(|n| n.eq_ignore_ascii_case(stem)) {
+            continue;
+        }
+        if session_of(pid) != my_session {
+            continue;
+        }
+        let Some(ph) = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+            continue;
+        };
+        let user = process_user(ph.0);
+        if user.is_empty() || (!my_user.is_empty() && user != my_user) {
+            continue;
+        }
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(ph.0, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token) } == 0 {
+            continue;
+        }
+        // 已提权的令牌绝不拿来当模板，否则绕一圈还是提权 shell
+        let mut elev: u32 = 0;
+        let mut len: u32 = 0;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TOKEN_ELEVATION_CLASS,
+                &mut elev as *mut u32 as *mut c_void,
+                4,
+                &mut len,
+            )
+        };
+        if ok == 0 || elev != 0 {
+            unsafe {
+                CloseHandle(token);
+            }
+            continue;
+        }
+
+        let mut dup: HANDLE = std::ptr::null_mut();
+        let d = unsafe {
+            DuplicateTokenEx(
+                token,
+                TOKEN_ALL_ACCESS,
+                std::ptr::null_mut(),
+                SECURITY_IMPERSONATION,
+                TOKEN_PRIMARY,
+                &mut dup,
+            )
+        };
+        unsafe {
+            CloseHandle(token);
+        }
+        if d == 0 {
+            continue;
+        }
+
+        let mut cmd_line = wide(&format!("\"{}\"", exe));
+        let cwd_w = wide(cwd);
+        let mut si: StartupInfoW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<StartupInfoW>() as u32;
+        let mut pi: ProcessInfoW = unsafe { std::mem::zeroed() };
+        let created = unsafe {
+            CreateProcessWithTokenW(
+                dup,
+                LOGON_WITH_PROFILE,
+                std::ptr::null(),
+                cmd_line.as_mut_ptr(),
+                CREATE_UNICODE_ENVIRONMENT,
+                std::ptr::null_mut(),
+                if cwd.is_empty() {
+                    std::ptr::null()
+                } else {
+                    cwd_w.as_ptr()
+                },
+                &mut si,
+                &mut pi,
+            )
+        };
+        unsafe {
+            CloseHandle(dup);
+        }
+        tried += 1;
+        if created != 0 {
+            unsafe {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            return Ok(pi.dwProcessId);
+        }
+        last = format!("CreateProcessWithTokenW 失败，错误码 {}", last_error());
+    }
+
+    Err(if tried == 0 {
+        "没找到可当模板的未提权令牌（同会话里的用户进程也都是提权状态）".to_string()
+    } else {
+        last
+    })
+}
+
 /// 改服务的启动类型。要"下次开机别再起来"，这是唯一真的办法——
 /// 只 `ControlService(STOP)` 的话重启就回来了。
 pub fn set_service_start_mode(name: &str, start_type: u32) -> Result<(), String> {
@@ -1782,7 +1989,10 @@ pub fn protected_pids() -> Vec<u32> {
         }
     }
 
-    // 1) 父进程链
+    // 1) 父进程链。
+    //    explorer 例外：它是桌面外壳，不是「启动我的宿主应用」。从桌面双击启动时
+    //    它必然在链上，一旦被算进保护集合，`restart explorer` 就会被静默跳过
+    //    （杀掉外壳不会带走子进程，MemBase 自己不受影响）。
     let mut chain: Vec<u32> = Vec::new();
     let mut cur = std::process::id();
     for _ in 0..40 {
@@ -1795,7 +2005,15 @@ pub fn protected_pids() -> Vec<u32> {
             _ => break,
         }
     }
-    out.extend(chain.iter().copied());
+    for &pid in &chain {
+        let is_shell = names
+            .get(&pid)
+            .map(|n| n.eq_ignore_ascii_case("explorer"))
+            .unwrap_or(false);
+        if !is_shell && !out.contains(&pid) {
+            out.push(pid);
+        }
+    }
 
     // 2) 找链上最高的「外部应用」，保护它整棵子树
     let mut root: u32 = 0;

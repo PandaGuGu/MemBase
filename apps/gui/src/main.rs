@@ -281,6 +281,8 @@ struct App {
     lay_screen: String,
     lay_shell: bool,
     lay_cache: String,
+    /// 登录自动恢复任务里记的布局名；None = 没装任务
+    lay_autostart: Option<String>,
     /// 预览里叠「这些图标现在在哪」的蓝色虚线
     show_ghost: bool,
     ghost: Vec<IconPos>,
@@ -623,6 +625,7 @@ impl App {
             lay_screen: String::new(),
             lay_shell: false,
             lay_cache: String::new(),
+            lay_autostart: None,
             show_ghost: false,
             ghost: Vec::new(),
             plan_cache: None,
@@ -3427,6 +3430,7 @@ impl App {
         self.lay_screen = format!("{}×{}", w, h);
         self.lay_shell = ShellView::try_open().is_some();
         self.lay_cache = repair::describe_cache();
+        self.lay_autostart = membase_win::task::query_layout(membase_win::task::LAYOUT_TASK);
     }
 
     /// 差异只在选中项 / 桌面状态变化时重算：每帧读 explorer 内存太贵
@@ -3493,6 +3497,42 @@ impl App {
         }
     }
 
+    /// 开关「登录后自动恢复布局」：装/删计划任务，跑完即退，不做常驻
+    fn toggle_layout_autostart(&mut self) {
+        let task = membase_win::task::LAYOUT_TASK;
+        if self.lay_autostart.is_some() {
+            match membase_win::task::uninstall(task) {
+                Ok(()) => {
+                    self.lay_autostart = None;
+                    self.status = "已关闭「登录后自动恢复布局」".into();
+                }
+                Err(e) => self.status = format!("[x] 关闭失败：{}", e),
+            }
+            return;
+        }
+
+        let Some(entry) = self.current_layout() else {
+            self.status = "[x] 先选中一个布局".into();
+            return;
+        };
+        let name = entry.display_name().to_string();
+        let Ok(me) = std::env::current_exe() else {
+            self.status = "[x] 取不到自身路径".into();
+            return;
+        };
+        let root = std::path::PathBuf::from(membase_core::default_root());
+        match membase_win::task::install_layout(&me, &root, &name, 30, task) {
+            Ok(_) => {
+                self.lay_autostart = Some(name.clone());
+                self.status = format!(
+                    "已安排：登录后第 30 秒自动恢复到「{}」（需要管理员权限；跑完就退出）",
+                    name
+                );
+            }
+            Err(e) => self.status = format!("[x] 注册失败：{}", e),
+        }
+    }
+
     fn do_layout_restore(&mut self) {
         let Some(entry) = self.current_layout() else {
             self.status = "[x] 先选中一个布局".into();
@@ -3516,10 +3556,12 @@ impl App {
                 if !r.failed.is_empty() {
                     parts.push(format!("{} 个没摆到位", r.failed.len()));
                 }
-                parts.push(if r.used_shell_api {
-                    "位置已写入系统，重启后保持".into()
+                parts.push(if r.used_shell_api && r.refresh_guard {
+                    "已写进系统布局，按 F5 也不会乱".into()
+                } else if r.used_shell_api {
+                    "已摆好，但没关掉刷新重排，按 F5 会被打回".into()
                 } else {
-                    "只改了内存，重启可能被覆盖".into()
+                    "只改了内存，刷新或重启会丢".into()
                 });
                 self.status = format!("「{}」{}", name, parts.join(" · "));
                 self.refresh_layout_status();
@@ -3895,6 +3937,27 @@ impl App {
             }
 
             ui.add_space(8.0);
+            let auto_on = self.lay_autostart.is_some();
+            let auto_label = if auto_on { "关闭登录恢复" } else { "登录自动恢复" };
+            let resp = ui.add(btn(auto_label, 12.5, 124.0));
+            let resp = if auto_on {
+                resp.on_hover_text(format!(
+                    "登录后不再自动恢复布局（当前：{}）",
+                    self.lay_autostart.clone().unwrap_or_default()
+                ))
+            } else {
+                resp.on_hover_text(format!(
+                    "登录后第 30 秒自动把图标摆回选中布局（跑完就退出，不常驻）
+需要管理员权限
+同 CLI：{}",
+                    cli_map::cli_for("layout_autostart").unwrap_or("MemBase.exe layout autostart on <名字>")
+                ))
+            };
+            if resp.clicked() {
+                self.toggle_layout_autostart();
+            }
+
+            ui.add_space(8.0);
             let resp = ui.add(btn("刷新", 12.5, 64.0));
             let resp = resp.on_hover_text(format!(
                 "重读布局目录与桌面状态\n同 CLI：{}",
@@ -4055,19 +4118,19 @@ impl App {
                         ui.add_space(4.0);
                         let r = ui.add(btn_small("诊断接口", 76.0));
                         let r = r.on_hover_text(format!(
-                            "看 shell 官方接口能不能用（决定位置能否持久化）\n同 CLI：{}",
+                            "看 shell 官方接口能不能用（决定恢复能否精确摆位）\n同 CLI：{}",
                             cli_map::cli_for("layout_probe").unwrap_or("")
                         ));
                         if r.clicked() {
                             match ShellView::try_open() {
                                 Some(sv) => {
                                     self.status = format!(
-                                        "shell 桌面视图可用：{} 个条目，恢复会写入系统并持久化",
+                                        "shell 桌面视图可用：{} 个条目，恢复能精确摆位",
                                         sv.count()
                                     )
                                 }
                                 None => {
-                                    self.status = "shell 桌面视图拿不到：恢复会退回改内存，重启可能被覆盖".into()
+                                    self.status = "shell 桌面视图拿不到：恢复会退回改内存，刷新即丢".into()
                                 }
                             }
                             self.lay_shell = ShellView::try_open().is_some();
@@ -5566,6 +5629,14 @@ impl eframe::App for App {
                         )
                         .size(11.5)
                         .color(pal().amber),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "恢复会把位置写进系统布局，并关掉 shell 的「刷新时重新枚举」，\
+之后按 F5 不会再把图标打回原位。",
+                        )
+                        .size(11.5)
+                        .color(pal().muted),
                     );
                     ui.add_space(8.0);
                     ui.label(

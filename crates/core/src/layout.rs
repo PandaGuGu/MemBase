@@ -20,6 +20,81 @@ pub struct IconPos {
     pub y: i32,
 }
 
+/// 一块显示器的描述。`device` 用设备名（`\.\DISPLAY1`），
+/// 不用 `DISPLAY1` 这种序号——Windows 每次开机可能重新编号。
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct MonitorEntry {
+    #[serde(default)]
+    pub device: String,
+    /// 虚拟屏坐标系里的 left/top/right/bottom
+    #[serde(default)]
+    pub rect: [i32; 4],
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub dpi: u32,
+}
+
+/// 保存布局时的显示器配置。坐标只在同一套配置下才有意义。
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct DisplayInfo {
+    /// 整个虚拟屏的 left/top/right/bottom（副屏在主屏左边时 left 是负数）
+    #[serde(default)]
+    pub virtual_screen: [i32; 4],
+    #[serde(default)]
+    pub monitors: Vec<MonitorEntry>,
+}
+
+impl DisplayInfo {
+    pub fn width(&self) -> i32 {
+        self.virtual_screen[2] - self.virtual_screen[0]
+    }
+
+    pub fn height(&self) -> i32 {
+        self.virtual_screen[3] - self.virtual_screen[1]
+    }
+
+    /// 一句话描述，给界面和命令行看
+    pub fn summary(&self) -> String {
+        if self.monitors.is_empty() {
+            return format!("{}×{}", self.width(), self.height());
+        }
+        let mut s = format!("{}×{} · {} 屏", self.width(), self.height(), self.monitors.len());
+        for m in &self.monitors {
+            s.push_str(&format!(
+                " · {}×{}{}{}",
+                m.rect[2] - m.rect[0],
+                m.rect[3] - m.rect[1],
+                if m.primary { "主" } else { "" },
+                if m.dpi > 0 { format!("@{}dpi", m.dpi) } else { String::new() }
+            ));
+        }
+        s
+    }
+
+    /// 硬件配置是否一致：屏数、每块屏的设备名、尺寸、主屏归属。
+    /// 位置（left/top）也算——副屏换到另一边坐标就不成立了。
+    pub fn same_hardware(&self, other: &Self) -> bool {
+        if self.monitors.len() != other.monitors.len() {
+            return false;
+        }
+        let mut mine: Vec<&MonitorEntry> = self.monitors.iter().collect();
+        let mut theirs: Vec<&MonitorEntry> = other.monitors.iter().collect();
+        let key = |m: &MonitorEntry| {
+            (
+                m.device.to_lowercase(),
+                m.rect[2] - m.rect[0],
+                m.rect[3] - m.rect[1],
+                m.primary,
+                m.dpi,
+            )
+        };
+        mine.sort_by_key(|m| key(m));
+        theirs.sort_by_key(|m| key(m));
+        mine.iter().zip(theirs.iter()).all(|(a, b)| key(a) == key(b))
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Layout {
     #[serde(default)]
@@ -32,6 +107,9 @@ pub struct Layout {
     pub auto_arrange: bool,
     #[serde(default)]
     pub icons: Vec<IconPos>,
+    /// 保存时的显示器配置；老布局没有这个字段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayInfo>,
 }
 
 impl Layout {
@@ -76,7 +154,7 @@ pub struct RestoreResult {
     pub moved: usize,
     /// 重试轮数
     pub rounds: usize,
-    /// 是否用上了 shell 官方接口（能持久化）
+    /// 是否用上了 shell 官方接口（摆得准，但扛不住 F5 —— 见 shellview.rs 头注释）
     pub used_shell_api: bool,
     /// 恢复前是否帮你关掉了自动排列
     pub auto_arrange_disabled: bool,
@@ -86,6 +164,13 @@ pub struct RestoreResult {
     pub extra: Vec<String>,
     /// 多轮重试后仍然摆不到位的
     pub failed: Vec<String>,
+    /// 是否成功关掉 shell 的「刷新时重新枚举」（关掉后按 F5 不会重排）
+    pub refresh_guard: bool,
+    /// 保存布局时的显示器配置与当前不一致（坐标可能不准）
+    pub display_changed: bool,
+    /// 两边的配置描述，给界面提示用
+    pub saved_display: Option<String>,
+    pub current_display: Option<String>,
 }
 
 /// 恢复前的差异预览

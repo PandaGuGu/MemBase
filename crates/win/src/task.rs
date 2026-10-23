@@ -285,3 +285,135 @@ mod tests {
         assert_eq!(xml_unescape(&xml_escape(raw)), raw);
     }
 }
+
+// ---------------------------------------------------------------- 开机自动恢复桌面布局
+
+/// 开机自动恢复布局的任务名（和采集任务分开，互不影响）
+pub const LAYOUT_TASK: &str = "MemBaseLayout";
+
+fn layout_task_xml(exe: &Path, layout: &str, delay_sec: u64) -> String {
+    let exe_s = xml_escape(&exe.to_string_lossy());
+    let args_s = xml_escape(&format!(
+        "layout restore \"{}\" --execute --yes --wait 180 --settle 45 --retries 3",
+        layout
+    ));
+    let desc = format!(
+        "登录后第 {delay} 秒把桌面图标摆回布局「{layout}」（membase）",
+        delay = delay_sec,
+        layout = layout
+    );
+    // 不写 <Principals>：schtasks 会按当前用户、交互式令牌注册，
+    // 布局恢复必须跑在用户会话里才看得到桌面，用 SYSTEM 是无效的。
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{desc}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT{delay}S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{exe}</Command><Arguments>{args}</Arguments></Exec>
+  </Actions>
+</Task>
+"#,
+        desc = xml_escape(&desc),
+        exe = exe_s,
+        args = args_s,
+        delay = delay_sec
+    )
+}
+
+/// 注册「登录后自动恢复布局」任务；exe 会复制到数据目录，路径不会因为挪动原文件而失效。
+pub fn install_layout(
+    src_exe: &Path,
+    out: &Path,
+    layout: &str,
+    delay_sec: u64,
+    task: &str,
+) -> Result<PathBuf, String> {
+    let task = if task.trim().is_empty() { LAYOUT_TASK } else { task.trim() };
+    if !src_exe.is_file() {
+        return Err(format!("找不到可执行文件：{}", src_exe.display()));
+    }
+    if layout.trim().is_empty() {
+        return Err("布局名字不能为空".into());
+    }
+    fs::create_dir_all(out).map_err(|e| format!("建目录失败: {e}"))?;
+    let target = out.join("membase.exe");
+    let same = match (src_exe.canonicalize(), target.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same {
+        fs::copy(src_exe, &target).map_err(|e| format!("复制 exe 失败: {e}"))?;
+    }
+
+    let xml = layout_task_xml(&target, layout, delay_sec);
+    let tmp = std::env::temp_dir().join(format!("membase_layout_task_{}.xml", std::process::id()));
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+    for u in xml.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(&tmp, &bytes).map_err(|e| format!("写 XML 失败: {e}"))?;
+
+    let st = Command::new("schtasks")
+        .args(["/Create", "/TN", task, "/XML", &tmp.to_string_lossy(), "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = fs::remove_file(&tmp);
+
+    match st {
+        Ok(s) if s.success() => Ok(target),
+        Ok(_) => Err("注册失败：需要管理员权限".into()),
+        Err(e) => Err(format!("调用 schtasks 失败: {e}")),
+    }
+}
+
+/// 查「登录自动恢复」任务里记的布局名；没装任务返回 None
+pub fn query_layout(task: &str) -> Option<String> {
+    let task = if task.trim().is_empty() { LAYOUT_TASK } else { task.trim() };
+    let out = Command::new("schtasks")
+        .args(["/Query", "/TN", task, "/XML"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let xml = decode(&out.stdout);
+    let args = tag_text(&xml, "Arguments")?;
+    let lowered = args.to_lowercase();
+    let pos = lowered.find("layout restore")?;
+    let rest = &args[pos + "layout restore".len()..];
+    let rest = rest.trim_start();
+    let name = if let Some(stripped) = rest.strip_prefix('"') {
+        stripped.split('"').next()?.to_string()
+    } else {
+        rest.split_whitespace().next()?.to_string()
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}

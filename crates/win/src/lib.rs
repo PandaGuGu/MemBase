@@ -12,6 +12,7 @@ pub mod actions;
 pub mod close;
 pub mod compare;
 pub mod desktop;
+pub mod display;
 pub mod gui_icon;
 pub mod repair;
 pub mod restart;

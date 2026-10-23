@@ -1559,7 +1559,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("baseline", "基准线：查看/校验/采集当前态/导出/导入", "info|verify|capture|export|import [包] [--to FILE] [--label NAME]", "all"),
     ("install", "注册开机计划任务", "--out --at --task", "windows"),
     ("uninstall", "删除开机计划任务", "--task", "windows"),
-    ("layout", "桌面图标布局：保存/差异/恢复/修复缓存", "list|save|restore|diff|show|delete|status|probe|repair|dir [名字] [--execute --yes --positions --open]", "windows"),
+    ("layout", "桌面图标布局：保存/差异/恢复/修复缓存", "list|save|restore|diff|show|delete|status|probe|repair|dir|flags [名字] [--execute --yes --positions --open --snap-grid on|off]", "windows"),
     ("theme", "外观：查看/切换浅色深色", "get|set light|dark", "all"),
     ("screen", "息屏：只关显示器，不锁屏（热键退出 / 定时自动亮）", "off|status|duration|key [--seconds N --exit-key K --delay N --dry-run]", "windows"),
     ("ui", "打开界面（可指定落在哪一页）", "--page layouts|baseline|protect|boot|cli|tools|settings", "windows"),

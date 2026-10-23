@@ -112,6 +112,43 @@ pub fn repair() -> Result<Option<RepairInfo>> {
     }))
 }
 
+/// 读桌面视图的 FFlags（REG_DWORD）；读不到返回 None
+pub fn read_fflags() -> Option<u32> {
+    let key = Key::open(KEY_READ).ok()?;
+    let name = to_wide("FFlags");
+    let mut ty: u32 = 0;
+    let mut val: u32 = 0;
+    let mut cb: u32 = 4;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key.0,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            &mut val as *mut u32 as *mut u8,
+            &mut cb,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    Some(val)
+}
+
+/// 写回 FFlags（REG_DWORD）。运行时的 SetCurrentFolderFlags 在 explorer 被强杀时不落盘，
+/// 直接写注册表可以让「刷新不重排」这个开关跨重启保留。
+pub fn write_fflags(v: u32) -> Result<()> {
+    let key = Key::open(KEY_SET_VALUE).context("打开注册表写入权限失败")?;
+    let name = to_wide("FFlags");
+    let rc = unsafe {
+        RegSetValueExW(key.0, name.as_ptr(), 0, REG_DWORD, &v as *const u32 as *const u8, 4)
+    };
+    if rc != ERROR_SUCCESS {
+        anyhow::bail!("写入 FFlags 失败（错误 {}）", rc);
+    }
+    Ok(())
+}
+
 /// 仅做诊断：缓存是否存在、多大
 pub fn describe_cache() -> String {
     match read_icon_layouts() {

@@ -743,7 +743,7 @@ def check_consistency():
     actions = doc['gui_actions']
 
     # 界面动作表条数：加/删按钮时同步这个数（表的用途是防「加了按钮忘了配命令」）
-    expect_actions = 37
+    expect_actions = 38
     add(G, 'gui_actions 数量', 'commands --json', expect_actions, len(actions),
         len(actions) == expect_actions)
     keys = [a['key'] for a in actions]

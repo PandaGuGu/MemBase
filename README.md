@@ -137,7 +137,19 @@ MemBase.exe status                         # 会列出这次开机的所有采�
 - 悬停看名字：图标缩小后认不出，鼠标停上去显示名称
 - 叠加当前位置：蓝色虚线标出这次恢复会移动的图标现在在哪
 - 差异条：`会动 N · 已消失 N · 新增 N · shell 接口 可用/不可用 · 布局缓存 N 字节`
-- 恢复优先走 shell 官方接口（能持久化），不可用时退回改 explorer 内存，并提示「重启可能被覆盖」
+- 恢复优先走 shell 官方接口（`IFolderView::SelectAndPositionItems`），不可用时退回改 explorer 内存
+- **按 F5 不再被打回**：恢复时会用 `IFolderView2::SetCurrentFolderFlags` 打开
+  `FWF_NOENUMREFRESH`（0x80000），shell 刷新时不再重新枚举图标，位置原地不动。
+  实测同一份布局：开这个标志 → F5 后 0 差异；关掉 → F5 后 63～66 个图标被重排
+- 这个开关由 explorer 在运行时持有，**重启资源管理器后会失效**，所以每次恢复都会重新打开它，
+  并同步写入 `Bags\Desktop\FFlags`
+- 重启资源管理器后 shell 仍会按自己的记录摆一部分（实测固定 39 项），
+  需要再恢复一次；登录任务就是干这个的
+- 每份布局记「显示器指纹」（虚拟屏边界 + 每块屏设备名/尺寸/主屏/DPI），换屏或改缩放后恢复会先提示
+- `layout autostart on <名字>` 装一个**登录后跑一次**的计划任务（延迟 30 秒，跑完就退出）：
+  不常驻、不轮询、不占资源。命令带 `--wait 180`，等 shell 接口就绪再摆；
+  失败会按 `RestartOnFailure` 再试 3 次。`off` 取消，`status` 查看
+- 界面布局页也有「登录自动恢复」按钮，效果相同
 - 修复缓存只在「每次重启固定错乱同一批图标」时使用，先备份注册表值再删除
 
 ![浅色主题](docs/screenshots/layouts-light.png)
@@ -182,6 +194,8 @@ MemBase.exe layout save 工作
 MemBase.exe layout diff 工作 --positions
 MemBase.exe layout restore 工作 --execute --yes
 MemBase.exe layout repair --execute --yes
+MemBase.exe layout flags --snap-grid on|off
+MemBase.exe layout autostart on 工作
 
 # 息屏
 MemBase.exe screen off --seconds 90 --exit-key space
@@ -255,20 +269,24 @@ cargo build --workspace --release
 # target\release\MemBase.exe   唯一产物：界面（带参数即命令行）
 
 cargo test -p membase-core    # 73 个纯逻辑测试
-cargo test -p membase-win     # 15 个平台层测试（1 个需真实桌面会话的用例默认忽略）
+cargo test -p membase-win     # 17 个平台层测试（1 个需真实桌面会话的用例默认忽略）
 python tools/verify.py        # 129 项全量验收（命令行动词 + 每页截图 + 动作表一致性）
 python tools/verify.py --fast # 跳过 11 页截图与黑屏层，只验命令行，约 10 秒
 ```
 
 `tools/verify.py` 会真跑每个命令和每一页：写盘指向临时目录，危险动作只验护栏，改过的配置全部还原。
-最新结果：[docs/verify-1.2.1.md](docs/verify-1.2.1.md)（129 项全量）、
-[docs/verify-1.2.0.md](docs/verify-1.2.0.md)（124 项全量）。
+最新结果：[docs/verify-1.3.0.md](docs/verify-1.3.0.md)（129 项全量）；
+测试集怎么分层、每层怎么跑、判定标准见 [docs/tests.md](docs/tests.md)。
 
 ## 已知限制
 
 - 图标按显示名匹配：改名或删除的文件不会恢复，新加的图标保持原位
 - 跨进程读写 explorer 内存，杀软可能报毒，加白名单即可
 - shell 接口不可用时恢复只改内存，重启可能被系统覆盖
+- 重启资源管理器后 shell 会先按自己的记录铺一遍（本机实测固定 39 项错位），
+  需要再恢复一次；登录任务就是干这个的（`layout autostart on <名字>`）
+- 「刷新时不重新枚举」这个开关由 explorer 运行时持有，每次恢复都会重新打开它，
+  重启后会失效——所以登录任务必须在，否则开机后第一次按 F5 仍会被重排
 - 在别的分辨率或缩放下保存的布局，坐标可能被网格吸附
 - 动态壁纸的预览取到的是当前帧
 - 未提权采集时大量进程内存读不到，这类基准只能看名单、不能比内存（`system.json` 的 `Elevated` 会标出来）

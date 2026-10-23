@@ -52,6 +52,13 @@ pub const SHGFI_PIDL: u32 = 0x0000_0008;
 pub const SHGFI_SYSICONINDEX: u32 = 0x0000_4000;
 pub const SHGDN_INFOLDER: u32 = 0x0001;
 pub const SVSI_POSITIONITEM: u32 = 0x0080;
+pub const SVSI_SELECT: u32 = 0x0001;
+pub const SVSI_DESELECTOTHERS: u32 = 0x0004;
+/// 桌面视图标志（就是 Bags 里 FFlags 的那套位）
+pub const FWF_AUTOARRANGE: u32 = 0x0000_0001;
+pub const FWF_SNAPTOGRID: u32 = 0x0000_0004;
+/// 内容变化时不要重新枚举（刷新时保留现有布局）
+pub const FWF_NOENUMREFRESH: u32 = 0x0008_0000;
 pub const SWC_DESKTOP: i32 = 8;
 pub const SWFO_NEEDDISPATCH: i32 = 1;
 pub const SHIL_LARGE: i32 = 0;
@@ -67,6 +74,7 @@ pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 // ---------------------------------------------------------------- 注册表
 pub const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
 pub const KEY_READ: u32 = 0x2_0019;
+pub const REG_DWORD: u32 = 4;
 pub const KEY_SET_VALUE: u32 = 0x0002;
 pub const REG_BINARY: u32 = 3;
 pub const ERROR_SUCCESS: i32 = 0;
@@ -94,6 +102,26 @@ pub struct RECT {
     pub right: i32,
     pub bottom: i32,
 }
+
+/// 显示器枚举回调用的结构（MONITORINFOEXW）
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct MONITORINFOEXW {
+    pub cb_size: u32,
+    pub rc_monitor: RECT,
+    pub rc_work: RECT,
+    pub flags: u32,
+    pub device: [u16; 32],
+}
+
+pub const MONITORINFOF_PRIMARY: u32 = 1;
+pub const SM_XVIRTUALSCREEN: i32 = 76;
+pub const SM_YVIRTUALSCREEN: i32 = 77;
+pub const SM_CXVIRTUALSCREEN: i32 = 78;
+pub const SM_CYVIRTUALSCREEN: i32 = 79;
+
+pub type HMONITOR = isize;
+pub type MONITORENUMPROC = extern "system" fn(HMONITOR, HDC, *mut RECT, LPARAM) -> BOOL;
 
 /// 64 位下的 LVITEMW 布局（与 C# / ctypes 版一致）
 #[repr(C)]
@@ -199,6 +227,12 @@ pub const IID_IFOLDERVIEW: GUID = GUID {
     data2: 0xCCC9,
     data3: 0x4519,
     data4: [0x91, 0x7E, 0x32, 0x5D, 0x72, 0xFA, 0xB4, 0xCE],
+};
+pub const IID_IFOLDERVIEW2: GUID = GUID {
+    data1: 0x1AF3_A467,
+    data2: 0x214F,
+    data3: 0x4298,
+    data4: [0x90, 0x8E, 0x06, 0xB0, 0x3E, 0x0B, 0x39, 0xF9],
 };
 pub const IID_ISHELLFOLDER: GUID = GUID {
     data1: 0x0002_14E6,
@@ -310,6 +344,10 @@ extern "system" {
     pub fn GetWindowLongW(hwnd: HWND, index: i32) -> i32;
     pub fn SetWindowLongW(hwnd: HWND, index: i32, value: i32) -> i32;
     pub fn GetSystemMetrics(index: i32) -> i32;
+    pub fn EnumDisplayMonitors(hdc: HDC, clip: *const RECT, proc_: MONITORENUMPROC, data: LPARAM) -> BOOL;
+    pub fn GetMonitorInfoW(hmon: HMONITOR, info: *mut MONITORINFOEXW) -> BOOL;
+    pub fn GetDesktopWindow() -> HWND;
+    pub fn GetDpiForWindow(hwnd: HWND) -> u32;
     pub fn SetProcessDpiAwarenessContext(ctx: isize) -> BOOL;
     pub fn DestroyIcon(icon: HICON) -> BOOL;
     pub fn GetIconInfo(icon: HICON, info: *mut ICONINFO) -> BOOL;
@@ -361,6 +399,7 @@ extern "system" {
 extern "system" {
     pub fn RegOpenKeyExW(key: isize, sub: *const u16, options: u32, sam: u32, out: *mut isize) -> i32;
     pub fn RegQueryValueExW(key: isize, name: *const u16, reserved: *mut u32, ty: *mut u32, data: *mut u8, cb: *mut u32) -> i32;
+    pub fn RegSetValueExW(key: isize, name: *const u16, reserved: u32, ty: u32, data: *const u8, cb: u32) -> i32;
     pub fn RegDeleteValueW(key: isize, name: *const u16) -> i32;
     pub fn RegCloseKey(key: isize) -> i32;
 }
@@ -437,8 +476,8 @@ pub struct IFolderViewVtbl {
     pub query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     pub release: unsafe extern "system" fn(*mut c_void) -> u32,
-    pub get_current_view_mode: usize,
-    pub set_current_view_mode: usize,
+    pub get_current_view_mode: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+    pub set_current_view_mode: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
     pub get_folder: usize,
     pub item: unsafe extern "system" fn(*mut c_void, i32, *mut *mut ITEMIDLIST) -> HRESULT,
     pub item_count: unsafe extern "system" fn(*mut c_void, u32, *mut i32) -> HRESULT,
@@ -448,10 +487,42 @@ pub struct IFolderViewVtbl {
     pub get_item_position: unsafe extern "system" fn(*mut c_void, *const ITEMIDLIST, *mut POINT) -> HRESULT,
     pub get_spacing: usize,
     pub get_default_spacing: usize,
-    pub get_auto_arrange: usize,
-    pub select_item: usize,
+    pub get_auto_arrange: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+    pub select_item: unsafe extern "system" fn(*mut c_void, i32, u32) -> HRESULT,
     pub select_and_position_items:
         unsafe extern "system" fn(*mut c_void, u32, *const *const ITEMIDLIST, *const POINT, u32) -> HRESULT,
+}
+
+/// IFolderView2：比 IFolderView 多了视图标志（自动排列 / 对齐网格等）的读写。
+/// 前 16 个槽与 IFolderView 一致，后面才是新方法。
+#[repr(C)]
+pub struct IFolderView2Vtbl {
+    pub query_interface: usize,
+    pub add_ref: usize,
+    pub release: usize,
+    pub get_current_view_mode: usize,
+    pub set_current_view_mode: usize,
+    pub get_folder: usize,
+    pub item: usize,
+    pub item_count: usize,
+    pub items: usize,
+    pub get_selection_marked_item: usize,
+    pub get_focused_item: usize,
+    pub get_item_position: usize,
+    pub get_spacing: usize,
+    pub get_default_spacing: usize,
+    pub get_auto_arrange: usize,
+    pub select_item: usize,
+    pub select_and_position_items: usize,
+    pub set_group_by: usize,
+    pub get_group_by: usize,
+    pub set_view_property: usize,
+    pub get_view_property: usize,
+    pub set_tile_view_properties: usize,
+    pub set_extended_tile_view_properties: usize,
+    pub set_text: usize,
+    pub set_current_folder_flags: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT,
+    pub get_current_folder_flags: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
 }
 
 #[repr(C)]

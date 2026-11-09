@@ -14,7 +14,7 @@ use membase_win::gui_icon::{self, IconProvider};
 use membase_win::task::{self as boot, TaskInfo};
 use membase_win::desktop::Desktop;
 use membase_win::{actions, close, repair, restart, shellview::ShellView, snapshot, startup, win};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -153,6 +153,141 @@ struct ReclaimRow {
     pick: bool,
 }
 
+/// 「重启选项」页的动作：同一份目标清单，三种处理方式。
+/// 和「可回收」页的一键重启是同一个后端，只是把力度与等待摊开来给人选。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestartMode {
+    /// 关掉 → 按原路径拉起（默认，也是唯一能「回收」的动作）
+    Restart,
+    /// 只关闭，不拉起
+    CloseOnly,
+    /// 只拉起：只对「基准里有、现在没跑」的项有意义
+    LaunchOnly,
+}
+
+impl RestartMode {
+    fn label(self) -> &'static str {
+        match self {
+            RestartMode::Restart => "关掉再拉起",
+            RestartMode::CloseOnly => "只关闭",
+            RestartMode::LaunchOnly => "只拉起",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            RestartMode::Restart => "重启",
+            RestartMode::CloseOnly => "关闭",
+            RestartMode::LaunchOnly => "拉起",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            RestartMode::Restart => "关掉 → 按原路径拉起 → 等够时间再量一次，报实测回收量",
+            RestartMode::CloseOnly => "只关不拉：适合「关掉就不该再回来」的东西，回收量同样实测",
+            RestartMode::LaunchOnly => "只把基准里记着、现在没跑的进程叫回来；已经在跑的不重复拉起",
+        }
+    }
+}
+
+/// 一次动作的结果（「重启选项」页的「最近一次」列表）。
+/// 和 `RestartReport` 的区别：这里只留界面要显示的几个数，不把整个报告搬进 UI。
+struct RestartHit {
+    name: String,
+    line: String,
+    before_mb: f64,
+    after_mb: f64,
+    reclaimed_mb: f64,
+    ok: bool,
+    revived: bool,
+}
+
+/// 「只拉起」的候选：基准里记着、现在却没在跑，且路径还在。
+struct LaunchRow {
+    name: String,
+    path: String,
+    /// 基准那一刻的工作集，用来排序和展示「预计回来多少」
+    base_mb: f64,
+    base_instances: u32,
+    pick: bool,
+}
+
+/// 逐项变化：一个一个程序 / 服务，开机那一刻 vs 此刻。
+///
+/// 进程按名字聚合（多实例合计）；服务按**宿主工作集**算 —— svchost 是共享宿主，
+/// 同一宿主上的服务共用一份内存，所以整族折成一行，不重复记账。
+struct GrowthRow {
+    kind: &'static str,
+    name: String,
+    base_mb: f64,
+    live_mb: f64,
+    delta_mb: f64,
+    /// 一句话说明：共享宿主 / 基准里没有 / 已经退出 / 内存读不到
+    note: &'static str,
+    /// 任一侧有实例读不到内存：差值不可比，不当成 0
+    unknown: bool,
+    /// 本工具自身：计入总账，但不进任何处理清单
+    protected: bool,
+}
+
+/// 基准 vs 此刻的汇总口径。
+///
+/// 两个时刻都用**整机已用物理内存**做总账，进程工作集合计只是其中一块；
+/// 本工具自身（MemBase）**计入**总数 —— 它是用户真实付掉的内存，
+/// 但它永远不进任何处理清单（受保护）。
+#[derive(Clone, Default)]
+struct BaselineCmp {
+    base_captured: String,
+    /// 基准采集于开机第几秒
+    base_uptime: u64,
+    /// 此刻已开机多少秒
+    live_uptime: u64,
+    base_total_mb: f64,
+    base_used_mb: f64,
+    base_proc_mb: f64,
+    base_proc_count: u32,
+    base_proc_names: usize,
+    base_svc_running: usize,
+    /// 基准里有几个进程名内存读不到（这些项的工作集是残缺的）
+    base_unknown: usize,
+    live_total_mb: f64,
+    live_used_mb: f64,
+    live_proc_mb: f64,
+    live_proc_count: u32,
+    live_proc_names: usize,
+    live_svc_running: usize,
+    live_unknown: usize,
+    /// 本工具自身：PID 与工作集
+    self_pid: u32,
+    self_mb: f64,
+}
+
+impl BaselineCmp {
+    /// 整机已用的变化（此刻 − 开机基准），正数 = 比开机时多占了
+    fn used_delta(&self) -> f64 {
+        self.live_used_mb - self.base_used_mb
+    }
+
+    fn proc_delta(&self) -> f64 {
+        self.live_proc_mb - self.base_proc_mb
+    }
+
+    /// 基准是不是热快照（开机 15 分钟后才采的，不能当「刚开机」看）
+    fn hot(&self) -> bool {
+        self.base_uptime > 900
+    }
+
+    /// 整机已用的百分比（用来写字，不参与计算）
+    fn used_pct(&self, used: f64, total: f64) -> f64 {
+        if total > 0.0 {
+            used / total * 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
 /// 一次「读基准 + 枚举进程/服务 + 算线外清单 + 算增长项」的结果。
 /// 纯数据：启动时丢给后台线程算，算完再换进界面。
 struct Scan {
@@ -168,15 +303,25 @@ struct Scan {
     collect_from_base: bool,
     /// 找不到基准时的提示（有值才写进状态栏）
     missing: Option<String>,
+    /// 基准 vs 此刻的汇总（「基准对比」标签用）
+    cmp: BaselineCmp,
+    /// 逐项变化（程序 / 服务），按变化从大到小
+    growth: Vec<GrowthRow>,
+    /// 「只拉起」的候选（基准里有、现在没跑）
+    launch: Vec<LaunchRow>,
 }
 
-/// 进程页的两个标签
+/// 进程页的四个标签
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProcTab {
     /// 基准里没有、现在在跑（trim）
     Outliers,
     /// 基准里就有、但当前有增长（restart）
     Recover,
+    /// 重启选项：动作 / 力度 / 等待都能换
+    Restart,
+    /// 内存基准线对比：开机那一刻 vs 此刻
+    Compare,
 }
 
 /// 左侧导航的页面
@@ -263,8 +408,8 @@ struct App {
     shot_path: Option<String>,
     /// 启动时后台扫描的结果接收端（None = 已经拿到或还没开始）
     scan_rx: Option<mpsc::Receiver<Scan>>,
-    /// 后台执行「实测重启」的结果接收端（每项一行报告；None = 没在跑）
-    restart_rx: Option<mpsc::Receiver<Vec<String>>>,
+    /// 后台执行「实测重启」的结果接收端（每项一条记录；None = 没在跑）
+    restart_rx: Option<mpsc::Receiver<Vec<RestartHit>>>,
     /// 已经按哪个主题灌过 Visuals（None = 还没灌过）
     themed_for: Option<bool>,
     /// 当前页（左侧导航）
@@ -330,6 +475,25 @@ struct App {
 
     // ---------------- 进程页：局部重启 ----------------
     confirm_restart: bool,
+
+    // ---------------- 进程页：重启选项 ----------------
+    restart_mode: RestartMode,
+    /// 直接强制：跳过 WM_CLOSE 宽限，直接终止
+    restart_force: bool,
+    /// 动作做完后等多少毫秒再量工作集
+    restart_settle: u32,
+    /// 最近一次动作的逐项结果（只留最近一批）
+    restart_log: Vec<RestartHit>,
+    /// 「重启选项」执行前的确认弹窗
+    confirm_restart_opts: bool,
+
+    // ---------------- 进程页：基准对比 ----------------
+    cmp: BaselineCmp,
+    /// 逐项变化（程序 / 服务）
+    growth: Vec<GrowthRow>,
+    /// 明细表是否连下降 / 持平一起看（默认只看上涨）
+    cmp_all: bool,
+    launch_rows: Vec<LaunchRow>,
 
     // ---------------- 开机采集：双采样 ----------------
     boot_also: bool,
@@ -457,6 +621,183 @@ fn reclaim_warning(name: &str) -> &'static str {
     } else {
         ""
     }
+}
+
+/// 「只拉起」的候选：基准 `processes.csv` 里有路径、现在却没在跑的进程。
+///
+/// 只用基准自己的记录，不按名字猜：没有 `Path` 的项根本起不来，直接不列。
+/// 本工具自身永远不进候选（受保护，拉起第二份没有意义）。
+/// 按基准工作集从大到小，最多 40 项 —— 这页是给人挑的，不是批处理清单。
+fn launch_candidates(
+    base_dir: &std::path::Path,
+    live: &std::collections::BTreeSet<String>,
+) -> Vec<LaunchRow> {
+    let text = std::fs::read_to_string(base_dir.join("processes.csv")).unwrap_or_default();
+    let rows = core::csv_parse(&text);
+    let Some(h) = rows.first() else {
+        return Vec::new();
+    };
+    let (Some(i_n), Some(i_p)) = (
+        core::col_index(h, "ProcessName"),
+        core::col_index(h, "Path"),
+    ) else {
+        return Vec::new();
+    };
+    let i_w = core::col_index(h, "WorkingSetMB");
+    let mut map: BTreeMap<String, LaunchRow> = BTreeMap::new();
+    for r in rows.iter().skip(1) {
+        let name = r.get(i_n).cloned().unwrap_or_default();
+        let path = r.get(i_p).cloned().unwrap_or_default();
+        if name.is_empty() || path.trim().is_empty() {
+            continue;
+        }
+        if live.contains(&name.to_lowercase()) || name.eq_ignore_ascii_case("membase") {
+            continue;
+        }
+        let mb = i_w
+            .and_then(|i| r.get(i))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let e = map.entry(name.to_lowercase()).or_insert_with(|| LaunchRow {
+            name: name.clone(),
+            path: path.clone(),
+            base_mb: 0.0,
+            base_instances: 0,
+            pick: false,
+        });
+        e.base_mb += mb;
+        e.base_instances += 1;
+    }
+    let mut out: Vec<LaunchRow> = map
+        .into_values()
+        .filter(|r| std::path::Path::new(&r.path).exists())
+        .collect();
+    out.sort_by(|a, b| {
+        b.base_mb
+            .partial_cmp(&a.base_mb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(40);
+    out
+}
+
+/// 逐项变化：每个程序 / 每个服务宿主，开机那一刻 vs 此刻。
+///
+/// 进程按名字聚合（多实例合计），基准里没有、现在在跑的算「新跑起来」；
+/// 服务不按服务名逐个记账 —— svchost 上挂着几十个服务共用一份内存，
+/// 逐个列等于把同一份 200 MB 算成几十份，所以整族折成一行，专宿主的服务单独列。
+fn build_growth_rows(
+    base_dir: &std::path::Path,
+    snap: &snapshot::Snapshot,
+    base_procs: &BTreeMap<String, core::ProcAgg>,
+) -> Vec<GrowthRow> {
+    let mut out: Vec<GrowthRow> = Vec::new();
+
+    // ---- 进程 ----
+    let mut live: BTreeMap<String, core::ProcAgg> = BTreeMap::new();
+    for p in &snap.procs {
+        let e = live.entry(p.name.clone()).or_default();
+        e.instances += 1;
+        match p.ws_mb {
+            Some(v) => e.ws_mb += v,
+            None => e.unknown += 1,
+        }
+    }
+    for d in core::diff_procs(base_procs, &live) {
+        let (note, unknown) = match d.kind {
+            core::DeltaKind::New => ("基准里没有（本次新跑起来）", false),
+            core::DeltaKind::Gone => ("已退出", false),
+            core::DeltaKind::Down => ("比开机更少", false),
+            core::DeltaKind::Same => ("持平", false),
+            core::DeltaKind::Unknown => ("内存读不到，不可比", true),
+            core::DeltaKind::Up => ("", false),
+        };
+        out.push(GrowthRow {
+            kind: "进程",
+            protected: d.name.eq_ignore_ascii_case("membase"),
+            name: d.name,
+            base_mb: r2(d.base_ws),
+            live_mb: r2(d.live_ws),
+            delta_mb: r2(d.delta),
+            note,
+            unknown,
+        });
+    }
+
+    // ---- 服务（按宿主算，svchost 折成一行） ----
+    let base_svcs = core::parse_service_rows(
+        &std::fs::read_to_string(base_dir.join("services.csv")).unwrap_or_default(),
+    );
+    let shared = |host: &str| host.to_ascii_lowercase().contains("svchost");
+    let mut b_shared: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut l_shared: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut b_own: BTreeMap<String, f64> = BTreeMap::new();
+    let mut l_own: BTreeMap<String, f64> = BTreeMap::new();
+    for s in &base_svcs {
+        let Some(ws) = s.host_ws else { continue };
+        if s.pid == 0 {
+            continue;
+        }
+        if shared(&s.host) {
+            b_shared.insert(s.pid, ws);
+        } else {
+            b_own.entry(s.name.clone()).or_insert(ws);
+        }
+    }
+    for s in &snap.svcs {
+        let Some(ws) = s.host_ws else { continue };
+        if s.pid == 0 {
+            continue;
+        }
+        if shared(&s.host) {
+            l_shared.insert(s.pid, ws);
+        } else {
+            l_own.entry(s.name.clone()).or_insert(ws);
+        }
+    }
+    if !b_shared.is_empty() || !l_shared.is_empty() {
+        let b: f64 = b_shared.values().sum();
+        let l: f64 = l_shared.values().sum();
+        out.push(GrowthRow {
+            kind: "服务",
+            name: format!(
+                "svchost 宿主（{} 个进程）",
+                l_shared.len().max(b_shared.len())
+            ),
+            base_mb: r2(b),
+            live_mb: r2(l),
+            delta_mb: r2(l - b),
+            note: "共享宿主：上面的服务共用这一份内存，只算一次",
+            unknown: false,
+            protected: false,
+        });
+    }
+    for (name, bws) in &b_own {
+        let Some(&lws) = l_own.get(name) else { continue };
+        out.push(GrowthRow {
+            kind: "服务",
+            name: name.clone(),
+            base_mb: r2(*bws),
+            live_mb: r2(lws),
+            delta_mb: r2(lws - bws),
+            note: "专宿主服务，宿主工作集就是它自己的",
+            unknown: false,
+            protected: false,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.delta_mb
+            .partial_cmp(&a.delta_mb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
+/// 两位小数：报告里不出现 12.340000000000001 这种数
+fn r2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 /// 采集耗时：小于 1 秒就报毫秒，免得全显示成「0.0 秒」
@@ -653,6 +994,15 @@ impl App {
             startup_loaded: false,
             startup_only_actionable: false,
             confirm_restart: false,
+            restart_mode: RestartMode::Restart,
+            restart_force: false,
+            restart_settle: 3000,
+            restart_log: Vec::new(),
+            confirm_restart_opts: false,
+            cmp: BaselineCmp::default(),
+            growth: Vec::new(),
+            cmp_all: false,
+            launch_rows: Vec::new(),
             boot_also: boot_also_sec.is_some(),
             boot_also_at: boot_also_sec.unwrap_or(300).max(60),
             scr_monitors: 0,
@@ -687,6 +1037,21 @@ impl App {
             if matches!(key.as_str(), "recover" | "reclaim" | "recycle") {
                 app.page = Page::Processes;
                 app.proc_tab = ProcTab::Recover;
+            }
+            // 截图/自检：直接开在「重启选项」/「基准对比」标签
+            if matches!(key.as_str(), "restart" | "restart-opts" | "restart_options") {
+                app.page = Page::Processes;
+                app.proc_tab = ProcTab::Restart;
+            }
+            if matches!(key.as_str(), "compare" | "cmp" | "baseline-cmp" | "baseline_cmp") {
+                app.page = Page::Processes;
+                app.proc_tab = ProcTab::Compare;
+            }
+            // 截图/自检：直接开在「只拉起」这一档
+            if matches!(key.as_str(), "restart-launch" | "restart_launch") {
+                app.page = Page::Processes;
+                app.proc_tab = ProcTab::Restart;
+                app.restart_mode = RestartMode::LaunchOnly;
             }
         }
         // 读基准 + 枚举进程/服务要几百毫秒：丢到后台算，窗口先画出来
@@ -744,6 +1109,9 @@ impl App {
             collect_ms: None,
             collect_from_base: false,
             missing: None,
+            cmp: BaselineCmp::default(),
+            growth: Vec::new(),
+            launch: Vec::new(),
         };
         let Some(base_dir) = membase_win::compare::find_latest_baseline(root) else {
             out.missing = Some(format!(
@@ -788,7 +1156,16 @@ impl App {
             &std::fs::read_to_string(base_dir.join("services.csv")).unwrap_or_default(),
         );
 
-        let snap = snapshot::snapshot_now(true);
+        // 快照**包含**本工具自己：对比页要按用户真实付掉的内存算总账。
+        // 但下面构建清单时把它排掉 —— 它是受保护的，不该出现在线外 / 可回收 / 重启目标里。
+        let snap = snapshot::snapshot_now(false);
+        let my_pid = std::process::id();
+        let self_mb = snap
+            .procs
+            .iter()
+            .find(|p| p.pid == my_pid)
+            .and_then(|p| p.ws_mb)
+            .unwrap_or(0.0);
         // 老基准（PS 版或本版之前的快照）没记 CollectMs，就用这次刷新的实测值兜底
         if out.collect_ms.is_none() {
             out.collect_ms = Some(snap.collect_ms);
@@ -803,6 +1180,7 @@ impl App {
         let live_procs: Vec<core::LiveProc> = snap
             .procs
             .iter()
+            .filter(|p| p.pid != my_pid)
             .map(|p| core::LiveProc {
                 name: p.name.clone(),
                 pid: p.pid,
@@ -825,6 +1203,39 @@ impl App {
                 path: s.path.clone(),
             })
             .collect();
+
+        // ---------- 基准 vs 此刻（整机口径，含本工具自身） ----------
+        let live_names: std::collections::BTreeSet<String> = snap
+            .procs
+            .iter()
+            .map(|p| p.name.to_lowercase())
+            .collect();
+        out.cmp = BaselineCmp {
+            base_captured: cap_text.clone(),
+            base_uptime: bn as u64,
+            live_uptime: snap.uptime_s,
+            base_total_mb: json_num(&sysj, "TotalPhysicalMemoryMB").unwrap_or(0.0),
+            base_used_mb: used,
+            base_proc_mb: base_procs.values().map(|v| v.ws_mb).sum::<f64>(),
+            base_proc_count: base_procs.values().map(|v| v.instances).sum::<u32>(),
+            base_proc_names: base_procs.len(),
+            base_svc_running: base_svc
+                .values()
+                .filter(|s| s.eq_ignore_ascii_case("Running"))
+                .count(),
+            base_unknown: out.base_unknown_names,
+            live_total_mb: snap.total_phys_mb as f64,
+            live_used_mb: snap.used_phys_mb as f64,
+            live_proc_mb: snap.procs.iter().filter_map(|p| p.ws_mb).sum::<f64>(),
+            live_proc_count: snap.procs.len() as u32,
+            live_proc_names: live_names.len(),
+            live_svc_running: snap.svcs.iter().filter(|s| s.state == "Running").count(),
+            live_unknown: snap.procs.iter().filter(|p| p.ws_mb.is_none()).count(),
+            self_pid: my_pid,
+            self_mb,
+        };
+        out.launch = launch_candidates(&base_dir, &live_names);
+        out.growth = build_growth_rows(&base_dir, &snap, &base_procs);
 
         // 基准内增长项：按名字聚合后的「当前 − 开机」，只收 ≥ 10 MB 的
         let heal = core::selfheal::parse(
@@ -907,6 +1318,9 @@ impl App {
         self.base_unknown_names = s.base_unknown_names;
         self.collect_ms = s.collect_ms;
         self.collect_from_base = s.collect_from_base;
+        self.cmp = s.cmp;
+        self.growth = s.growth;
+        self.launch_rows = s.launch;
         if let Some(m) = s.missing {
             self.status = m;
         }
@@ -1343,6 +1757,22 @@ impl App {
             .collect()
     }
 
+    /// 「重启选项」页当前勾选的目标：动作决定看哪一份清单。
+    /// 本工具自身永远不进来（它在快照里，但清单里已经排掉，这里再兜一层）。
+    fn restart_opts_targets(&self) -> Vec<(String, String, f64)> {
+        let mut out: Vec<(String, String, f64)> = match self.restart_mode {
+            RestartMode::LaunchOnly => self
+                .launch_rows
+                .iter()
+                .filter(|r| r.pick)
+                .map(|r| (r.name.clone(), r.path.clone(), r.base_mb))
+                .collect(),
+            _ => self.restart_targets(),
+        };
+        out.retain(|(name, _, _)| !name.eq_ignore_ascii_case("membase"));
+        out
+    }
+
     /// (增长项总数, 可重启数, 增长合计 MB)
     fn recover_stats(&self) -> (usize, usize, f64) {
         let total = self.recover_rows.len();
@@ -1364,9 +1794,30 @@ impl App {
         self.start_restart(items);
     }
 
-    /// 真的去重启，但**丢到后台**：关进程 + 等它回来 + 3 秒实测都在子线程里，
-    /// 界面这 3 秒还能动（不然点完按钮整窗卡死，看起来像点坏了）。
-    fn start_restart(&mut self, items: Vec<(String, String, f64)>) {
+    /// 「重启选项」页的执行入口：按当前动作 / 力度 / 等待跑
+    fn do_restart_opts(&mut self) {
+        let items = self.restart_opts_targets();
+        if items.is_empty() {
+            self.status = format!("没有勾选可{}的项", self.restart_mode.verb());
+            return;
+        }
+        self.start_restart_with(
+            items,
+            self.restart_mode,
+            self.restart_force,
+            self.restart_settle,
+        );
+    }
+
+    /// 真的去动手，但**丢到后台**：关进程 + 等它回来 + 实测都在子线程里，
+    /// 界面这段时间还能动（不然点完按钮整窗卡死，看起来像点坏了）。
+    fn start_restart_with(
+        &mut self,
+        items: Vec<(String, String, f64)>,
+        mode: RestartMode,
+        force: bool,
+        settle_ms: u32,
+    ) {
         if self.restart_rx.is_some() {
             return;
         }
@@ -1374,28 +1825,61 @@ impl App {
         let root = self.root.clone();
         std::thread::spawn(move || {
             let protected = win::protected_pids();
-            let mut lines: Vec<String> = Vec::new();
+            // force = 跳过 WM_CLOSE 宽限，直接终止；否则就是默认的先礼后兵
+            let opts = close::CloseOptions {
+                graceful: !force,
+                grace_ms: if force { 0 } else { 3000 },
+                force: true,
+            };
+            let mut hits: Vec<RestartHit> = Vec::new();
             for (name, path, _mb) in items {
-                let rep = restart::restart_process(
-                    &name,
-                    &path,
-                    close::CloseOptions::default(),
-                    &protected,
-                    3000,
-                );
+                let rep = match mode {
+                    RestartMode::Restart => {
+                        restart::restart_process(&name, &path, opts, &protected, settle_ms)
+                    }
+                    RestartMode::CloseOnly => {
+                        restart::close_only(&name, opts, &protected, settle_ms)
+                    }
+                    RestartMode::LaunchOnly => restart::launch(&name, &path),
+                };
                 // GUI 也要记账：自愈型进程下次进「可回收」页就能看到
                 if rep.revived {
                     membase_cli::note_selfheal(&root, &name);
                 }
-                lines.push(rep.message);
-                if name.eq_ignore_ascii_case("explorer") {
-                    lines.push("桌面图标可能被 shell 重排，去「桌面布局」页点恢复".into());
+                let mut line = rep.message.clone();
+                if mode == RestartMode::Restart && name.eq_ignore_ascii_case("explorer") {
+                    line.push_str("；桌面图标可能被 shell 重排，去「桌面布局」页点恢复");
                 }
+                hits.push(RestartHit {
+                    name,
+                    line,
+                    before_mb: rep.before_mb,
+                    after_mb: rep.after_mb,
+                    reclaimed_mb: rep.reclaimed_mb,
+                    ok: rep.ok,
+                    revived: rep.revived,
+                });
             }
-            let _ = tx.send(lines);
+            let _ = tx.send(hits);
         });
         self.restart_rx = Some(rx);
-        self.status = "正在重启：关掉 → 等它自己回来 → 实测 3 秒…".into();
+        self.status = match mode {
+            RestartMode::Restart => format!(
+                "正在重启：关掉 → 等它自己回来 → 实测 {} 秒…",
+                settle_ms / 1000
+            ),
+            RestartMode::CloseOnly => format!(
+                "正在关闭：{} → 实测 {} 秒…",
+                if force { "直接强制" } else { "先礼后兵" },
+                settle_ms / 1000
+            ),
+            RestartMode::LaunchOnly => "正在按原路径拉起…".into(),
+        };
+    }
+
+    /// 可回收页的一键重启：等价于「关掉再拉起 + 先礼后兵 + 3 秒」
+    fn start_restart(&mut self, items: Vec<(String, String, f64)>) {
+        self.start_restart_with(items, RestartMode::Restart, false, 3000);
     }
 
     fn export_baseline(&mut self) {
@@ -1650,6 +2134,213 @@ fn note(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         ui.label(egui::RichText::new(text).size(11.5).color(color));
     });
     ui.add_space(2.0);
+}
+
+/// 小标题：用来分「动作 / 力度 / 目标 / 最近一次」这几段
+fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new(text.to_owned())
+                .size(11.5)
+                .strong()
+                .color(pal().muted),
+        );
+    });
+    ui.add_space(6.0);
+}
+
+/// 分段按钮：选中时蓝底白字，未选中是普通卡片底（动作 / 力度 / 等待共用一套样式）
+fn mode_btn(text: &str, on: bool, w: f32) -> egui::Button<'static> {
+    egui::Button::new(
+        egui::RichText::new(text.to_owned())
+            .size(12.5)
+            .color(if on { pal().on_accent } else { pal().text }),
+    )
+    .fill(if on { pal().accent } else { pal().card })
+    .stroke(egui::Stroke::new(
+        1.0,
+        if on { pal().accent } else { pal().line },
+    ))
+    .min_size(egui::vec2(w, 30.0))
+}
+
+/// 固定宽度的一格：`right` = 数字列右对齐，宽度对齐了表才好读
+fn cell(
+    ui: &mut egui::Ui,
+    w: f32,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    right: bool,
+) -> egui::Response {
+    let dir = if right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.allocate_ui_with_layout(egui::vec2(w, 22.0), dir, |ui| {
+        ui.add(
+            egui::Label::new(egui::RichText::new(text.to_owned()).size(size).color(color))
+                .truncate(),
+        )
+    })
+    .inner
+}
+
+/// 空列表 / 没执行过时的占位说明
+fn hint_row(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(18.0);
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new(text).size(12.0).color(pal().grey));
+    });
+    ui.add_space(18.0);
+}
+
+/// 大号数字块（对比页顶部：开机基准 / 此刻 / 差额）
+fn metric_block(ui: &mut egui::Ui, title: &str, value: &str, sub: &str, color: egui::Color32) {
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new(title).size(11.5).color(pal().muted));
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(value.to_owned())
+                .size(26.0)
+                .strong()
+                .color(color),
+        );
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(sub.to_owned()).size(11.0).color(pal().grey));
+    });
+}
+
+/// 一根对比条：左上标签与差额，右上「此刻 / 基准」，底下两条横杠（灰=开机，彩色=此刻）
+#[allow(clippy::too_many_arguments)]
+fn cmp_bar(
+    ui: &mut egui::Ui,
+    label: &str,
+    base: f64,
+    live: f64,
+    base_text: &str,
+    live_text: &str,
+    delta_text: &str,
+    delta_color: egui::Color32,
+) {
+    let w = (ui.available_width() - 32.0).max(320.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 62.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.text(
+        rect.left_top(),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(12.5),
+        pal().text,
+    );
+    p.text(
+        egui::pos2(rect.left(), rect.top() + 18.0),
+        egui::Align2::LEFT_TOP,
+        delta_text,
+        egui::FontId::proportional(11.5),
+        delta_color,
+    );
+    p.text(
+        rect.right_top(),
+        egui::Align2::RIGHT_TOP,
+        live_text,
+        egui::FontId::proportional(13.5),
+        pal().text,
+    );
+    p.text(
+        egui::pos2(rect.right(), rect.top() + 18.0),
+        egui::Align2::RIGHT_TOP,
+        format!("基准 {}", base_text),
+        egui::FontId::proportional(11.5),
+        pal().muted,
+    );
+
+    let bar_w = ((rect.right() - 150.0) - rect.left()).max(80.0);
+    let max = base.max(live).max(1.0);
+    let draw = |y: f32, v: f64, fill: egui::Color32| {
+        let track = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(bar_w, 6.0));
+        p.rect_filled(track, egui::CornerRadius::same(3), pal().line);
+        let wpx = (bar_w as f64 * (v / max)).clamp(0.0, bar_w as f64) as f32;
+        if wpx > 0.5 {
+            let bar =
+                egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(wpx, 6.0));
+            p.rect_filled(bar, egui::CornerRadius::same(3), fill);
+        }
+    };
+    draw(rect.top() + 38.0, base, pal().grey);
+    draw(
+        rect.top() + 46.0,
+        live,
+        if live > base { pal().amber } else { pal().accent },
+    );
+}
+
+/// 增长值的配色：越大越刺眼（和可回收表同一套阈值）
+fn growth_color(mb: f64) -> egui::Color32 {
+    if mb >= 100.0 {
+        pal().red
+    } else if mb >= 20.0 {
+        pal().amber
+    } else {
+        pal().muted
+    }
+}
+
+/// 可回收行的状态标签与颜色（两个页面共用，口径不能各写一套）
+fn reclaim_status(r: &ReclaimRow) -> (&'static str, egui::Color32) {
+    if r.it.protect {
+        ("受保护", pal().grey)
+    } else if !r.it.allowed {
+        if r.it.reason.contains("关键") {
+            ("关键组件", pal().grey)
+        } else if r.it.reason.contains("共享") {
+            ("共享宿主", pal().grey)
+        } else if r.it.reason.contains("路径") {
+            ("无路径", pal().grey)
+        } else {
+            ("禁止", pal().grey)
+        }
+    } else if r.self_heal_at.is_some() {
+        ("自愈型", pal().amber)
+    } else {
+        ("可重启", pal().accent)
+    }
+}
+
+/// 内存差额文案：正数 = 比开机多占（琥珀），负数 = 少占（绿）
+fn delta_mb_text(v: f64) -> (String, egui::Color32) {
+    if v.abs() < 0.5 {
+        ("与开机持平".to_owned(), pal().muted)
+    } else if v > 0.0 {
+        (format!("+{}", fmt_mb(v)), pal().amber)
+    } else {
+        (format!("−{}", fmt_mb(-v)), pal().green)
+    }
+}
+
+/// 计数差额文案（进程数 / 服务数）
+fn delta_count_text(v: f64) -> (String, egui::Color32) {
+    if v == 0.0 {
+        ("与开机持平".to_owned(), pal().muted)
+    } else if v > 0.0 {
+        (format!("+{:.0}", v), pal().amber)
+    } else {
+        (format!("−{:.0}", -v), pal().green)
+    }
+}
+
+/// 开机时长：秒 → 「4 小时 45 分」/「12 分」
+fn fmt_uptime(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{} 分", secs / 60)
+    } else {
+        format!("{} 秒", secs)
+    }
 }
 
 /// 侧栏图标：全部用 painter 画，不依赖图标字体
@@ -1992,9 +2683,86 @@ impl App {
                     rec_ok,
                     fmt_mb(rec_growth)
                 ),
+                ProcTab::Restart => format!(
+                    "{} · 目标 {} 项 · 实测等待 {} 秒",
+                    self.restart_mode.label(),
+                    self.restart_opts_targets().len(),
+                    self.restart_settle / 1000
+                ),
+                ProcTab::Compare => format!(
+                    "开机第 {} 秒 → 此刻（已开机 {}）· 已用 {} → {}",
+                    self.cmp.base_uptime,
+                    fmt_uptime(self.cmp.live_uptime),
+                    fmt_mb(self.cmp.base_used_mb),
+                    fmt_mb(self.cmp.live_used_mb)
+                ),
             }
         };
         page_head(ui, "进程", &sub, |ui| {
+            if tab == ProcTab::Restart {
+                let n = self.restart_opts_targets().len();
+                let busy = self.restart_rx.is_some();
+                let on = n > 0 && self.is_admin && !busy;
+                let text = if n == 0 {
+                    "未勾选目标".to_owned()
+                } else if busy {
+                    format!("{}中…", self.restart_mode.verb())
+                } else {
+                    format!("{} {} 项", self.restart_mode.verb(), n)
+                };
+                let resp = ui.add_enabled(on, btn_primary(&text, 150.0, on));
+                let resp = if on {
+                    resp.on_hover_text(match self.restart_mode {
+                        RestartMode::Restart => format!(
+                            "关掉 → 按原路径拉起 → 等 {} 秒实测回收量（可能为负）",
+                            self.restart_settle / 1000
+                        ),
+                        RestartMode::CloseOnly => format!(
+                            "只关闭，不拉起 → 等 {} 秒实测回收量",
+                            self.restart_settle / 1000
+                        ),
+                        RestartMode::LaunchOnly => {
+                            "只对「基准里有、现在没跑」的项有效；已经在跑的不重复拉起".to_string()
+                        }
+                    })
+                } else if n == 0 {
+                    resp.on_hover_text("先勾选下面的目标；换动作会换一份清单")
+                } else if busy {
+                    resp.on_hover_text("上一批还在跑，等它出结果")
+                } else {
+                    resp.on_hover_text("需要以管理员身份运行")
+                };
+                if resp.clicked() {
+                    self.confirm_restart_opts = true;
+                }
+                ui.add_space(8.0);
+                let resp = ui.add(btn("刷新对比", 12.5, 84.0));
+                let resp = with_cli(resp, "proc_refresh");
+                if resp.clicked() {
+                    self.reload();
+                    self.status = "已刷新：倒计时与目标都重算".into();
+                }
+                return;
+            }
+
+            if tab == ProcTab::Compare {
+                let resp = ui.add(btn("刷新对比", 12.5, 84.0));
+                let resp = with_cli(resp, "proc_refresh");
+                if resp.clicked() {
+                    self.reload();
+                    self.status = "已刷新基准对比".into();
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add(btn("去基准页", 12.5, 88.0))
+                    .on_hover_text("采集 / 导入 / 导出基准线本体")
+                    .clicked()
+                {
+                    self.page = Page::Baseline;
+                }
+                return;
+            }
+
             if tab == ProcTab::Recover {
                 let targets = self.restart_targets();
                 let n = targets.len();
@@ -2153,7 +2921,8 @@ impl App {
             }
         });
 
-        // 两个标签：线外（trim）与可回收（restart）。动作语义不同，不能混一张表。
+        // 四个标签：线外（trim）/ 可回收（restart）/ 重启选项 / 基准对比。
+        // 前两个是「该处理什么」，后两个是「怎么处理」和「开机到现在差多少」，语义不同不能混一张表。
         ui.horizontal(|ui| {
             ui.add_space(16.0);
             let before = self.proc_tab;
@@ -2168,15 +2937,29 @@ impl App {
                 ProcTab::Recover,
                 format!("可回收 {}", rec_total),
             );
+            ui.selectable_value(&mut self.proc_tab, ProcTab::Restart, "重启选项");
+            ui.selectable_value(&mut self.proc_tab, ProcTab::Compare, "基准对比");
             if before != self.proc_tab {
                 self.confirm_restart = false;
+                self.confirm_restart_opts = false;
             }
         });
         ui.add_space(4.0);
 
-        if self.proc_tab == ProcTab::Recover {
-            self.page_recover(ui);
-            return;
+        match self.proc_tab {
+            ProcTab::Recover => {
+                self.page_recover(ui);
+                return;
+            }
+            ProcTab::Restart => {
+                self.page_restart_opts(ui);
+                return;
+            }
+            ProcTab::Compare => {
+                self.page_compare(ui);
+                return;
+            }
+            ProcTab::Outliers => {}
         }
 
         ui.add_space(8.0);
@@ -2623,23 +3406,7 @@ impl App {
                     );
 
                     // 状态
-                    let (status, status_color) = if r.it.protect {
-                        ("受保护", pal().grey)
-                    } else if !r.it.allowed {
-                        if r.it.reason.contains("关键") {
-                            ("关键组件", pal().grey)
-                        } else if r.it.reason.contains("共享") {
-                            ("共享宿主", pal().grey)
-                        } else if r.it.reason.contains("路径") {
-                            ("无路径", pal().grey)
-                        } else {
-                            ("禁止", pal().grey)
-                        }
-                    } else if r.self_heal_at.is_some() {
-                        ("自愈型", pal().amber)
-                    } else {
-                        ("可重启", pal().accent)
-                    };
+                    let (status, status_color) = reclaim_status(r);
                     let sc = cols.rect(area, 4);
                     p.text(
                         egui::pos2(sc.left(), rect.center().y),
@@ -2756,6 +3523,688 @@ impl App {
         if let Some((name, path, mb)) = one_click {
             self.start_restart(vec![(name, path, mb)]);
         }
+    }
+
+    // ---------------- 进程页：重启选项 ----------------
+
+    /// 重启选项页：同一份目标，动作 / 力度 / 等待都能换
+    fn page_restart_opts(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // ---- 动作 ----
+                ui.add_space(12.0);
+                section_title(ui, "动作");
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(16.0);
+                    for m in [
+                        RestartMode::Restart,
+                        RestartMode::CloseOnly,
+                        RestartMode::LaunchOnly,
+                    ] {
+                        if ui
+                            .add(mode_btn(m.label(), self.restart_mode == m, 100.0))
+                            .clicked()
+                            && self.restart_mode != m
+                        {
+                            self.restart_mode = m;
+                            self.confirm_restart_opts = false;
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(self.restart_mode.hint())
+                            .size(11.5)
+                            .color(pal().muted),
+                    );
+                });
+
+                // ---- 力度与等待 ----
+                ui.add_space(14.0);
+                section_title(ui, "力度与等待");
+                let closable = self.restart_mode != RestartMode::LaunchOnly;
+                if closable {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(16.0);
+                        if ui
+                            .add(mode_btn("先礼后兵", !self.restart_force, 88.0))
+                            .on_hover_text("先发关闭请求（等同点 ✕），3 秒还没退才强杀")
+                            .clicked()
+                        {
+                            self.restart_force = false;
+                        }
+                        if ui
+                            .add(mode_btn("直接强制", self.restart_force, 88.0))
+                            .on_hover_text("跳过宽限直接终止：未保存的数据没人替你留")
+                            .clicked()
+                        {
+                            self.restart_force = true;
+                        }
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("实测等待").size(12.0).color(pal().muted));
+                        for s in [1000u32, 3000, 5000] {
+                            if ui
+                                .add(mode_btn(
+                                    &format!("{} 秒", s / 1000),
+                                    self.restart_settle == s,
+                                    56.0,
+                                ))
+                                .on_hover_text("拉起后等这么久再量工作集")
+                                .clicked()
+                            {
+                                self.restart_settle = s;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    note(
+                        ui,
+                        "「直接强制」不会等窗口自己保存；explorer / ctfmon 这类有可见副作用，执行前会再确认一次。",
+                        pal().grey,
+                    );
+                } else {
+                    // 只拉起不动任何进程：力度和等待在这里是摆设，说清楚比给个点不动的按钮好
+                    note(
+                        ui,
+                        "只拉起不关任何进程：关闭力度与实测等待都用不上，切到「关掉再拉起 / 只关闭」才有意义。",
+                        pal().grey,
+                    );
+                }
+
+                // ---- 目标 ----
+                ui.add_space(12.0);
+                section_title(ui, "目标");
+                if self.restart_mode == RestartMode::LaunchOnly {
+                    self.restart_launch_table(ui);
+                } else {
+                    self.restart_growth_table(ui);
+                }
+
+                // ---- 最近一次 ----
+                ui.add_space(14.0);
+                section_title(ui, "最近一次");
+                self.restart_last_run(ui);
+
+                ui.add_space(10.0);
+                note(
+                    ui,
+                    "动作只影响这一次，不改开机基准；这里和「可回收」页共用同一份勾选。",
+                    pal().muted,
+                );
+                note(
+                    ui,
+                    "本工具自身（MemBase）在保护集合里，永远不进目标清单；它占的内存照旧计入「基准对比」的总账。",
+                    pal().muted,
+                );
+                ui.add_space(10.0);
+            });
+    }
+
+    /// 「关掉再拉起 / 只关闭」的目标表：就是「可回收」页那份增长项
+    fn restart_growth_table(&mut self, ui: &mut egui::Ui) {
+        if self.recover_rows.is_empty() {
+            hint_row(
+                ui,
+                "没有基准内增长项：先在「基准」页采一份，或等进程跑一段时间再看",
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            cell(ui, 30.0, "", 11.5, pal().muted, false);
+            cell(ui, 220.0, "名称", 11.5, pal().muted, false);
+            cell(ui, 96.0, "当前", 11.5, pal().muted, true);
+            cell(ui, 96.0, "开机", 11.5, pal().muted, true);
+            cell(ui, 96.0, "增长", 11.5, pal().muted, true);
+            cell(ui, 120.0, "状态", 11.5, pal().muted, false);
+        });
+        ui.add_space(2.0);
+        let hw = ui.available_width();
+        let (hline_rect, _) = ui.allocate_exact_size(egui::vec2(hw, 1.0), egui::Sense::hover());
+        ui.painter().hline(
+            hline_rect.x_range(),
+            hline_rect.center().y,
+            egui::Stroke::new(1.0, pal().line),
+        );
+        ui.add_space(2.0);
+
+        let rows = std::mem::take(&mut self.recover_rows);
+        let mut toggles: Vec<(usize, bool)> = Vec::new();
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, r) in rows.iter().enumerate() {
+                    let can = r.it.allowed && !r.it.protect;
+                    let mut pick = r.pick;
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.add_space(16.0);
+                            // 固定 30px 宽：勾选框默认宽度和表头的空格不一样，
+                            // 直接用会让后面所有列跟着漂移
+                            let cb = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(30.0, 22.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_enabled(
+                                            can,
+                                            egui::Checkbox::without_text(&mut pick),
+                                        )
+                                    },
+                                )
+                                .inner;
+                            if cb.changed() {
+                                toggles.push((i, pick));
+                            }
+                            cell(
+                                ui,
+                                220.0,
+                                &r.it.name,
+                                12.5,
+                                if can { pal().text } else { pal().muted },
+                                false,
+                            );
+                            cell(ui, 96.0, &fmt_mb(r.it.mem_mb), 12.5, pal().text, true);
+                            cell(ui, 96.0, &fmt_mb(r.it.base_mb), 12.0, pal().muted, true);
+                            cell(
+                                ui,
+                                96.0,
+                                &format!("+{}", fmt_mb(r.it.growth_mb)),
+                                12.5,
+                                growth_color(r.it.growth_mb),
+                                true,
+                            );
+                            let (status, color) = reclaim_status(r);
+                            cell(ui, 120.0, status, 12.0, color, false);
+                        })
+                        .response;
+                    ui.painter().hline(
+                        resp.rect.x_range(),
+                        resp.rect.bottom() + 2.0,
+                        egui::Stroke::new(1.0, pal().line),
+                    );
+                }
+            });
+        self.recover_rows = rows;
+        for (i, v) in toggles {
+            if let Some(r) = self.recover_rows.get_mut(i) {
+                r.pick = v && r.it.allowed && !r.it.protect;
+            }
+        }
+    }
+
+    /// 「只拉起」的目标表：基准里有路径、现在没跑的进程
+    fn restart_launch_table(&mut self, ui: &mut egui::Ui) {
+        if self.launch_rows.is_empty() {
+            hint_row(ui, "没有可拉起项：基准里有路径的进程现在都在跑");
+            return;
+        }
+        let path_w = (ui.available_width() - 470.0).max(160.0);
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            cell(ui, 30.0, "", 11.5, pal().muted, false);
+            cell(ui, 220.0, "名称", 11.5, pal().muted, false);
+            cell(ui, 96.0, "基准占用", 11.5, pal().muted, true);
+            cell(ui, 64.0, "实例", 11.5, pal().muted, true);
+            cell(ui, path_w, "路径", 11.5, pal().muted, false);
+        });
+        ui.add_space(2.0);
+        let hw = ui.available_width();
+        let (hline_rect, _) = ui.allocate_exact_size(egui::vec2(hw, 1.0), egui::Sense::hover());
+        ui.painter().hline(
+            hline_rect.x_range(),
+            hline_rect.center().y,
+            egui::Stroke::new(1.0, pal().line),
+        );
+        ui.add_space(2.0);
+
+        let rows = std::mem::take(&mut self.launch_rows);
+        let mut toggles: Vec<(usize, bool)> = Vec::new();
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, r) in rows.iter().enumerate() {
+                    let mut pick = r.pick;
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.add_space(16.0);
+                            let cb = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(30.0, 22.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| ui.checkbox(&mut pick, ""),
+                                )
+                                .inner;
+                            if cb.changed() {
+                                toggles.push((i, pick));
+                            }
+                            cell(ui, 220.0, &r.name, 12.5, pal().text, false);
+                            cell(ui, 96.0, &fmt_mb(r.base_mb), 12.0, pal().muted, true);
+                            cell(
+                                ui,
+                                64.0,
+                                &r.base_instances.to_string(),
+                                12.0,
+                                pal().muted,
+                                true,
+                            );
+                            cell(ui, path_w, &r.path, 11.5, pal().grey, false).on_hover_text(&r.path);
+                        })
+                        .response;
+                    ui.painter().hline(
+                        resp.rect.x_range(),
+                        resp.rect.bottom() + 2.0,
+                        egui::Stroke::new(1.0, pal().line),
+                    );
+                }
+            });
+        self.launch_rows = rows;
+        for (i, v) in toggles {
+            if let Some(r) = self.launch_rows.get_mut(i) {
+                r.pick = v;
+            }
+        }
+        ui.add_space(6.0);
+        note(
+            ui,
+            "候选来自基准 processes.csv 里有路径、现在没跑的进程；已经在跑的不重复拉起 —— 那不是重启，是多开一份。",
+            pal().grey,
+        );
+    }
+
+    /// 最近一次动作的逐项结果
+    fn restart_last_run(&mut self, ui: &mut egui::Ui) {
+        if self.restart_log.is_empty() {
+            hint_row(
+                ui,
+                "还没执行过：跑一次之后，这里按项列出前后内存与实测回收量",
+            );
+            return;
+        }
+        for h in &self.restart_log {
+            let color = if !h.ok {
+                pal().red
+            } else if h.revived {
+                pal().amber
+            } else if h.reclaimed_mb > 0.0 {
+                pal().green
+            } else {
+                pal().muted
+            };
+            let delta = if h.reclaimed_mb >= 0.0 {
+                format!("回收 {}", fmt_mb(h.reclaimed_mb))
+            } else {
+                format!("多占 {}", fmt_mb(-h.reclaimed_mb))
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                cell(ui, 200.0, &h.name, 12.5, pal().text, false);
+                cell(
+                    ui,
+                    190.0,
+                    &format!("{} → {}", fmt_mb(h.before_mb), fmt_mb(h.after_mb)),
+                    12.0,
+                    pal().muted,
+                    false,
+                );
+                cell(ui, 110.0, &delta, 12.5, color, false);
+                ui.label(
+                    egui::RichText::new(elide(&h.line, 52))
+                        .size(11.5)
+                        .color(pal().grey),
+                )
+                .on_hover_text(&h.line);
+            });
+            ui.add_space(2.0);
+        }
+    }
+
+    // ---------------- 进程页：基准对比 ----------------
+
+    /// 基准对比页：开机那一刻 vs 此刻。两个时刻都是**整机已用**口径，含本工具自身。
+    fn page_compare(&mut self, ui: &mut egui::Ui) {
+        let c = self.cmp.clone();
+        if c.base_used_mb <= 0.0 {
+            hint_row(
+                ui,
+                "还没有可用基准：去「基准」页采集一份，才知道开机那一刻是多少",
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                if ui.add(btn("去基准页", 12.5, 88.0)).clicked() {
+                    self.page = Page::Baseline;
+                }
+            });
+            return;
+        }
+
+        let delta = c.used_delta();
+        let growth: f64 = self.recover_rows.iter().map(|r| r.it.growth_mb).sum();
+        let outlier: f64 = self.rows.iter().map(|r| r.mem_mb).sum();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // ---- 顶部三个大数字 ----
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    metric_block(
+                        ui,
+                        "开机基准",
+                        &fmt_mb(c.base_used_mb),
+                        &format!("开机第 {} 秒 · {}", c.base_uptime, c.base_captured),
+                        pal().muted,
+                    );
+                    ui.add_space(28.0);
+                    metric_block(
+                        ui,
+                        "此刻",
+                        &fmt_mb(c.live_used_mb),
+                        &format!("已开机 {}", fmt_uptime(c.live_uptime)),
+                        pal().text,
+                    );
+                    ui.add_space(28.0);
+                    let pct = if c.base_used_mb > 0.0 {
+                        delta / c.base_used_mb * 100.0
+                    } else {
+                        0.0
+                    };
+                    let (sub, color) = if delta >= 0.0 {
+                        (
+                            format!("比开机多占 {:+.0}%", pct),
+                            if delta > 100.0 {
+                                pal().amber
+                            } else {
+                                pal().muted
+                            },
+                        )
+                    } else {
+                        ("比开机更少".to_owned(), pal().green)
+                    };
+                    metric_block(ui, "差额", &fmt_mb(delta.abs()), &sub, color);
+                });
+
+                // ---- 逐项明细（程序 / 服务） ----
+                ui.add_space(16.0);
+                section_title(ui, "逐项对比（程序 / 服务）");
+                self.compare_table(ui);
+
+                // ---- 四个口径的对比条 ----
+                ui.add_space(18.0);
+                section_title(ui, "四个口径");
+                let (t, col) = delta_mb_text(c.used_delta());
+                cmp_bar(
+                    ui,
+                    "整机已用物理内存",
+                    c.base_used_mb,
+                    c.live_used_mb,
+                    &fmt_mb(c.base_used_mb),
+                    &format!(
+                        "{} · {:.0}%",
+                        fmt_mb(c.live_used_mb),
+                        c.used_pct(c.live_used_mb, c.live_total_mb)
+                    ),
+                    &t,
+                    col,
+                );
+                let (t, col) = delta_mb_text(c.proc_delta());
+                cmp_bar(
+                    ui,
+                    "进程工作集合计",
+                    c.base_proc_mb,
+                    c.live_proc_mb,
+                    &fmt_mb(c.base_proc_mb),
+                    &fmt_mb(c.live_proc_mb),
+                    &t,
+                    col,
+                );
+                let (t, col) =
+                    delta_count_text(c.live_proc_count as f64 - c.base_proc_count as f64);
+                cmp_bar(
+                    ui,
+                    "进程数",
+                    c.base_proc_count as f64,
+                    c.live_proc_count as f64,
+                    &c.base_proc_count.to_string(),
+                    &c.live_proc_count.to_string(),
+                    &t,
+                    col,
+                );
+                let (t, col) =
+                    delta_count_text(c.live_svc_running as f64 - c.base_svc_running as f64);
+                cmp_bar(
+                    ui,
+                    "运行中服务",
+                    c.base_svc_running as f64,
+                    c.live_svc_running as f64,
+                    &c.base_svc_running.to_string(),
+                    &c.live_svc_running.to_string(),
+                    &t,
+                    col,
+                );
+
+                // ---- 差额去向 ----
+                ui.add_space(16.0);
+                section_title(ui, "差额去向");
+                kv_row(
+                    ui,
+                    "基准内增长",
+                    &format!("{} 项 · +{}", self.recover_rows.len(), fmt_mb(growth)),
+                );
+                kv_row(
+                    ui,
+                    "线外项合计",
+                    &format!("{} 项 · {}", self.rows.len(), fmt_mb(outlier)),
+                );
+                kv_row(
+                    ui,
+                    "本工具自身",
+                    &format!(
+                        "{} · PID {} · 受保护：计入此刻的总账，但不进任何处理清单",
+                        fmt_mb(c.self_mb),
+                        c.self_pid
+                    ),
+                );
+                kv_row(
+                    ui,
+                    "整机内存",
+                    &format!(
+                        "基准 {} → 此刻 {}（含本工具自身）",
+                        fmt_mb(c.base_total_mb),
+                        fmt_mb(c.live_total_mb)
+                    ),
+                );
+                kv_row(
+                    ui,
+                    "进程名（去重）",
+                    &format!("{} → {}", c.base_proc_names, c.live_proc_names),
+                );
+                kv_row(
+                    ui,
+                    "已用 − 工作集",
+                    &format!(
+                        "{} · 内核 / 驱动 / 共享页",
+                        fmt_mb(c.live_used_mb - c.live_proc_mb)
+                    ),
+                );
+                kv_row(
+                    ui,
+                    "基准热快照",
+                    &if c.hot() {
+                        format!("是：采于开机第 {} 秒，差值只作参考", c.base_uptime)
+                    } else {
+                        "否".to_owned()
+                    },
+                );
+
+
+                // ---- 口径说明 ----
+                ui.add_space(14.0);
+                note(
+                    ui,
+                    "「开机基准」由计划任务在开机第 N 秒采，是那一刻的整机快照；「此刻」是这次刷新的实测。",
+                    pal().muted,
+                );
+                note(
+                    ui,
+                    "两个时刻之间做的事（浏览器、编译、游戏）都会进差额：差额不等于泄漏，重启也不一定回收。",
+                    pal().grey,
+                );
+                note(
+                    ui,
+                    "已用物理内存是整机口径，进程工作集只是其中一块；共享页会被重复算进各自进程，所以两者不相等。",
+                    pal().grey,
+                );
+                note(
+                    ui,
+                    "基准由计划任务采集，那一刻没有本工具在跑；「此刻」把本工具自己也算了进去 —— 它同样是真实占用的内存，只是永远不进处理清单。",
+                    pal().grey,
+                );
+                if c.hot() {
+                    note(
+                        ui,
+                        "这份基准是热快照（开机 15 分钟后才采），别当「刚开机」的起点。",
+                        pal().amber,
+                    );
+                }
+                if c.base_unknown > 0 || c.live_unknown > 0 {
+                    note(
+                        ui,
+                        &format!(
+                            "内存读不到的实例：基准 {} 个进程名、此刻 {} 个进程 —— 它们只影响工作集合计，不影响整机口径。",
+                            c.base_unknown, c.live_unknown
+                        ),
+                        pal().grey,
+                    );
+                }
+                ui.add_space(12.0);
+            });
+    }
+
+    /// 逐项对比表：每个程序 / 服务宿主，开机 vs 此刻。
+    /// 默认只看上涨（这页存在的理由就是这个），勾上「连下降一起看」才是全量。
+    fn compare_table(&mut self, ui: &mut egui::Ui) {
+        let mut all = self.cmp_all;
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            if ui
+                .checkbox(&mut all, "连下降 / 持平一起看")
+                .on_hover_text("默认只列比开机更多的项；基准里没有、现在在跑的也算上涨")
+                .changed()
+            {
+                self.cmp_all = all;
+            }
+            let n = self.growth.iter().filter(|r| all || r.delta_mb > 0.5).count();
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("{} 项", n))
+                    .size(11.5)
+                    .color(pal().muted),
+            );
+        });
+        ui.add_space(4.0);
+        if self.growth.is_empty() {
+            hint_row(ui, "没有可对比的项：基准里没有进程记录");
+            return;
+        }
+
+        // 说明列吃掉剩下的宽度：窗口宽的时候不该留一片空白，窄的时候也不挤成省略号
+        let note_w = (ui.available_width() - 664.0).max(120.0);
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            cell(ui, 48.0, "类型", 11.5, pal().muted, false);
+            cell(ui, 230.0, "名称", 11.5, pal().muted, false);
+            cell(ui, 100.0, "开机", 11.5, pal().muted, true);
+            cell(ui, 100.0, "此刻", 11.5, pal().muted, true);
+            cell(ui, 110.0, "变化", 11.5, pal().muted, true);
+            cell(ui, note_w, "说明", 11.5, pal().muted, false);
+        });
+        ui.add_space(2.0);
+        let hw = ui.available_width();
+        let (hline_rect, _) = ui.allocate_exact_size(egui::vec2(hw, 1.0), egui::Sense::hover());
+        ui.painter().hline(
+            hline_rect.x_range(),
+            hline_rect.center().y,
+            egui::Stroke::new(1.0, pal().line),
+        );
+        ui.add_space(2.0);
+
+        egui::ScrollArea::vertical()
+            .max_height(340.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for r in &self.growth {
+                    if !all && r.delta_mb <= 0.5 {
+                        continue;
+                    }
+                    let color = if r.protected || r.unknown {
+                        pal().grey
+                    } else if r.delta_mb > 0.5 {
+                        growth_color(r.delta_mb)
+                    } else if r.delta_mb < -0.5 {
+                        pal().green
+                    } else {
+                        pal().muted
+                    };
+                    let delta_text = if r.unknown {
+                        "不可比".to_owned()
+                    } else if r.delta_mb > 0.5 {
+                        format!("+{}", fmt_mb(r.delta_mb))
+                    } else if r.delta_mb < -0.5 {
+                        format!("−{}", fmt_mb(-r.delta_mb))
+                    } else {
+                        "持平".to_owned()
+                    };
+                    let name = if r.protected {
+                        format!("{}（受保护）", r.name)
+                    } else {
+                        r.name.clone()
+                    };
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.add_space(16.0);
+                            cell(
+                                ui,
+                                48.0,
+                                r.kind,
+                                11.5,
+                                if r.kind == "进程" {
+                                    pal().accent
+                                } else {
+                                    pal().muted
+                                },
+                                false,
+                            );
+                            cell(
+                                ui,
+                                230.0,
+                                &name,
+                                12.5,
+                                if r.protected { pal().grey } else { pal().text },
+                                false,
+                            );
+                            cell(ui, 100.0, &fmt_mb(r.base_mb), 12.0, pal().muted, true);
+                            cell(ui, 100.0, &fmt_mb(r.live_mb), 12.0, pal().text, true);
+                            cell(ui, 110.0, &delta_text, 12.5, color, true);
+                            cell(ui, note_w, r.note, 11.5, pal().grey, false);
+                        })
+                        .response;
+                    ui.painter().hline(
+                        resp.rect.x_range(),
+                        resp.rect.bottom() + 2.0,
+                        egui::Stroke::new(1.0, pal().line),
+                    );
+                }
+                ui.add_space(8.0);
+            });
+        note(
+            ui,
+            "服务按宿主记账：svchost 上几十个服务共用一份内存，Windows 不给单个服务的内存数，只能看到宿主这一层。",
+            pal().grey,
+        );
     }
 
     /// 基准页：基准线本体
@@ -4874,9 +6323,14 @@ impl eframe::App for App {
         if self.restart_rx.is_some() {
             let got = self.restart_rx.as_ref().unwrap().try_recv();
             match got {
-                Ok(lines) => {
+                Ok(hits) => {
                     self.restart_rx = None;
-                    self.status = lines.join("；");
+                    self.status = hits
+                        .iter()
+                        .map(|h| h.line.clone())
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    self.restart_log = hits;
                     self.reload();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -5030,22 +6484,32 @@ impl eframe::App for App {
                     );
                     ui.add_space(12.0);
                     if self.is_admin {
-                        let text = if self.page == Page::Processes
-                            && self.proc_tab == ProcTab::Recover
-                        {
-                            let (total, ok, growth) = self.recover_stats();
-                            format!(
-                                "可回收 {} 项 · 可重启 {} · 增长 {}",
-                                total,
-                                ok,
-                                fmt_mb(growth)
-                            )
-                        } else {
-                            format!(
+                        let text = match (self.page, self.proc_tab) {
+                            (Page::Processes, ProcTab::Recover) => {
+                                let (total, ok, growth) = self.recover_stats();
+                                format!(
+                                    "可回收 {} 项 · 可重启 {} · 增长 {}",
+                                    total,
+                                    ok,
+                                    fmt_mb(growth)
+                                )
+                            }
+                            (Page::Processes, ProcTab::Restart) => format!(
+                                "{} · 目标 {} 项 · 等待 {} 秒",
+                                self.restart_mode.label(),
+                                self.restart_opts_targets().len(),
+                                self.restart_settle / 1000
+                            ),
+                            (Page::Processes, ProcTab::Compare) => format!(
+                                "已用 {} · 比开机 {:+.0} MB",
+                                fmt_mb(self.cmp.live_used_mb),
+                                self.cmp.used_delta()
+                            ),
+                            _ => format!(
                                 "线外 {} 项 · 可释放 {}",
                                 self.rows.len(),
                                 fmt_mb(self.selected_count().1)
-                            )
+                            ),
                         };
                         ui.label(egui::RichText::new(text).size(11.5).color(pal().muted));
                     } else {
@@ -5655,6 +7119,120 @@ impl eframe::App for App {
             if do_it {
                 self.confirm_restart = false;
                 self.do_restart();
+            }
+        }
+
+        // ---------- 重启选项确认 ----------
+        if self.confirm_restart_opts {
+            let mut do_it = false;
+            let mut cancel = false;
+            let targets = self.restart_opts_targets();
+            let mode = self.restart_mode;
+            let force = self.restart_force;
+            let settle = self.restart_settle / 1000;
+            let mut warns: Vec<&'static str> = Vec::new();
+            for (name, _, _) in &targets {
+                let w = reclaim_warning(name);
+                if !w.is_empty() && !warns.contains(&w) {
+                    warns.push(w);
+                }
+            }
+            egui::Modal::new(egui::Id::unique("restart_opts_modal"))
+                .frame(
+                    egui::Frame::new()
+                        .fill(pal().panel)
+                        .stroke(egui::Stroke::new(1.0, pal().line))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(20, 18)),
+                )
+                .show(&ctx, |ui| {
+                    ui.set_width(470.0);
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}这 {} 项？",
+                            mode.verb(),
+                            targets.len()
+                        ))
+                        .size(17.0)
+                        .strong()
+                        .color(pal().text),
+                    );
+                    ui.add_space(6.0);
+                    for (name, _, mb) in targets.iter().take(8) {
+                        ui.label(
+                            egui::RichText::new(format!("· {}（{}）", name, fmt_mb(*mb)))
+                                .size(12.0)
+                                .color(pal().muted),
+                        );
+                    }
+                    if targets.len() > 8 {
+                        ui.label(
+                            egui::RichText::new(format!("… 另有 {} 项", targets.len() - 8))
+                                .size(11.5)
+                                .color(pal().grey),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    let body = match mode {
+                        RestartMode::Restart => format!(
+                            "关掉 → 按原路径拉起 → 等 {} 秒再量一次工作集。报的是实测回收量，冷启动更胖时会如实记成负收益。",
+                            settle
+                        ),
+                        RestartMode::CloseOnly => format!(
+                            "只关闭，不拉起；等 {} 秒实测省了多少。之后要用就自己开，有些进程会被外壳自愈。",
+                            settle
+                        ),
+                        RestartMode::LaunchOnly => {
+                            "只按原路径拉起，不关闭任何东西；已经在跑的不会重复拉起。这步不回收内存。"
+                                .to_string()
+                        }
+                    };
+                    ui.label(egui::RichText::new(body).size(11.5).color(pal().muted));
+                    if force && mode != RestartMode::LaunchOnly {
+                        ui.label(
+                            egui::RichText::new("已选「直接强制」：不给窗口保存的机会，未保存内容会丢。")
+                                .size(11.5)
+                                .color(pal().amber),
+                        );
+                    }
+                    for w in &warns {
+                        ui.label(egui::RichText::new(format!("注意：{}", w)).size(11.5).color(pal().amber));
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("取消").size(13.5))
+                                    .min_size(egui::vec2(90.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(mode.verb())
+                                        .size(13.5)
+                                        .color(pal().on_accent),
+                                )
+                                .fill(pal().accent)
+                                .min_size(egui::vec2(110.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            do_it = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+            if cancel {
+                self.confirm_restart_opts = false;
+            }
+            if do_it {
+                self.confirm_restart_opts = false;
+                self.do_restart_opts();
             }
         }
 

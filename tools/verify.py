@@ -622,6 +622,8 @@ def check_gui_pages():
     pages = [
         (None, '进程·线外（默认页）'),
         ('recover', '进程·可回收'),
+        ('restart', '进程·重启选项'),
+        ('compare', '进程·基准对比'),
         ('slim', '瘦身'),
         ('startup', '启动项'),
         ('baseline', '基准'),

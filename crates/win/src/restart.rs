@@ -154,6 +154,37 @@ fn is_shell_process(name: &str) -> bool {
     .any(|n| n.eq_ignore_ascii_case(name))
 }
 
+/// 按原路径拉起一份进程。返回 `Err` = 根本没起来；
+/// `Ok(Some(warn))` = 起来了，但中间有值得写进报告的事（借令牌失败后回退）。
+///
+/// 提权会话里的 CreateProcess 会让子进程继承高完整性。对 shell 来说这就是
+/// 「提权 explorer」：拖放被 UIPI 拦掉、部分扩展失效。这类进程改用同会话里
+/// 未提权的令牌拉起；借不到令牌就回退直接启动（宁可起来，也别黑着桌面）。
+fn spawn_image(name: &str, exe: &str) -> Result<Option<String>, String> {
+    let dir = Path::new(exe)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut warn: Option<String> = None;
+    if win::is_elevated() && is_shell_process(name) {
+        match win::spawn_with_user_token(exe, &dir) {
+            Ok(_) => return Ok(None),
+            Err(e) => warn = Some(format!("借未提权令牌拉起失败，回退直接启动：{}", e)),
+        }
+    }
+    let mut cmd = std::process::Command::new(exe);
+    if !dir.is_empty() {
+        cmd.current_dir(&dir);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(win::CREATE_NO_WINDOW);
+    }
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(warn)
+}
+
 /// 重启一个进程：关掉（先礼后兵）→ 必要时按快照里的 `Path` 拉起 → 等稳定 → 实测。
 ///
 /// `exe_path` 建议用快照里记的路径（和用户当初启动的是同一个），
@@ -270,41 +301,17 @@ pub fn restart_process(
         rep.ok = rep.after_instances > 0;
         return rep;
     } else {
-        let dir = Path::new(&exe)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        // 提权会话里的 CreateProcess 会让子进程继承高完整性。对 shell 来说这就是
-        // 「提权 explorer」：拖放被 UIPI 拦掉、部分扩展失效。这类进程改用同会话里
-        // 未提权的令牌拉起；借不到令牌就回退直接启动（宁可起来，也别黑着桌面）。
-        let mut launched = false;
-        if win::is_elevated() && is_shell_process(name) {
-            match win::spawn_with_user_token(&exe, &dir) {
-                Ok(_) => launched = true,
-                Err(e) => rep
-                    .errors
-                    .push(format!("借未提权令牌拉起失败，回退直接启动：{}", e)),
-            }
-        }
-        if launched {
-            rep.relaunched = true;
-        } else {
-            let mut cmd = std::process::Command::new(&exe);
-            if !dir.is_empty() {
-                cmd.current_dir(&dir);
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(win::CREATE_NO_WINDOW);
-            }
-            match cmd.spawn() {
-                Ok(_) => rep.relaunched = true,
-                Err(e) => {
-                    rep.errors.push(format!("拉起失败: {}", e));
-                    rep.message = format!("已关闭，但拉起失败：{}", e);
-                    return rep;
+        match spawn_image(name, &exe) {
+            Ok(warn) => {
+                rep.relaunched = true;
+                if let Some(w) = warn {
+                    rep.errors.push(w);
                 }
+            }
+            Err(e) => {
+                rep.errors.push(format!("拉起失败: {}", e));
+                rep.message = format!("已关闭，但拉起失败：{}", e);
+                return rep;
             }
         }
     }
@@ -343,6 +350,70 @@ pub fn restart_process(
             rep.after_mb
         );
     }
+    rep
+}
+
+/// 只拉起：不动已经在跑的实例，把「现在没跑」的进程按原路径叫回来。
+///
+/// 已经在跑时**不重复拉起** —— 那不是重启，是多开一份。所以这个方法只对
+/// 「基准里记着、现在不在」的进程有意义，报告里的回收量按 0 处理，如实写「没有回收」。
+pub fn launch(name: &str, exe_path: &str) -> RestartReport {
+    let mut rep = RestartReport {
+        name: name.to_string(),
+        kind: "process",
+        ..Default::default()
+    };
+
+    let before = processes_named(name);
+    let (bmb, bunk) = total_ws(&before);
+    rep.before_instances = before.len() as u32;
+    rep.before_mb = bmb;
+    rep.before_unknown = bunk;
+    if !before.is_empty() {
+        rep.after_instances = rep.before_instances;
+        rep.after_mb = rep.before_mb;
+        rep.after_unknown = rep.before_unknown;
+        rep.ok = true;
+        rep.message = format!(
+            "{} 已经有 {} 个实例在跑，没有重复拉起",
+            name, rep.before_instances
+        );
+        return rep;
+    }
+
+    let exe = exe_path.trim();
+    if exe.is_empty() || !Path::new(exe).exists() {
+        rep.message = format!(
+            "拿不到能用的可执行路径（{}），没有拉起",
+            if exe.is_empty() { "空" } else { exe }
+        );
+        return rep;
+    }
+
+    if let Err(e) = spawn_image(name, exe) {
+        rep.errors.push(format!("拉起失败: {}", e));
+        rep.message = format!("拉起失败：{}", e);
+        return rep;
+    }
+    rep.relaunched = true;
+    // 等待口径和重启一致：先等到有实例，再给它一点时间把工作集铺开
+    wait_until(3_000, || !processes_named(name).is_empty());
+
+    let after = processes_named(name);
+    let (amb, aunk) = total_ws(&after);
+    rep.after_instances = after.len() as u32;
+    rep.after_mb = amb;
+    rep.after_unknown = aunk;
+    rep.reclaimed_mb = round2(rep.before_mb - rep.after_mb);
+    rep.ok = rep.after_instances > 0;
+    rep.message = if rep.ok {
+        format!(
+            "已拉起（{} 个 / {:.1} MB）；只拉起不回收，这步本来就不省内存",
+            rep.after_instances, rep.after_mb
+        )
+    } else {
+        "拉起后没检测到实例，需要你手动确认".to_string()
+    };
     rep
 }
 

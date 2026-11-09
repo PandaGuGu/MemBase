@@ -353,69 +353,6 @@ pub fn restart_process(
     rep
 }
 
-/// 只拉起：不动已经在跑的实例，把「现在没跑」的进程按原路径叫回来。
-///
-/// 已经在跑时**不重复拉起** —— 那不是重启，是多开一份。所以这个方法只对
-/// 「基准里记着、现在不在」的进程有意义，报告里的回收量按 0 处理，如实写「没有回收」。
-pub fn launch(name: &str, exe_path: &str) -> RestartReport {
-    let mut rep = RestartReport {
-        name: name.to_string(),
-        kind: "process",
-        ..Default::default()
-    };
-
-    let before = processes_named(name);
-    let (bmb, bunk) = total_ws(&before);
-    rep.before_instances = before.len() as u32;
-    rep.before_mb = bmb;
-    rep.before_unknown = bunk;
-    if !before.is_empty() {
-        rep.after_instances = rep.before_instances;
-        rep.after_mb = rep.before_mb;
-        rep.after_unknown = rep.before_unknown;
-        rep.ok = true;
-        rep.message = format!(
-            "{} 已经有 {} 个实例在跑，没有重复拉起",
-            name, rep.before_instances
-        );
-        return rep;
-    }
-
-    let exe = exe_path.trim();
-    if exe.is_empty() || !Path::new(exe).exists() {
-        rep.message = format!(
-            "拿不到能用的可执行路径（{}），没有拉起",
-            if exe.is_empty() { "空" } else { exe }
-        );
-        return rep;
-    }
-
-    if let Err(e) = spawn_image(name, exe) {
-        rep.errors.push(format!("拉起失败: {}", e));
-        rep.message = format!("拉起失败：{}", e);
-        return rep;
-    }
-    rep.relaunched = true;
-    // 等待口径和重启一致：先等到有实例，再给它一点时间把工作集铺开
-    wait_until(3_000, || !processes_named(name).is_empty());
-
-    let after = processes_named(name);
-    let (amb, aunk) = total_ws(&after);
-    rep.after_instances = after.len() as u32;
-    rep.after_mb = amb;
-    rep.after_unknown = aunk;
-    rep.reclaimed_mb = round2(rep.before_mb - rep.after_mb);
-    rep.ok = rep.after_instances > 0;
-    rep.message = if rep.ok {
-        format!(
-            "已拉起（{} 个 / {:.1} MB）；只拉起不回收，这步本来就不省内存",
-            rep.after_instances, rep.after_mb
-        )
-    } else {
-        "拉起后没检测到实例，需要你手动确认".to_string()
-    };
-    rep
-}
 
 /// 只关不拉：给「关掉功能开关后本来就该退场」的进程用（比如 CrossDeviceResume）。
 ///

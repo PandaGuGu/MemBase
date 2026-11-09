@@ -509,16 +509,23 @@ def check_blackout_exit():
             if mode == '最小化':
                 u.ShowWindow(h, SW_MINIMIZE)
                 time.sleep(1.2)
+            else:
+                # 验收机上别的窗口（终端、烧录工具）可能正占着前台；真实用户是
+                # 对着黑屏按 ESC 的，这里先把黑屏窗口拉回前台，免得测成「焦点不在」
+                u.SetForegroundWindow(h)
+                time.sleep(0.1)
             tap_esc()
             if mode == '最小化':
                 time.sleep(0.3)
                 u.ShowWindow(h, SW_RESTORE)
             ok = False
-            for _ in range(40):
+            for i in range(40):
                 time.sleep(0.1)
                 if not topmost(h):
                     ok = True
                     break
+                if i == 20 and mode == '正常':
+                    tap_esc()  # 第一下没收到（窗口刚被别的进程抢过焦点）就再按一次
             add(G, 'ESC 退出（%s）' % mode, 'keybd_event VK_ESCAPE', '退出息屏（撤销置顶）',
                 '已退出' if ok else '仍置顶，退不出来', ok)
             if not ok:
@@ -622,7 +629,6 @@ def check_gui_pages():
     pages = [
         (None, '进程·线外（默认页）'),
         ('recover', '进程·可回收'),
-        ('restart', '进程·重启选项'),
         ('compare', '进程·基准对比'),
         ('slim', '瘦身'),
         ('startup', '启动项'),

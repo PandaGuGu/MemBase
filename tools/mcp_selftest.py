@@ -7,6 +7,14 @@ import json
 import subprocess
 import sys
 
+# CI 的 Python 默认按 cp1252 输出，中文标签会直接抛 UnicodeEncodeError；
+# 这里固定成 UTF-8，免得自检还没开始就死在 print 上。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
 EXE = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\Administrator\Desktop\项目集合\MemBase\target\release\membase-cli.exe"
 
 

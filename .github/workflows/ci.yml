@@ -10,22 +10,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # 纯逻辑层不碰 Win32，任何平台都该能跑通：
-  # 这条红了说明「分级 / 计划 / 布局模型 / 打包」的判定被平台细节污染了。
-  core-linux:
-    name: core（Linux）
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p membase-core
-      - run: cargo build -p membase-cli --release
-      - name: CLI 自描述仍可用
-        run: |
-          ./target/release/membase-cli commands --json | grep -q '"commands"'
-          ./target/release/membase-cli version
-
+  # 只跑 Windows：Linux 端暂时不维护，core 的纯逻辑测试已经在下面的
+  # `cargo test --workspace` 里覆盖。
   # 完整构建 + 全部测试。CLI 是控制台程序、GUI 是窗口程序，
   # 这两个子系统不能弄反（弄反了开机任务会弹窗而不是采集）。
   windows:

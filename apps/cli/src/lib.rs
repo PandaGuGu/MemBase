@@ -3140,6 +3140,7 @@ fn rotate_runs(root: &Path, keep: usize) -> Vec<String> {
     done
 }
 
+#[cfg(windows)]
 fn cmd_collect(args: &[String]) {
     let out = root_arg(args);
     let at = num_arg(args, "--at", 60.0) as u64;

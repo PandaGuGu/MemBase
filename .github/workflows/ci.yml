@@ -80,10 +80,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # CI 机器上没有用户的基准快照，mem_status 会以 2「没有基准」退出；
+          # 先在临时目录现采一份，再按 JSON-RPC 跟服务端对话。
+          export MEMBASE_ROOT="$RUNNER_TEMP/mb-mcp"
+          ./target/release/MemBase.exe baseline capture --json > /dev/null
           python tools/mcp_selftest.py target/release/MemBase.exe
 
       - name: MCP 服务端自检（控制台版）
         shell: bash
         run: |
           set -euo pipefail
+          export MEMBASE_ROOT="$RUNNER_TEMP/mb-mcp"
           python tools/mcp_selftest.py target/release/membase-cli.exe

@@ -21,6 +21,11 @@ pub struct TaskInfo {
 }
 
 fn unit_dir() -> PathBuf {
+    // 提权运行时 root 没有 user manager（systemctl --user 会报
+    // "Failed to connect to bus"），改用系统级 timer，路径也换成 /etc。
+    if crate::elevated() {
+        return PathBuf::from("/etc/systemd/system");
+    }
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -48,14 +53,17 @@ fn safe_task(task: &str) -> String {
 }
 
 fn systemctl_user(args: &[&str]) -> Result<(), String> {
-    let out = Command::new("systemctl")
-        .arg("--user")
+    let mut cmd = Command::new("systemctl");
+    if !crate::elevated() {
+        cmd.arg("--user");
+    }
+    let out = cmd
         .args(args)
         .env("LC_ALL", "C.UTF-8")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("调用 systemctl --user 失败: {e}"))?;
+        .map_err(|e| format!("调用 systemctl 失败: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -103,8 +111,15 @@ pub fn install(
         also_arg,
         task
     );
+    // 系统级 timer 不会自动带 HOME；显式给 root 的 home，数据目录才对得上
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let after = if crate::elevated() {
+        "After=graphical.target"
+    } else {
+        "After=graphical-session.target"
+    };
     let service = format!(
-        "[Unit]\nDescription=MemBase 开机内存基准线采集\nAfter=graphical-session.target\n\n[Service]\nType=oneshot\nExecStart={exec}\nNice=5\n"
+        "[Unit]\nDescription=MemBase 开机内存基准线采集\n{after}\n\n[Service]\nType=oneshot\nEnvironment=HOME={home}\nExecStart={exec}\nNice=5\n"
     );
     let timer = format!(
         "[Unit]\nDescription=MemBase 开机第 {at_sec} 秒采集基准线\n\n[Timer]\nOnBootSec={at_sec}s\nUnit={task}.service\n\n[Install]\nWantedBy=timers.target\n"
@@ -160,8 +175,12 @@ pub fn query(task: &str) -> TaskInfo {
     if !timer.exists() {
         return info;
     }
-    let enabled = Command::new("systemctl")
-        .args(["--user", "is-enabled", &format!("{task}.timer")])
+    let mut cmd = Command::new("systemctl");
+    if !crate::elevated() {
+        cmd.arg("--user");
+    }
+    let enabled = cmd
+        .args(["is-enabled", &format!("{task}.timer")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);

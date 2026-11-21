@@ -5034,8 +5034,9 @@ impl App {
         plat::screen::hold_awake(false);
         self.refresh_screen_status();
         self.status = format!(
-            "已退出息屏（{}）· 同 CLI：MemBase.exe screen off --seconds {} --exit-key {}",
+            "已退出息屏（{}）· 同 CLI：{} screen off --seconds {} --exit-key {}",
             reason,
+            CLI_EXE,
             self.bo_secs,
             self.bo_key.as_str()
         );
@@ -5877,9 +5878,11 @@ impl App {
                     ui,
                     "等价命令",
                     &format!(
-                        "MemBase.exe screen off --seconds {} --exit-key {}  ·  MemBase.exe screen duration {}",
+                        "{} screen off --seconds {} --exit-key {}  ·  {} screen duration {}",
+                        CLI_EXE,
                         self.bo_secs,
                         self.bo_key.as_str(),
+                        CLI_EXE,
                         plat::screen::fmt_hms(self.bo_secs)
                     ),
                 );
@@ -5906,7 +5909,11 @@ impl App {
                     ui,
                     "关屏通道",
                     if self.scr_channel {
-                        "可用（有窗口接收 SC_MONITORPOWER）"
+                        #[cfg(windows)]
+                        let ok = "可用（有窗口接收 SC_MONITORPOWER）";
+                        #[cfg(target_os = "linux")]
+                        let ok = "可用（X11 + DPMS）";
+                        ok
                     } else {
                         "不可用（远程桌面 / 虚拟显示环境常见）"
                     },
@@ -5931,9 +5938,16 @@ impl App {
                     ),
                     pal().muted,
                 );
+                #[cfg(windows)]
                 note(
                     ui,
                     "走的是系统自己的 WM_SYSCOMMAND / SC_MONITORPOWER，和开始菜单里的「睡眠」不是一回事。",
+                    pal().muted,
+                );
+                #[cfg(target_os = "linux")]
+                note(
+                    ui,
+                    "走的是 X11 的 DPMS 关屏（xset dpms force off），和系统「挂起 / 睡眠」不是一回事。",
                     pal().muted,
                 );
                 note(
@@ -6278,8 +6292,12 @@ impl eframe::App for App {
                             };
                             ui.label(egui::RichText::new(text).size(11.5).color(pal().muted));
                         } else {
+                            #[cfg(windows)]
+                            let warn = "以非管理员运行：恢复与开机采集会失败";
+                            #[cfg(target_os = "linux")]
+                            let warn = "普通用户：系统级服务操作受限";
                             ui.label(
-                                egui::RichText::new("以非管理员运行：恢复与开机采集会失败")
+                                egui::RichText::new(warn)
                                     .size(11.5)
                                     .color(pal().amber),
                             );

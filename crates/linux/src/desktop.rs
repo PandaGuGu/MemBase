@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use membase_core::layout::IconPos;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -142,13 +143,29 @@ fn write_entries(entries: &[(String, i32, i32)]) -> Result<()> {
         text.push_str(&format!("\n[{}]\nrow={}\ncol={}\n", name, row, col));
     }
     fs::write(&path, text)?;
-    // 让 xfdesktop 重新读一次；失败也不算错（文件已经是新内容）
+    // 不在这里重启 xfdesktop：一次恢复要写好几个图标，逐个重启会闪屏且慢。
+    // 调用方在整批写完后再调用 `reload_desktop_now()`。
+    Ok(())
+}
+
+/// 重启 xfdesktop，让它重新读 rc 文件里的图标位置。
+/// 桌面会闪一下，但这是唯一可靠的应用方式（rtfm：xfdesktop 没有 re-layout 信号）。
+fn reload_desktop() {
     let _ = std::process::Command::new("xfdesktop")
-        .arg("--reload")
+        .arg("--quit")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let _ = std::process::Command::new("xfdesktop")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-    Ok(())
+    std::thread::sleep(std::time::Duration::from_millis(250));
+}
+
+pub(crate) fn reload_desktop_now() {
+    reload_desktop();
 }
 
 fn desktop_running() -> bool {
@@ -156,7 +173,8 @@ fn desktop_running() -> bool {
 }
 
 pub struct Desktop {
-    entries: Vec<(String, i32, i32)>,
+    // set_pos 是 &self（GUI 里拿的是不可变引用），位置更新用运行期可变缓存
+    entries: RefCell<Vec<(String, i32, i32)>>,
     desktop: PathBuf,
     pid: u32,
     hwnd: isize,
@@ -176,7 +194,7 @@ impl Desktop {
             .map(|p| p.pid)
             .unwrap_or(0);
         Ok(Desktop {
-            entries,
+            entries: RefCell::new(entries),
             desktop: desktop_dir(),
             pid,
             hwnd: 0,
@@ -192,7 +210,7 @@ impl Desktop {
     }
 
     pub fn count(&self) -> Result<i32> {
-        Ok(self.entries.len() as i32)
+        Ok(self.entries.borrow().len() as i32)
     }
 
     /// Xfce 的自动排列由 xfdesktop 自己的设置控制；这里不假装能改
@@ -205,16 +223,16 @@ impl Desktop {
     }
 
     pub fn item_name(&self, index: i32) -> Result<String> {
-        let e = self
-            .entries
+        let entries = self.entries.borrow();
+        let e = entries
             .get(index as usize)
             .ok_or_else(|| anyhow!("图标索引越界: {}", index))?;
         Ok(display_name(&e.0))
     }
 
     pub fn item_pos(&self, index: i32) -> Result<(i32, i32)> {
-        let e = self
-            .entries
+        let entries = self.entries.borrow();
+        let e = entries
             .get(index as usize)
             .ok_or_else(|| anyhow!("图标索引越界: {}", index))?;
         let (cw, ch) = cell();
@@ -222,8 +240,8 @@ impl Desktop {
     }
 
     pub fn set_pos(&self, index: i32, x: i32, y: i32) -> Result<()> {
-        let mut entries = self.entries.clone();
         let (cw, ch) = cell();
+        let mut entries = self.entries.borrow_mut();
         let e = entries
             .get_mut(index as usize)
             .ok_or_else(|| anyhow!("图标索引越界: {}", index))?;
@@ -236,6 +254,7 @@ impl Desktop {
         let (cw, ch) = cell();
         Ok(self
             .entries
+            .borrow()
             .iter()
             .map(|(path, row, col)| IconPos {
                 name: display_name(path),
@@ -247,7 +266,7 @@ impl Desktop {
 
     pub fn index_map(&self) -> Result<HashMap<String, i32>> {
         let mut m = HashMap::new();
-        for (i, (path, _, _)) in self.entries.iter().enumerate() {
+        for (i, (path, _, _)) in self.entries.borrow().iter().enumerate() {
             m.insert(display_name(path).to_lowercase(), i as i32);
         }
         Ok(m)

@@ -19,8 +19,17 @@ const MARGIN: i32 = 8;
 /// 图标下方的文字区
 const LABEL_H: i32 = 24;
 
+/// 登录用户的 home。提权运行时用 pkexec/sudo 背后的那个用户，而不是 /root，
+/// 否则桌面和 xfdesktop 配置全都找不到。
+fn home_dir() -> PathBuf {
+    crate::session_user()
+        .map(|(_, h)| h)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()))
+}
+
 fn desktop_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir();
+    let home = home.to_string_lossy();
     // XDG_DESKTOP_DIR 优先
     if let Ok(text) = fs::read_to_string(format!("{home}/.config/user-dirs.dirs")) {
         for line in text.lines() {
@@ -39,7 +48,7 @@ fn desktop_dir() -> PathBuf {
 }
 
 fn xfce_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/xfce4/desktop")
+    home_dir().join(".config/xfce4/desktop")
 }
 
 fn icon_size() -> i32 {
@@ -143,6 +152,15 @@ fn write_entries(entries: &[(String, i32, i32)]) -> Result<()> {
         text.push_str(&format!("\n[{}]\nrow={}\ncol={}\n", name, row, col));
     }
     fs::write(&path, text)?;
+    // 提权运行时 rc 是 root 写的；文件可能是新建的，交还给登录用户
+    if let Some((user, _)) = crate::session_user() {
+        let _ = std::process::Command::new("chown")
+            .arg(format!("{user}:{user}"))
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
     // 不在这里重启 xfdesktop：一次恢复要写好几个图标，逐个重启会闪屏且慢。
     // 调用方在整批写完后再调用 `reload_desktop_now()`。
     Ok(())
@@ -151,16 +169,31 @@ fn write_entries(entries: &[(String, i32, i32)]) -> Result<()> {
 /// 重启 xfdesktop，让它重新读 rc 文件里的图标位置。
 /// 桌面会闪一下，但这是唯一可靠的应用方式（rtfm：xfdesktop 没有 re-layout 信号）。
 fn reload_desktop() {
-    let _ = std::process::Command::new("xfdesktop")
-        .arg("--quit")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // root 起 xfdesktop 会把桌面的进程变成 root 的，必须换回登录用户执行
+    let user = crate::session_user().map(|(u, _)| u);
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
+    let xauth = std::env::var("XAUTHORITY")
+        .unwrap_or_else(|_| format!("{}/.Xauthority", home_dir().display()));
+    let build = |extra: &str| {
+        let mut c = match &user {
+            Some(u) => {
+                let mut c = std::process::Command::new("runuser");
+                c.arg("-u").arg(u).arg("--").arg("env")
+                    .arg(format!("DISPLAY={display}"))
+                    .arg(format!("XAUTHORITY={xauth}"))
+                    .arg("xfdesktop");
+                c
+            }
+            None => std::process::Command::new("xfdesktop"),
+        };
+        c.arg(extra)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        c
+    };
+    let _ = build("--quit").status();
     std::thread::sleep(std::time::Duration::from_millis(250));
-    let _ = std::process::Command::new("xfdesktop")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let _ = build("").spawn();
     std::thread::sleep(std::time::Duration::from_millis(250));
 }
 

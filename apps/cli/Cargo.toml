@@ -13,11 +13,16 @@ path = "src/main.rs"
 
 [dependencies]
 membase-core.workspace = true
-membase-win.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 # MCP 层要用 serde_json；core 已经在编它，不新增编译量
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+membase-win.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+membase-linux.workspace = true
 
 [lints]
 workspace = true

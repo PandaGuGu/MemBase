@@ -305,14 +305,20 @@ fn extra_baseline() -> Value {
 /// 会动手的工具统一在 schema 里加 execute / yes 两位。
 fn schema_mutating(extra: Value) -> Value {
     let mut props = Map::new();
-    props.insert("execute".into(), json!({
-        "type": "boolean",
-        "description": "是否真的动手。false（默认）只输出预演结果，不改系统"
-    }));
-    props.insert("yes".into(), json!({
-        "type": "boolean",
-        "description": "二次确认。必须与 execute 同时为 true，否则拒绝执行"
-    }));
+    props.insert(
+        "execute".into(),
+        json!({
+            "type": "boolean",
+            "description": "是否真的动手。false（默认）只输出预演结果，不改系统"
+        }),
+    );
+    props.insert(
+        "yes".into(),
+        json!({
+            "type": "boolean",
+            "description": "二次确认。必须与 execute 同时为 true，否则拒绝执行"
+        }),
+    );
     if let Value::Object(p) = extra {
         for (k, v) in p {
             props.insert(k, v);
@@ -350,7 +356,9 @@ fn t_slim(args: &Map<String, Value>) -> Result<Vec<String>, String> {
 fn t_svc(args: &Map<String, Value>) -> Result<Vec<String>, String> {
     let action = opt_str(args, "action").ok_or("缺少 action（stop / start / disable / enable）")?;
     if !matches!(action.as_str(), "stop" | "start" | "disable" | "enable") {
-        return Err(format!("action 只支持 stop / start / disable / enable，收到 {action}"));
+        return Err(format!(
+            "action 只支持 stop / start / disable / enable，收到 {action}"
+        ));
     }
     let name = opt_str(args, "service").ok_or("缺少 service（服务名）")?;
     let mut out = vec!["svc".to_string(), action, name, "--json".to_string()];
@@ -425,7 +433,9 @@ fn t_startup(args: &Map<String, Value>) -> Result<Vec<String>, String> {
             out.extend(mutating_gate(args)?);
         }
         other => {
-            return Err(format!("action 只支持 list / disable / enable，收到 {other}"));
+            return Err(format!(
+                "action 只支持 list / disable / enable，收到 {other}"
+            ));
         }
     }
     Ok(out)
@@ -674,9 +684,30 @@ fn run_cli(argv: &[String]) -> Result<String, String> {
     Ok(stdout.trim().to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn run_cli(argv: &[String]) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("取不到自身路径: {e}"))?;
+    let out = std::process::Command::new(exe)
+        .args(argv)
+        .output()
+        .map_err(|e| format!("启动子进程失败: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let code = out.status.code().unwrap_or(-1);
+    if code != 0 {
+        let msg = if stderr.is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr
+        };
+        return Err(format!("退出码 {code}：{msg}"));
+    }
+    Ok(stdout.trim().to_string())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn run_cli(_argv: &[String]) -> Result<String, String> {
-    Err("MCP 模式目前只在 Windows 上可用（平台层依赖 Win32）".to_string())
+    Err("MCP 模式目前只在 Windows / Linux 上可用".to_string())
 }
 
 // ---------------------------------------------------------------- JSON-RPC

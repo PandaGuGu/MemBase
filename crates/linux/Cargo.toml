@@ -1,0 +1,28 @@
+[package]
+name = "membase-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemBase 平台层（Linux）：/proc 进程与服务、XDG 启动项、systemd 定时采集、X11 息屏、Xfce 桌面图标布局"
+
+[features]
+default = []
+# GUI 预览才需要解壁纸（png/jpeg/bmp），CLI 不必背这个依赖
+preview = ["dep:image"]
+
+[dependencies]
+membase-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+# 发信号 / geteuid：平台层允许 unsafe（和 membase-win 一致）
+libc = "0.2"
+# X11：取屏幕尺寸、DPMS 关屏、息屏窗口与按键监听（纯 Rust 实现，不需要 x11 开发头文件）
+x11rb = { version = "0.13", default-features = false, features = ["randr", "dpms", "xfixes"] }
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+    "jpeg",
+    "bmp",
+] }
+
+[lints.rust]
+unsafe_code = "allow"

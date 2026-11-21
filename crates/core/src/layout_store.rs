@@ -7,6 +7,15 @@ use std::path::PathBuf;
 
 /// 布局目录（不存在则创建）
 pub fn dir() -> PathBuf {
+    #[cfg(not(windows))]
+    let base = {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
+        xdg.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    #[cfg(windows)]
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
@@ -56,9 +65,10 @@ pub fn load(name: &str) -> Result<Layout> {
     if !path.is_file() {
         anyhow::bail!("布局不存在: {}", name);
     }
-    let text = fs::read_to_string(&path).with_context(|| format!("读取失败: {}", path.display()))?;
-    let layout: Layout =
-        serde_json::from_str(&text).with_context(|| format!("布局文件格式不对: {}", path.display()))?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("读取失败: {}", path.display()))?;
+    let layout: Layout = serde_json::from_str(&text)
+        .with_context(|| format!("布局文件格式不对: {}", path.display()))?;
     Ok(layout)
 }
 

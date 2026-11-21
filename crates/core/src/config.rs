@@ -77,18 +77,41 @@ pub fn config_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    #[cfg(not(windows))]
+    {
+        // Linux：$XDG_CONFIG_HOME/membase/config.json（缺省 ~/.config/membase）
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let xdg = xdg.trim().trim_end_matches('/');
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("membase").join("config.json");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let home = home.trim().trim_end_matches('/');
+            if !home.is_empty() {
+                return PathBuf::from(home)
+                    .join(".config")
+                    .join("membase")
+                    .join("config.json");
+            }
+        }
+        return PathBuf::from("membase-config.json");
+    }
+    #[cfg(windows)]
     if let Ok(appdata) = std::env::var("APPDATA") {
         let appdata = appdata.trim();
         if !appdata.is_empty() {
             return PathBuf::from(appdata).join("MemBase").join("config.json");
         }
     }
+    #[cfg(windows)]
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home)
             .join(".config")
             .join("MemBase")
             .join("config.json");
     }
+    #[cfg(windows)]
     PathBuf::from("membase-config.json")
 }
 
@@ -150,7 +173,10 @@ pub fn root_source(cli: Option<&str>) -> &'static str {
             return "MEMBASE_ROOT";
         }
     }
-    let from_cfg = load().data_root.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let from_cfg = load()
+        .data_root
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     if from_cfg {
         return "配置文件";
     }

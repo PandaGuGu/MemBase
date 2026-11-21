@@ -2,7 +2,7 @@
 //!
 //! 界面上每个按钮都有一条等价命令行（见 membase-cli 的 ACTIONS 表）：
 //! 按钮 hover 会直接把那条命令写出来，程序里也另有一页「命令行」做对照。
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 use eframe::egui;
 use membase_cli::layout::{self as cli_map, ACTIONS};
@@ -10,12 +10,22 @@ use membase_core as core;
 use membase_core::layout::{IconPos, Layout, LayoutEntry, Plan};
 use membase_core::layout_store as store;
 use membase_core::{Kind, Tier};
-use membase_win::gui_icon::{self, IconProvider};
-use membase_win::task::{self as boot, TaskInfo};
-use membase_win::desktop::Desktop;
-use membase_win::{actions, close, repair, restart, shellview::ShellView, snapshot, startup, win};
+#[cfg(target_os = "linux")]
+use membase_linux as plat;
+#[cfg(windows)]
+use membase_win as plat;
+use plat::desktop::Desktop;
+use plat::gui_icon::{self, IconProvider};
+use plat::task::{self as boot, TaskInfo};
+use plat::{actions, close, repair, restart, shellview::ShellView, snapshot, startup, win};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+
+/// 命令行入口的名字：Windows 下是同一个 exe，Linux 下是独立的 membase-cli
+#[cfg(windows)]
+const CLI_EXE: &str = "MemBase.exe";
+#[cfg(target_os = "linux")]
+const CLI_EXE: &str = "membase-cli";
 use std::sync::mpsc;
 
 /// 语义调色板：浅色对齐 Windows 11 任务管理器，深色对齐它的夜间模式
@@ -437,11 +447,11 @@ struct App {
     /// 正在息屏（全屏黑）
     blackout: Option<Blackout>,
     /// 息屏期间的全局输入监听：系统级查按键/光标，跟窗口焦点无关
-    bo_watch: Option<membase_win::screen::Watch>,
+    bo_watch: Option<plat::screen::Watch>,
     /// 默认息屏时长（秒，0 = 不自动退出）
     bo_secs: u64,
     /// 退出息屏的热键（默认 ESC）
-    bo_key: membase_win::screen::ExitKey,
+    bo_key: plat::screen::ExitKey,
     /// 息屏时是否同时关显示器电源（默认否：只盖黑窗，最不容易退不出来）
     bo_power_off: bool,
     /// 自检模式：MEMBASE_BLACKOUT_TEST=1 时进息屏但不真关显示器（截图验证用）
@@ -493,7 +503,10 @@ fn save_bmp(img: &egui::ColorImage, path: &str) -> std::io::Result<()> {
 fn json_num(text: &str, key: &str) -> Option<f64> {
     let pat = format!("\"{}\"", key);
     let i = text.find(&pat)?;
-    let rest = text[i + pat.len()..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = text[i + pat.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
     let end = rest
         .find(|c: char| c == ',' || c == '\n' || c == '}')
         .unwrap_or(rest.len());
@@ -643,7 +656,9 @@ fn build_growth_rows(
         });
     }
     for (name, bws) in &b_own {
-        let Some(&lws) = l_own.get(name) else { continue };
+        let Some(&lws) = l_own.get(name) else {
+            continue;
+        };
         out.push(GrowthRow {
             kind: "服务",
             name: name.clone(),
@@ -876,13 +891,13 @@ impl App {
             scr_last: String::new(),
             blackout: None,
             bo_watch: None,
-            bo_secs: membase_win::screen::default_secs(),
-            bo_key: membase_win::screen::exit_key(),
-            bo_power_off: membase_win::screen::power_off(),
+            bo_secs: plat::screen::default_secs(),
+            bo_key: plat::screen::exit_key(),
+            bo_power_off: plat::screen::power_off(),
             bo_test: std::env::var("MEMBASE_BLACKOUT_TEST").is_ok(),
         };
         // 屏幕分辨率很便宜，先取好
-        let (sw, sh) = membase_win::sys::screen_size();
+        let (sw, sh) = plat::sys::screen_size();
         app.lay_screen = format!("{}×{}", sw, sh);
         // 自检/截图：MEMBASE_PAGE=layouts|cli|... 直接开在指定页
         if let Ok(p) = std::env::var("MEMBASE_PAGE") {
@@ -905,7 +920,10 @@ impl App {
                 app.proc_tab = ProcTab::Recover;
             }
             // 截图/自检：直接开在「基准对比」标签
-            if matches!(key.as_str(), "compare" | "cmp" | "baseline-cmp" | "baseline_cmp") {
+            if matches!(
+                key.as_str(),
+                "compare" | "cmp" | "baseline-cmp" | "baseline_cmp"
+            ) {
                 app.page = Page::Processes;
                 app.proc_tab = ProcTab::Compare;
             }
@@ -968,9 +986,10 @@ impl App {
             cmp: BaselineCmp::default(),
             growth: Vec::new(),
         };
-        let Some(base_dir) = membase_win::compare::find_latest_baseline(root) else {
+        let Some(base_dir) = plat::compare::find_latest_baseline(root) else {
             out.missing = Some(format!(
-                "没有基准快照，先跑一次 MemBase.exe collect（{}）",
+                "没有基准快照，先跑一次 {} collect（{}）",
+                CLI_EXE,
                 root.display()
             ));
             return out;
@@ -1060,11 +1079,8 @@ impl App {
             .collect();
 
         // ---------- 基准 vs 此刻（整机口径，含本工具自身） ----------
-        let live_names: std::collections::BTreeSet<String> = snap
-            .procs
-            .iter()
-            .map(|p| p.name.to_lowercase())
-            .collect();
+        let live_names: std::collections::BTreeSet<String> =
+            snap.procs.iter().map(|p| p.name.to_lowercase()).collect();
         out.cmp = BaselineCmp {
             base_captured: cap_text.clone(),
             base_uptime: bn as u64,
@@ -1311,9 +1327,15 @@ impl App {
         self.confirm = false;
         self.status = format!(
             "已执行：成功 {} 项，失败 {} 项（礼貌关闭 {} 个实例，强制 {} 个）{}",
-            ok, fail, graceful, forced,
+            ok,
+            fail,
+            graceful,
+            forced,
             if disabled > 0 {
-                format!("，其中 {} 个服务已禁止开机自启（可用 svc enable 撤销）", disabled)
+                format!(
+                    "，其中 {} 个服务已禁止开机自启（可用 svc enable 撤销）",
+                    disabled
+                )
             } else {
                 String::new()
             }
@@ -1359,7 +1381,8 @@ impl App {
     }
 
     /// 扫描当前状态，直接立成新基准（不用重启、不用等开机 60 秒）
-    fn capture_now(&mut self) {        let snap = snapshot::snapshot_now(true);
+    fn capture_now(&mut self) {
+        let snap = snapshot::snapshot_now(true);
         let unknown = snap.procs.iter().filter(|p| p.ws_mb.is_none()).count();
         let run_dir = snapshot::new_run_dir(&self.root);
         let sub = run_dir.join("now");
@@ -1442,7 +1465,7 @@ impl App {
         self.slim_loaded = true;
         self.slim_items.clear();
         self.slim_pick.clear();
-        let Some(dir) = membase_win::compare::find_latest_baseline(&self.root) else {
+        let Some(dir) = plat::compare::find_latest_baseline(&self.root) else {
             self.slim_msg = "没有基准快照：先在「基准」页采集或导入一份".to_string();
             return;
         };
@@ -1466,15 +1489,11 @@ impl App {
                 *mem_by_exe.entry(p.name.to_lowercase()).or_insert(0.0) += ws;
             }
         }
-        let startup_raw = membase_win::startup::scan();
+        let startup_raw = plat::startup::scan();
         let no_baseline: std::collections::BTreeSet<String> = Default::default();
         let startup_items = core::startup::build_startup_items(&startup_raw, &no_baseline);
-        let startup_items = core::build_startup_trim_items(
-            &startup_items,
-            &mem_by_exe,
-            5.0,
-            self.slim_caution,
-        );
+        let startup_items =
+            core::build_startup_trim_items(&startup_items, &mem_by_exe, 5.0, self.slim_caution);
         let startup_count = startup_items.len();
         items.extend(startup_items);
 
@@ -1569,7 +1588,7 @@ impl App {
     fn refresh_startup(&mut self) {
         let raw = startup::scan();
         let mut baseline: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        if let Some(dir) = membase_win::compare::find_latest_baseline(&self.root) {
+        if let Some(dir) = plat::compare::find_latest_baseline(&self.root) {
             let text =
                 std::fs::read_to_string(dir.join("processes_by_name.csv")).unwrap_or_default();
             for (name, _) in core::parse_by_name(&text) {
@@ -1675,7 +1694,7 @@ impl App {
     }
 
     fn export_baseline(&mut self) {
-        let dir = match membase_win::compare::find_latest_baseline(&self.root) {
+        let dir = match plat::compare::find_latest_baseline(&self.root) {
             Some(d) => d,
             None => {
                 self.status = "没有基准可以导出".into();
@@ -1763,15 +1782,65 @@ fn extract_captured(sysj: &str) -> String {
 
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    // 不写死盘符：用 %WINDIR% 拼字体目录
-    let win_dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let font_dir = std::path::Path::new(&win_dir).join("Fonts");
-    let candidates = [
-        font_dir.join("msyh.ttc"),
-        font_dir.join("Deng.ttf"),
-        font_dir.join("simhei.ttf"),
-    ];
+
+    // Windows：%WINDIR%\Fonts；Linux：fontconfig 找一款中文字体。
+    // 不写死盘符/路径，发行版换字体也能命中。
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(custom) = std::env::var("MEMBASE_FONT") {
+        candidates.push(PathBuf::from(custom));
+    }
+    #[cfg(windows)]
+    {
+        let win_dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let font_dir = std::path::Path::new(&win_dir).join("Fonts");
+        candidates.push(font_dir.join("msyh.ttc"));
+        candidates.push(font_dir.join("Deng.ttf"));
+        candidates.push(font_dir.join("simhei.ttf"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 先试常见发行版的 CJK 字体包路径：Noto CJK / 文泉驿 / Droid 回退。
+        // 不能只信 `fc-match sans-serif:lang=zh`——某些环境下它会给出
+        // 不含汉字的 NotoSans-Regular.ttf，结果界面全是方框。
+        candidates.push(PathBuf::from(
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ));
+        candidates.push(PathBuf::from(
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        ));
+        candidates.push(PathBuf::from(
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ));
+        candidates.push(PathBuf::from(
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        ));
+        for query in [
+            "Noto Sans CJK SC",
+            "WenQuanYi Zen Hei",
+            "sans-serif:lang=zh",
+        ] {
+            if let Ok(out) = std::process::Command::new("fc-match")
+                .args(["-f", "%{file}", query])
+                .output()
+            {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let looks_cjk = [
+                    "CJK", "cjk", "wqy", "Droid", "Han", "Hei", "Song", "Kai", "Ming",
+                ]
+                .iter()
+                .any(|k| p.contains(k));
+                if !p.is_empty() && looks_cjk {
+                    candidates.push(PathBuf::from(p));
+                }
+            }
+        }
+    }
+
     for path in candidates {
+        let dbg = std::env::var("MEMBASE_DEBUG").is_ok();
+        if dbg {
+            eprintln!("[dbg] 尝试字体: {}", path.display());
+        }
         if let Ok(bytes) = std::fs::read(&path) {
             fonts.font_data.insert(
                 "cjk".to_owned(),
@@ -1834,7 +1903,6 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     });
 }
 
-
 // ---------- 浅色基元（对齐 Windows 11 任务管理器的观感）----------
 
 /// 卡片页头：左边标题 + 副标题，右边动作；底下一根分隔线
@@ -1847,13 +1915,17 @@ fn page_head<F: FnOnce(&mut egui::Ui)>(ui: &mut egui::Ui, title: &str, sub: &str
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         ui.add_space(16.0);
-        ui.label(egui::RichText::new(title).size(16.5).strong().color(pal().text));
+        ui.label(
+            egui::RichText::new(title)
+                .size(16.5)
+                .strong()
+                .color(pal().text),
+        );
         if !sub.is_empty() {
             ui.add_space(6.0);
             // 摘要按剩余宽度省略，不和按钮抢位置
             ui.add(
-                egui::Label::new(egui::RichText::new(sub).size(11.5).color(pal().muted))
-                    .truncate(),
+                egui::Label::new(egui::RichText::new(sub).size(11.5).color(pal().muted)).truncate(),
             );
         }
     });
@@ -1875,8 +1947,12 @@ fn page_head<F: FnOnce(&mut egui::Ui)>(ui: &mut egui::Ui, title: &str, sub: &str
 
 /// 普通按钮
 fn btn(text: &str, size: f32, w: f32) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.to_owned()).size(size).color(pal().text))
-        .min_size(egui::vec2(w, 30.0))
+    egui::Button::new(
+        egui::RichText::new(text.to_owned())
+            .size(size)
+            .color(pal().text),
+    )
+    .min_size(egui::vec2(w, 30.0))
 }
 
 /// 主操作按钮：可用时蓝底白字，不可用时灰底灰字
@@ -1890,7 +1966,6 @@ fn btn_primary(text: &str, w: f32, on: bool) -> egui::Button<'static> {
     .min_size(egui::vec2(w, 30.0))
 }
 
-
 /// 按钮 hover 统一样式：先说什么事，再给出等价命令
 fn with_cli(resp: egui::Response, key: &str) -> egui::Response {
     match cli_map::cli_for(key) {
@@ -1901,8 +1976,12 @@ fn with_cli(resp: egui::Response, key: &str) -> egui::Response {
 
 /// 小号次要按钮（列表下方的批量动作）
 fn btn_small(text: &str, w: f32) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.to_owned()).size(12.0).color(pal().text))
-        .min_size(egui::vec2(w, 27.0))
+    egui::Button::new(
+        egui::RichText::new(text.to_owned())
+            .size(12.0)
+            .color(pal().text),
+    )
+    .min_size(egui::vec2(w, 27.0))
 }
 
 /// 「键 / 值」一行
@@ -1913,8 +1992,12 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
             [88.0, 18.0],
             egui::Label::new(egui::RichText::new(key).size(12.0).color(pal().muted)),
         );
-        ui.label(egui::RichText::new(elide(value, 76)).size(12.5).color(pal().text))
-            .on_hover_text(value);
+        ui.label(
+            egui::RichText::new(elide(value, 76))
+                .size(12.5)
+                .color(pal().text),
+        )
+        .on_hover_text(value);
     });
     ui.add_space(2.0);
 }
@@ -1958,14 +2041,7 @@ fn mode_btn(text: &str, on: bool, w: f32) -> egui::Button<'static> {
 }
 
 /// 精确占位的列单元格：宽度就是 `w`，表头与表体用同一份宽度才能对齐。
-fn col_cell(
-    ui: &mut egui::Ui,
-    w: f32,
-    text: &str,
-    size: f32,
-    color: egui::Color32,
-    right: bool,
-) {
+fn col_cell(ui: &mut egui::Ui, w: f32, text: &str, size: f32, color: egui::Color32, right: bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
@@ -2044,7 +2120,11 @@ fn metric_block(ui: &mut egui::Ui, title: &str, value: &str, sub: &str, color: e
                 .color(color),
         );
         ui.add_space(2.0);
-        ui.label(egui::RichText::new(sub.to_owned()).size(11.0).color(pal().grey));
+        ui.label(
+            egui::RichText::new(sub.to_owned())
+                .size(11.0)
+                .color(pal().grey),
+        );
     });
 }
 
@@ -2099,8 +2179,7 @@ fn cmp_bar(
         p.rect_filled(track, egui::CornerRadius::same(3), pal().line);
         let wpx = (bar_w as f64 * (v / max)).clamp(0.0, bar_w as f64) as f32;
         if wpx > 0.5 {
-            let bar =
-                egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(wpx, 6.0));
+            let bar = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(wpx, 6.0));
             p.rect_filled(bar, egui::CornerRadius::same(3), fill);
         }
     };
@@ -2108,7 +2187,11 @@ fn cmp_bar(
     draw(
         rect.top() + 46.0,
         live,
-        if live > base { pal().amber } else { pal().accent },
+        if live > base {
+            pal().amber
+        } else {
+            pal().accent
+        },
     );
 }
 
@@ -2190,7 +2273,10 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
         Page::Baseline => {
             p.circle_stroke(c, 6.5, s);
             p.line_segment(
-                [egui::pos2(c.x - 4.5, c.y + 2.0), egui::pos2(c.x + 4.5, c.y - 2.0)],
+                [
+                    egui::pos2(c.x - 4.5, c.y + 2.0),
+                    egui::pos2(c.x + 4.5, c.y - 2.0),
+                ],
                 s,
             );
         }
@@ -2202,11 +2288,17 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
                 egui::StrokeKind::Middle,
             );
             p.line_segment(
-                [egui::pos2(c.x - 2.5, c.y - 0.5), egui::pos2(c.x - 0.5, c.y + 2.0)],
+                [
+                    egui::pos2(c.x - 2.5, c.y - 0.5),
+                    egui::pos2(c.x - 0.5, c.y + 2.0),
+                ],
                 s,
             );
             p.line_segment(
-                [egui::pos2(c.x - 0.5, c.y + 2.0), egui::pos2(c.x + 3.0, c.y - 2.5)],
+                [
+                    egui::pos2(c.x - 0.5, c.y + 2.0),
+                    egui::pos2(c.x + 3.0, c.y - 2.5),
+                ],
                 s,
             );
         }
@@ -2222,7 +2314,10 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
                 s,
             );
             p.line_segment(
-                [egui::pos2(c.x - 5.5, c.y + 6.0), egui::pos2(c.x + 5.5, c.y + 6.0)],
+                [
+                    egui::pos2(c.x - 5.5, c.y + 6.0),
+                    egui::pos2(c.x + 5.5, c.y + 6.0),
+                ],
                 s,
             );
         }
@@ -2238,15 +2333,24 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
                 egui::StrokeKind::Middle,
             );
             p.line_segment(
-                [egui::pos2(c.x + 3.0, c.y + 1.0), egui::pos2(c.x + 3.0, c.y - 5.5)],
+                [
+                    egui::pos2(c.x + 3.0, c.y + 1.0),
+                    egui::pos2(c.x + 3.0, c.y - 5.5),
+                ],
                 s,
             );
             p.line_segment(
-                [egui::pos2(c.x + 0.6, c.y - 3.2), egui::pos2(c.x + 3.0, c.y - 5.8)],
+                [
+                    egui::pos2(c.x + 0.6, c.y - 3.2),
+                    egui::pos2(c.x + 3.0, c.y - 5.8),
+                ],
                 s,
             );
             p.line_segment(
-                [egui::pos2(c.x + 5.4, c.y - 3.2), egui::pos2(c.x + 3.0, c.y - 5.8)],
+                [
+                    egui::pos2(c.x + 5.4, c.y - 3.2),
+                    egui::pos2(c.x + 3.0, c.y - 5.8),
+                ],
                 s,
             );
         }
@@ -2265,7 +2369,10 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
             );
             for (dx, dy) in [(-3.0f32, -2.0f32), (1.0, -2.0), (-3.0, 2.0), (1.0, 2.0)] {
                 p.rect_filled(
-                    egui::Rect::from_center_size(egui::pos2(c.x + dx, c.y + dy), egui::vec2(2.6, 2.6)),
+                    egui::Rect::from_center_size(
+                        egui::pos2(c.x + dx, c.y + dy),
+                        egui::vec2(2.6, 2.6),
+                    ),
                     egui::CornerRadius::same(1),
                     color,
                 );
@@ -2298,7 +2405,10 @@ fn nav_icon(p: &egui::Painter, c: egui::Pos2, page: Page, color: egui::Color32) 
                 s,
             );
             p.line_segment(
-                [egui::pos2(c.x + 0.5, c.y + 3.5), egui::pos2(c.x + 5.0, c.y + 3.5)],
+                [
+                    egui::pos2(c.x + 0.5, c.y + 3.5),
+                    egui::pos2(c.x + 5.0, c.y + 3.5),
+                ],
                 s,
             );
         }
@@ -2329,14 +2439,24 @@ impl Cols {
         // 类型 / 分级 / 内存 / 保护 / 恢复
         let fixed = 58.0 + 82.0 + 92.0 + 62.0 + 62.0;
         Self {
-            w: [(total - 24.0 - fixed).max(150.0), 58.0, 82.0, 92.0, 62.0, 62.0],
+            w: [
+                (total - 24.0 - fixed).max(150.0),
+                58.0,
+                82.0,
+                92.0,
+                62.0,
+                62.0,
+            ],
         }
     }
 
     /// 第 i 列在 area 里的矩形（0 名称 / 1 类型 / 2 分级 / 3 内存 / 4 保护 / 5 恢复）
     fn rect(&self, area: egui::Rect, i: usize) -> egui::Rect {
         let x = area.left() + self.w[..i].iter().sum::<f32>();
-        egui::Rect::from_min_size(egui::pos2(x, area.top()), egui::vec2(self.w[i], area.height()))
+        egui::Rect::from_min_size(
+            egui::pos2(x, area.top()),
+            egui::vec2(self.w[i], area.height()),
+        )
     }
 }
 
@@ -2365,19 +2485,37 @@ fn table_head(ui: &mut egui::Ui, cols: &Cols) {
         egui::CornerRadius::ZERO,
         pal().line,
     );
-    for (i, t) in ["名称", "类型", "分级", "内存", "保护", "恢复"].iter().enumerate() {
+    for (i, t) in ["名称", "类型", "分级", "内存", "保护", "恢复"]
+        .iter()
+        .enumerate()
+    {
         let c = cols.rect(area, i);
         let (pos, anchor) = match i {
-            3 => (egui::pos2(c.right() - 10.0, c.center().y), egui::Align2::RIGHT_CENTER),
+            3 => (
+                egui::pos2(c.right() - 10.0, c.center().y),
+                egui::Align2::RIGHT_CENTER,
+            ),
             4 | 5 => (c.center(), egui::Align2::CENTER_CENTER),
-            _ => (egui::pos2(c.left(), c.center().y), egui::Align2::LEFT_CENTER),
+            _ => (
+                egui::pos2(c.left(), c.center().y),
+                egui::Align2::LEFT_CENTER,
+            ),
         };
-        p.text(pos, anchor, *t, egui::FontId::proportional(12.0), pal().muted);
+        p.text(
+            pos,
+            anchor,
+            *t,
+            egui::FontId::proportional(12.0),
+            pal().muted,
+        );
     }
     for k in [3usize, 4, 5] {
         let c = cols.rect(area, k);
         p.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(c.left(), rect.top()), egui::vec2(1.0, rect.height())),
+            egui::Rect::from_min_size(
+                egui::pos2(c.left(), rect.top()),
+                egui::vec2(1.0, rect.height()),
+            ),
             egui::CornerRadius::ZERO,
             pal().line,
         );
@@ -2394,13 +2532,23 @@ impl RecoverCols {
     fn new(total: f32) -> Self {
         let fixed = 84.0 + 84.0 + 84.0 + 92.0 + 62.0;
         Self {
-            w: [(total - 24.0 - fixed).max(160.0), 84.0, 84.0, 84.0, 92.0, 62.0],
+            w: [
+                (total - 24.0 - fixed).max(160.0),
+                84.0,
+                84.0,
+                84.0,
+                92.0,
+                62.0,
+            ],
         }
     }
 
     fn rect(&self, area: egui::Rect, i: usize) -> egui::Rect {
         let x = area.left() + self.w[..i].iter().sum::<f32>();
-        egui::Rect::from_min_size(egui::pos2(x, area.top()), egui::vec2(self.w[i], area.height()))
+        egui::Rect::from_min_size(
+            egui::pos2(x, area.top()),
+            egui::vec2(self.w[i], area.height()),
+        )
     }
 }
 
@@ -2422,19 +2570,37 @@ fn recover_table_head(ui: &mut egui::Ui, cols: &RecoverCols) {
         egui::CornerRadius::ZERO,
         pal().line,
     );
-    for (i, t) in ["名称", "当前", "开机", "增长", "状态", "重启"].iter().enumerate() {
+    for (i, t) in ["名称", "当前", "开机", "增长", "状态", "重启"]
+        .iter()
+        .enumerate()
+    {
         let c = cols.rect(area, i);
         let (pos, anchor) = match i {
-            1 | 2 | 3 => (egui::pos2(c.right() - 10.0, c.center().y), egui::Align2::RIGHT_CENTER),
+            1 | 2 | 3 => (
+                egui::pos2(c.right() - 10.0, c.center().y),
+                egui::Align2::RIGHT_CENTER,
+            ),
             5 => (c.center(), egui::Align2::CENTER_CENTER),
-            _ => (egui::pos2(c.left(), c.center().y), egui::Align2::LEFT_CENTER),
+            _ => (
+                egui::pos2(c.left(), c.center().y),
+                egui::Align2::LEFT_CENTER,
+            ),
         };
-        p.text(pos, anchor, *t, egui::FontId::proportional(12.0), pal().muted);
+        p.text(
+            pos,
+            anchor,
+            *t,
+            egui::FontId::proportional(12.0),
+            pal().muted,
+        );
     }
     for k in 1usize..6 {
         let c = cols.rect(area, k);
         p.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(c.left(), rect.top()), egui::vec2(1.0, rect.height())),
+            egui::Rect::from_min_size(
+                egui::pos2(c.left(), rect.top()),
+                egui::vec2(1.0, rect.height()),
+            ),
             egui::CornerRadius::ZERO,
             pal().line,
         );
@@ -2481,7 +2647,12 @@ impl App {
         } else if resp.hovered() {
             p.rect_filled(rect, egui::CornerRadius::same(5), pal().row_hover);
         }
-        nav_icon(p, egui::pos2(rect.left() + 16.0, rect.center().y), page, if sel { pal().accent } else { pal().muted });
+        nav_icon(
+            p,
+            egui::pos2(rect.left() + 16.0, rect.center().y),
+            page,
+            if sel { pal().accent } else { pal().muted },
+        );
         p.text(
             egui::pos2(rect.left() + 34.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -2585,7 +2756,10 @@ impl App {
                     .count();
                 if picked > 0 {
                     ui.add_space(8.0);
-                    if ui.add(btn(&format!("清空勾选 {}", picked), 11.5, 96.0)).clicked() {
+                    if ui
+                        .add(btn(&format!("清空勾选 {}", picked), 11.5, 96.0))
+                        .clicked()
+                    {
                         for r in self.recover_rows.iter_mut() {
                             r.pick = false;
                         }
@@ -2785,7 +2959,8 @@ impl App {
                         continue;
                     }
                     let w = ui.available_width();
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::hover());
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::hover());
                     let hovered = resp.hovered();
                     let fill = if r.protect {
                         pal().bg
@@ -2835,7 +3010,11 @@ impl App {
                     p.rect_filled(
                         tile,
                         egui::CornerRadius::same(4),
-                        if r.kind == Kind::Process { pal().accent } else { pal().grey },
+                        if r.kind == Kind::Process {
+                            pal().accent
+                        } else {
+                            pal().grey
+                        },
                     );
                     let initial = r
                         .name
@@ -2851,7 +3030,11 @@ impl App {
                         pal().on_accent,
                     );
 
-                    let name_color = if r.protect || !r.pick { pal().muted } else { pal().text };
+                    let name_color = if r.protect || !r.pick {
+                        pal().muted
+                    } else {
+                        pal().text
+                    };
                     let mut shown_name = r.name.clone();
                     if r.instances > 1 {
                         shown_name = format!("{}  · {} 实例", shown_name, r.instances);
@@ -2868,7 +3051,11 @@ impl App {
                     p.text(
                         egui::pos2(kc.left(), rect.center().y),
                         egui::Align2::LEFT_CENTER,
-                        if r.kind == Kind::Process { "进程" } else { "服务" },
+                        if r.kind == Kind::Process {
+                            "进程"
+                        } else {
+                            "服务"
+                        },
                         egui::FontId::proportional(12.0),
                         pal().muted,
                     );
@@ -2892,12 +3079,19 @@ impl App {
                         egui::Align2::RIGHT_CENTER,
                         fmt_mb(r.mem_mb),
                         egui::FontId::proportional(12.5),
-                        if r.mem_mb >= 200.0 && r.pick { pal().red } else { pal().muted },
+                        if r.mem_mb >= 200.0 && r.pick {
+                            pal().red
+                        } else {
+                            pal().muted
+                        },
                     );
 
                     // 保护：勾上就写进保护名单
                     let mut prot = r.protect;
-                    let pc = egui::Rect::from_center_size(cols.rect(area, 4).center(), egui::vec2(22.0, 22.0));
+                    let pc = egui::Rect::from_center_size(
+                        cols.rect(area, 4).center(),
+                        egui::vec2(22.0, 22.0),
+                    );
                     let presp = ui.put(pc, egui::Checkbox::without_text(&mut prot));
                     if presp.changed() {
                         toggled.push((i, prot));
@@ -2918,12 +3112,15 @@ impl App {
                     // 恢复：勾上就参与这一轮关闭
                     let mut pk = r.pick;
                     let can = can_pick(r, include_caution);
-                    let rc = egui::Rect::from_center_size(cols.rect(area, 5).center(), egui::vec2(22.0, 22.0));
+                    let rc = egui::Rect::from_center_size(
+                        cols.rect(area, 5).center(),
+                        egui::vec2(22.0, 22.0),
+                    );
                     let rresp = ui
                         .scope_builder(
-                            egui::UiBuilder::new()
-                                .max_rect(rc)
-                                .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
+                            egui::UiBuilder::new().max_rect(rc).layout(
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            ),
                             |ui| ui.add_enabled(can, egui::Checkbox::without_text(&mut pk)),
                         )
                         .inner;
@@ -3576,7 +3773,11 @@ impl App {
             {
                 self.cmp_all = all;
             }
-            let n = self.growth.iter().filter(|r| all || r.delta_mb > 0.5).count();
+            let n = self
+                .growth
+                .iter()
+                .filter(|r| all || r.delta_mb > 0.5)
+                .count();
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!("{} 项", n))
@@ -3791,9 +3992,11 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.add_space(16.0);
                         ui.label(
-                            egui::RichText::new("基准里没有值得砍的项；要减少开机常驻，去「启动项」页看")
-                                .size(12.5)
-                                .color(pal().grey),
+                            egui::RichText::new(
+                                "基准里没有值得砍的项；要减少开机常驻，去「启动项」页看",
+                            )
+                            .size(12.5)
+                            .color(pal().grey),
                         );
                     });
                     return;
@@ -3865,8 +4068,11 @@ impl App {
                             *slot = v;
                         }
                     }
-                    resp.on_hover_text(format!("{}
-{}", it.reason, it.path));
+                    resp.on_hover_text(format!(
+                        "{}
+{}",
+                        it.reason, it.path
+                    ));
                     ui.add_space(2.0);
                 }
             });
@@ -3943,7 +4149,11 @@ impl App {
                     p.rect_filled(
                         rect,
                         egui::CornerRadius::ZERO,
-                        if resp.hovered() { pal().row_hover } else { pal().card },
+                        if resp.hovered() {
+                            pal().row_hover
+                        } else {
+                            pal().card
+                        },
                     );
                     p.rect_filled(
                         egui::Rect::from_min_size(
@@ -4002,8 +4212,11 @@ impl App {
                     if r.clicked() {
                         toggle = Some((idx, !it.enabled));
                     }
-                    resp.on_hover_text(format!("{}
-{}", it.command, it.detail));
+                    resp.on_hover_text(format!(
+                        "{}
+{}",
+                        it.command, it.detail
+                    ));
                     ui.add_space(2.0);
                 }
             });
@@ -4069,18 +4282,33 @@ impl App {
                 kv_row(
                     ui,
                     "保护名单",
-                    &format!("{} 条 · {}", self.whitelist().len(), self.protect_file.to_string_lossy()),
+                    &format!(
+                        "{} 条 · {}",
+                        self.whitelist().len(),
+                        self.protect_file.to_string_lossy()
+                    ),
                 );
                 ui.add_space(10.0);
-                note(ui, "基准 = 刚开机时该有的样子；刷新对比时多出来的东西才会出现在「进程」页。", pal().muted);
-                note(ui, "把当前状态设为基准，会把此刻开着的浏览器、游戏一并算进去，之后不再清理。", pal().amber);
+                note(
+                    ui,
+                    "基准 = 刚开机时该有的样子；刷新对比时多出来的东西才会出现在「进程」页。",
+                    pal().muted,
+                );
+                note(
+                    ui,
+                    "把当前状态设为基准，会把此刻开着的浏览器、游戏一并算进去，之后不再清理。",
+                    pal().amber,
+                );
             });
     }
 
     /// 保护名单页：和 protect.txt 是同一个文件，改完立刻生效
     fn page_protect(&mut self, ui: &mut egui::Ui) {
         let items = self.whitelist();
-        let sub = format!("{} 条规则 · 与列表里的「保护」勾选框同一个文件", items.len());
+        let sub = format!(
+            "{} 条规则 · 与列表里的「保护」勾选框同一个文件",
+            items.len()
+        );
         let mut remove: Option<String> = None;
         page_head(ui, "保护名单", &sub, |ui| {
             if ui
@@ -4180,7 +4408,11 @@ impl App {
 
     /// 开机采集页：把 `MemBase.exe install --at N` 做成按钮
     fn page_boot(&mut self, ui: &mut egui::Ui) {
-        let sub = if self.boot.installed { "已安排" } else { "未安排" };
+        let sub = if self.boot.installed {
+            "已安排"
+        } else {
+            "未安排"
+        };
         page_head(ui, "开机采集", sub, |ui| {
             let can = self.is_admin;
             let label = if self.boot.installed {
@@ -4188,11 +4420,11 @@ impl App {
             } else {
                 "安排下次开机采集"
             };
-            let b = egui::Button::new(
-                egui::RichText::new(label)
-                    .size(13.0)
-                    .color(if can { pal().on_accent } else { pal().muted }),
-            )
+            let b = egui::Button::new(egui::RichText::new(label).size(13.0).color(if can {
+                pal().on_accent
+            } else {
+                pal().muted
+            }))
             .fill(if can { pal().accent } else { pal().disabled_bg })
             .min_size(egui::vec2(160.0, 30.0));
             let resp = ui.add_enabled(can, b);
@@ -4212,8 +4444,7 @@ impl App {
                 ui.add_space(8.0);
                 let r = ui.add(btn("取消安排", 12.5, 88.0));
                 let r = with_cli(r, "boot_uninstall");
-                if r.clicked()
-                {
+                if r.clicked() {
                     self.remove_boot();
                 }
             }
@@ -4224,7 +4455,11 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.label(egui::RichText::new("开机后第").size(12.0).color(pal().muted));
+                    ui.label(
+                        egui::RichText::new("开机后第")
+                            .size(12.0)
+                            .color(pal().muted),
+                    );
                     ui.add(
                         egui::DragValue::new(&mut self.boot_at)
                             .range(5..=600)
@@ -4259,7 +4494,11 @@ impl App {
                     }
                     if self.boot_also {
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("第二次在第").size(12.0).color(pal().muted));
+                        ui.label(
+                            egui::RichText::new("第二次在第")
+                                .size(12.0)
+                                .color(pal().muted),
+                        );
                         ui.add(
                             egui::DragValue::new(&mut self.boot_also_at)
                                 .range((self.boot_at + 10)..=1800)
@@ -4277,7 +4516,11 @@ impl App {
                     &if self.boot.installed {
                         format!(
                             "已安排：开机第 {} 秒",
-                            if self.boot.at_sec >= 5 { self.boot.at_sec } else { self.boot_at }
+                            if self.boot.at_sec >= 5 {
+                                self.boot.at_sec
+                            } else {
+                                self.boot_at
+                            }
                         )
                     } else {
                         "未安排".to_owned()
@@ -4287,11 +4530,23 @@ impl App {
                 kv_row(
                     ui,
                     "运行身份",
-                    if self.is_admin { "管理员" } else { "普通用户（无法安排任务）" },
+                    if self.is_admin {
+                        "管理员"
+                    } else {
+                        "普通用户（无法安排任务）"
+                    },
                 );
                 ui.add_space(10.0);
-                note(ui, "采集完任务与程序副本会自动删除，不留常驻进程。", pal().muted);
-                note(ui, "采集本身通常几十毫秒，对开机体验没有可感知影响。", pal().muted);
+                note(
+                    ui,
+                    "采集完任务与程序副本会自动删除，不留常驻进程。",
+                    pal().muted,
+                );
+                note(
+                    ui,
+                    "采集本身通常几十毫秒，对开机体验没有可感知影响。",
+                    pal().muted,
+                );
             });
     }
 
@@ -4320,8 +4575,9 @@ impl App {
                     ui,
                     "版本",
                     &format!(
-                        "MemBase {} · MemBase.exe（egui · 纯 Rust）",
-                        env!("CARGO_PKG_VERSION")
+                        "MemBase {} · {}（egui · 纯 Rust）",
+                        env!("CARGO_PKG_VERSION"),
+                        CLI_EXE
                     ),
                 );
                 kv_row(ui, "布局目录", &store::dir().to_string_lossy());
@@ -4398,7 +4654,6 @@ impl App {
             });
     }
 
-
     // ================= 桌面布局：数据与动作 =================
 
     /// 重新读布局目录，尽量保住当前选中项
@@ -4428,11 +4683,11 @@ impl App {
                 self.lay_arrange = None;
             }
         }
-        let (w, h) = membase_win::sys::screen_size();
+        let (w, h) = plat::sys::screen_size();
         self.lay_screen = format!("{}×{}", w, h);
         self.lay_shell = ShellView::try_open().is_some();
         self.lay_cache = repair::describe_cache();
-        self.lay_autostart = membase_win::task::query_layout(membase_win::task::LAYOUT_TASK);
+        self.lay_autostart = plat::task::query_layout(plat::task::LAYOUT_TASK);
     }
 
     /// 差异只在选中项 / 桌面状态变化时重算：每帧读 explorer 内存太贵
@@ -4501,9 +4756,9 @@ impl App {
 
     /// 开关「登录后自动恢复布局」：装/删计划任务，跑完即退，不做常驻
     fn toggle_layout_autostart(&mut self) {
-        let task = membase_win::task::LAYOUT_TASK;
+        let task = plat::task::LAYOUT_TASK;
         if self.lay_autostart.is_some() {
-            match membase_win::task::uninstall(task) {
+            match plat::task::uninstall(task) {
                 Ok(()) => {
                     self.lay_autostart = None;
                     self.status = "已关闭「登录后自动恢复布局」".into();
@@ -4523,7 +4778,7 @@ impl App {
             return;
         };
         let root = std::path::PathBuf::from(membase_core::default_root());
-        match membase_win::task::install_layout(&me, &root, &name, 30, task) {
+        match plat::task::install_layout(&me, &root, &name, 30, task) {
             Ok(_) => {
                 self.lay_autostart = Some(name.clone());
                 self.status = format!(
@@ -4575,7 +4830,9 @@ impl App {
     }
 
     fn do_layout_diff(&mut self) {
-        let Some(entry) = self.current_layout() else { return };
+        let Some(entry) = self.current_layout() else {
+            return;
+        };
         let name = entry.display_name().to_string();
         self.plan_cache = None;
         self.refresh_plan();
@@ -4595,7 +4852,9 @@ impl App {
     }
 
     fn do_layout_delete(&mut self, index: usize) {
-        let Some(entry) = self.layouts.get(index) else { return };
+        let Some(entry) = self.layouts.get(index) else {
+            return;
+        };
         let name = entry.display_name().to_string();
         match store::delete_entry(entry) {
             Ok(()) => {
@@ -4634,7 +4893,10 @@ impl App {
             self.icons_pending = true;
             return None;
         }
-        let handle = self.icons.get(name).map(|img| upload_texture(ctx, name, img));
+        let handle = self
+            .icons
+            .get(name)
+            .map(|img| upload_texture(ctx, name, img));
         self.icon_tex.insert(name.to_string(), handle.clone());
         handle
     }
@@ -4681,9 +4943,9 @@ impl App {
 
     /// 工具页要显示的三件事：几台显示器、关屏通道通不通、上次什么时候息屏
     fn refresh_screen_status(&mut self) {
-        self.scr_monitors = membase_win::screen::monitor_count();
-        self.scr_channel = membase_win::screen::probe();
-        self.scr_last = membase_win::screen::last_off().unwrap_or_default();
+        self.scr_monitors = plat::screen::monitor_count();
+        self.scr_channel = plat::screen::probe();
+        self.scr_last = plat::screen::last_off().unwrap_or_default();
     }
 
     /// 进入息屏：窗口铺成全屏纯黑；**默认不动显示器电源**。
@@ -4694,15 +4956,15 @@ impl App {
     ///
     /// 顺序不能反：**先按住系统，再关屏**。关屏消息发出去到面板真灭有一小段空档，
     /// 那一段里不该让空闲计时器把机器带睡（真正会触发待机的是 `lParam = 2`，
-    /// 现在用的是低功耗的 `1`，见 `membase_win::screen` 模块头）。
+    /// 现在用的是低功耗的 `1`，见 `plat::screen` 模块头）。
     fn enter_blackout(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         let secs = self.bo_secs;
         let mut note = String::new();
         let mut powered = false;
-        membase_win::screen::hold_awake(true);
-        if !self.bo_test && membase_win::screen::power_off() {
-            match membase_win::screen::off() {
+        plat::screen::hold_awake(true);
+        if !self.bo_test && plat::screen::power_off() {
+            match plat::screen::off() {
                 // 关不掉也不算失败：黑屏照样挡住内容，只是费点电，如实告诉用户
                 Ok(()) => powered = true,
                 Err(e) => note = format!("（{}）", e),
@@ -4716,11 +4978,11 @@ impl App {
             std::sync::Arc::new(move || ctx.request_repaint())
                 as std::sync::Arc<dyn Fn() + Send + Sync>
         };
-        match membase_win::screen::Watch::start(
+        match plat::screen::Watch::start(
             self.bo_key,
             // 自检模式下不认鼠标移动：截图验收时谁碰一下鼠标都会把黑屏层收掉
-            !self.bo_test && membase_win::screen::mouse_exit(),
-            !self.bo_test && membase_win::screen::block_keys(),
+            !self.bo_test && plat::screen::mouse_exit(),
+            !self.bo_test && plat::screen::block_keys(),
             Some(wake_ui),
         ) {
             Ok(w) => self.bo_watch = Some(w),
@@ -4744,7 +5006,7 @@ impl App {
             egui::WindowLevel::AlwaysOnTop,
         ));
         // 息屏就是一片纯黑，鼠标指针也得收掉，不然屏幕上永远挂着一个箭头
-        membase_win::screen::hide_cursor();
+        plat::screen::hide_cursor();
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         ctx.request_repaint();
     }
@@ -4761,15 +5023,15 @@ impl App {
             egui::WindowLevel::Normal,
         ));
         // 不管之前是什么状态，退出息屏都把指针还回来
-        membase_win::screen::show_cursor();
+        plat::screen::show_cursor();
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         if powered {
-            membase_win::screen::wake();
+            plat::screen::wake();
         } else {
-            membase_win::screen::wake_light();
+            plat::screen::wake_light();
         }
         // 松开息屏期间按住的那只手：之后系统照电源计划走
-        membase_win::screen::hold_awake(false);
+        plat::screen::hold_awake(false);
         self.refresh_screen_status();
         self.status = format!(
             "已退出息屏（{}）· 同 CLI：MemBase.exe screen off --seconds {} --exit-key {}",
@@ -4794,11 +5056,7 @@ impl App {
         // 全局监听（首选）：跟窗口焦点、显示器开关、窗口是否被隐藏都无关
         let watched = self.bo_watch.as_ref().and_then(|w| w.hit());
         // 监听线程自己没了就说明「再也收不到退出」，宁可多退一次也别把人关在黑屏里
-        let watch_dead = self
-            .bo_watch
-            .as_ref()
-            .map(|w| !w.alive())
-            .unwrap_or(false);
+        let watch_dead = self.bo_watch.as_ref().map(|w| !w.alive()).unwrap_or(false);
 
         if timed_out {
             self.exit_blackout(ctx, "到时间了");
@@ -4823,10 +5081,10 @@ impl App {
         });
         let click = ctx.input(|i| i.pointer.any_click());
         let hot = match self.bo_key {
-            membase_win::screen::ExitKey::Esc => ctx.input(|i| i.key_pressed(egui::Key::Escape)),
-            membase_win::screen::ExitKey::Space => ctx.input(|i| i.key_pressed(egui::Key::Space)),
-            membase_win::screen::ExitKey::Enter => ctx.input(|i| i.key_pressed(egui::Key::Enter)),
-            membase_win::screen::ExitKey::Any => any_key,
+            plat::screen::ExitKey::Esc => ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+            plat::screen::ExitKey::Space => ctx.input(|i| i.key_pressed(egui::Key::Space)),
+            plat::screen::ExitKey::Enter => ctx.input(|i| i.key_pressed(egui::Key::Enter)),
+            plat::screen::ExitKey::Any => any_key,
         };
         if hot || click {
             let why = if click {
@@ -4861,7 +5119,7 @@ impl App {
                 format!(
                     "按 {} 退出 · {} 后自动亮",
                     self.bo_key.label(),
-                    membase_win::screen::fmt_hms(left)
+                    plat::screen::fmt_hms(left)
                 )
             }
             None => format!("按 {} 退出", self.bo_key.label()),
@@ -4882,9 +5140,7 @@ impl App {
             .current_layout()
             .map(|e| e.display_name().to_string())
             .unwrap_or_else(|| "<名字>".into());
-        cli_map::cli_for(key)
-            .unwrap_or("")
-            .replace("<名字>", &name)
+        cli_map::cli_for(key).unwrap_or("").replace("<名字>", &name)
     }
 
     /// 从保护名单里删掉一条，并立刻重新对比
@@ -4896,7 +5152,6 @@ impl App {
         self.status = format!("已从保护名单移除 {}", key);
     }
 }
-
 
 /// 两个新页面（桌面布局 / 命令行）单独开一块 impl，避免和原有方法挤在一起
 impl App {
@@ -4915,7 +5170,10 @@ impl App {
                 arrange,
                 self.lay_screen
             ),
-            None => format!("{} 份布局 · 连不上桌面（explorer 没在跑？）", self.layouts.len()),
+            None => format!(
+                "{} 份布局 · 连不上桌面（explorer 没在跑？）",
+                self.layouts.len()
+            ),
         };
 
         page_head(ui, "桌面布局", &sub, |ui| {
@@ -4949,7 +5207,11 @@ impl App {
 
             ui.add_space(8.0);
             let auto_on = self.lay_autostart.is_some();
-            let auto_label = if auto_on { "关闭登录恢复" } else { "登录自动恢复" };
+            let auto_label = if auto_on {
+                "关闭登录恢复"
+            } else {
+                "登录自动恢复"
+            };
             let resp = ui.add(btn(auto_label, 12.5, 124.0));
             let resp = if auto_on {
                 resp.on_hover_text(format!(
@@ -4961,7 +5223,8 @@ impl App {
                     "登录后第 30 秒自动把图标摆回选中布局（跑完就退出，不常驻）
 需要管理员权限
 同 CLI：{}",
-                    cli_map::cli_for("layout_autostart").unwrap_or("MemBase.exe layout autostart on <名字>")
+                    cli_map::cli_for("layout_autostart")
+                        .unwrap_or("MemBase.exe layout autostart on <名字>")
                 ))
             };
             if resp.clicked() {
@@ -5248,7 +5511,11 @@ impl App {
                         "shell 接口 不可用"
                     })
                     .size(11.5)
-                    .color(if self.lay_shell { pal().green } else { pal().amber }),
+                    .color(if self.lay_shell {
+                        pal().green
+                    } else {
+                        pal().amber
+                    }),
                 );
                 ui.add_space(10.0);
                 ui.label(
@@ -5319,7 +5586,10 @@ impl App {
                 dashed_rect(
                     &painter,
                     r,
-                    egui::Stroke::new(1.3, egui::Color32::from_rgba_unmultiplied(0x6F, 0x8C, 0xFF, 0xE6)),
+                    egui::Stroke::new(
+                        1.3,
+                        egui::Color32::from_rgba_unmultiplied(0x6F, 0x8C, 0xFF, 0xE6),
+                    ),
                     4.0,
                     3.0,
                 );
@@ -5386,7 +5656,10 @@ impl App {
         painter.rect_stroke(
             screen,
             egui::CornerRadius::same(4),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0x64, 0x74, 0x94, 0x66)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(0x64, 0x74, 0x94, 0x66),
+            ),
             egui::StrokeKind::Inside,
         );
 
@@ -5395,14 +5668,17 @@ impl App {
         }
     }
 
-
     /// 工具页：息屏（离开座位）+ 一块系统信息
     fn page_tools(&mut self, ui: &mut egui::Ui) {
         let sub = format!(
             "{} 台显示器 · {} · 关屏通道{}",
             self.scr_monitors,
             self.lay_screen,
-            if self.scr_channel { "可用" } else { "不可用" }
+            if self.scr_channel {
+                "可用"
+            } else {
+                "不可用"
+            }
         );
         page_head(ui, "工具", &sub, |ui| {
             let r = ui.add(btn("刷新", 12.5, 64.0));
@@ -5481,15 +5757,15 @@ impl App {
                     );
                     if r1.changed() || r2.changed() || r3.changed() {
                         self.bo_secs = hh * 3600 + mm * 60 + ss;
-                        let _ = membase_win::screen::set_default_secs(self.bo_secs);
+                        let _ = plat::screen::set_default_secs(self.bo_secs);
                         self.status = format!(
                             "默认息屏时长已设为 {} · 同 CLI：MemBase.exe screen duration {}",
                             if self.bo_secs == 0 {
                                 "不定时".to_string()
                             } else {
-                                membase_win::screen::fmt_hms(self.bo_secs)
+                                plat::screen::fmt_hms(self.bo_secs)
                             },
-                            membase_win::screen::fmt_hms(self.bo_secs)
+                            plat::screen::fmt_hms(self.bo_secs)
                         );
                     }
                     let hov = format!(
@@ -5507,12 +5783,12 @@ impl App {
                             .on_hover_text(format!(
                                 "一键设为 {}\n同 CLI：MemBase.exe screen duration {}",
                                 label,
-                                membase_win::screen::fmt_hms(secs)
+                                plat::screen::fmt_hms(secs)
                             ))
                             .clicked()
                         {
                             self.bo_secs = secs;
-                            let _ = membase_win::screen::set_default_secs(secs);
+                            let _ = plat::screen::set_default_secs(secs);
                             self.status = format!("默认息屏时长已设为 {}", label);
                         }
                         ui.add_space(4.0);
@@ -5528,12 +5804,12 @@ impl App {
                         .selected_text(self.bo_key.label())
                         .width(96.0)
                         .show_ui(ui, |ui| {
-                            for k in membase_win::screen::ExitKey::all() {
+                            for k in plat::screen::ExitKey::all() {
                                 ui.selectable_value(&mut self.bo_key, k, k.label());
                             }
                         });
                     if self.bo_key != before {
-                        let _ = membase_win::screen::set_exit_key(self.bo_key);
+                        let _ = plat::screen::set_exit_key(self.bo_key);
                         self.status = format!(
                             "退出热键已改为 {} · 同 CLI：MemBase.exe screen key {}",
                             self.bo_key.label(),
@@ -5556,7 +5832,7 @@ impl App {
                         "真的把面板电断掉（不是画黑），最省电。\n走低功耗关屏，系统不算「离开」，按一下就回桌面，不跳锁屏。\n个别驱动叫不醒时，按一下电源键。",
                     );
                     if r.changed() {
-                        let _ = membase_win::screen::set_power_off(self.bo_power_off);
+                        let _ = plat::screen::set_power_off(self.bo_power_off);
                         self.status = if self.bo_power_off {
                             "已打开「同时关闭显示器」：退出时会尝试叫醒显示器".into()
                         } else {
@@ -5604,7 +5880,7 @@ impl App {
                         "MemBase.exe screen off --seconds {} --exit-key {}  ·  MemBase.exe screen duration {}",
                         self.bo_secs,
                         self.bo_key.as_str(),
-                        membase_win::screen::fmt_hms(self.bo_secs)
+                        plat::screen::fmt_hms(self.bo_secs)
                     ),
                 );
 
@@ -5624,7 +5900,7 @@ impl App {
                 kv_row(
                     ui,
                     "缩放比例",
-                    &format!("{:.0}%", membase_win::sys::dpi_scale() * 100.0),
+                    &format!("{:.0}%", plat::sys::dpi_scale() * 100.0),
                 );
                 kv_row(
                     ui,
@@ -5640,7 +5916,11 @@ impl App {
                 kv_row(
                     ui,
                     "版本",
-                    &format!("MemBase {} · MemBase.exe（egui · 纯 Rust）", env!("CARGO_PKG_VERSION")),
+                    &format!(
+                        "MemBase {} · {}（egui · 纯 Rust）",
+                        env!("CARGO_PKG_VERSION"),
+                        CLI_EXE
+                    ),
                 );
                 ui.add_space(8.0);
                 note(
@@ -5688,10 +5968,10 @@ impl App {
             ui.add_space(8.0);
             if ui
                 .add(btn("打开接口说明", 12.5, 112.0))
-                .on_hover_text("MemBase.exe help 的完整文本")
+                .on_hover_text(format!("{} help 的完整文本", CLI_EXE))
                 .clicked()
             {
-                self.status = "命令行速查：MemBase.exe help / MemBase.exe commands --json".into();
+                self.status = format!("命令行速查：{} help / {} commands --json", CLI_EXE, CLI_EXE);
             }
         });
 
@@ -5779,7 +6059,6 @@ impl App {
                 );
             });
     }
-
 }
 
 impl eframe::App for App {
@@ -5896,114 +6175,117 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(14, 11)),
             )
             .show(ui, |ui| {
-              ui.horizontal(|ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(320.0, 32.0), egui::Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(rect, egui::CornerRadius::same(6), pal().field_bg);
-                p.rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(6),
-                    egui::Stroke::new(1.0, pal().line),
-                    egui::StrokeKind::Inside,
-                );
-                let c = egui::pos2(rect.left() + 16.0, rect.center().y);
-                p.circle_stroke(c, 5.5, egui::Stroke::new(1.4, pal().muted));
-                p.line_segment(
-                    [
-                        egui::pos2(c.x + 4.0, c.y + 4.0),
-                        egui::pos2(c.x + 8.0, c.y + 8.0),
-                    ],
-                    egui::Stroke::new(1.4, pal().muted),
-                );
-                let edit = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 30.0, rect.top() + 4.0),
-                    egui::pos2(rect.right() - 10.0, rect.bottom() - 4.0),
-                );
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(edit)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .frame(egui::Frame::NONE)
-                                .hint_text(if self.page == Page::Layouts {
-                                    "搜索布局名称"
-                                } else {
-                                    "搜索名称或发布者"
-                                })
-                                .desired_width(edit.width()),
-                        );
-                    },
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 当前整机内存占用：百分比 + 已用 / 总可用
-                    let mem = win::memory_status();
-                    let total_gb = mem.ullTotalPhys as f64 / 1024.0 / 1024.0 / 1024.0;
-                    let used_gb =
-                        mem.ullTotalPhys.saturating_sub(mem.ullAvailPhys) as f64
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(320.0, 32.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(rect, egui::CornerRadius::same(6), pal().field_bg);
+                    p.rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(1.0, pal().line),
+                        egui::StrokeKind::Inside,
+                    );
+                    let c = egui::pos2(rect.left() + 16.0, rect.center().y);
+                    p.circle_stroke(c, 5.5, egui::Stroke::new(1.4, pal().muted));
+                    p.line_segment(
+                        [
+                            egui::pos2(c.x + 4.0, c.y + 4.0),
+                            egui::pos2(c.x + 8.0, c.y + 8.0),
+                        ],
+                        egui::Stroke::new(1.4, pal().muted),
+                    );
+                    let edit = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 30.0, rect.top() + 4.0),
+                        egui::pos2(rect.right() - 10.0, rect.bottom() - 4.0),
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(edit)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .frame(egui::Frame::NONE)
+                                    .hint_text(if self.page == Page::Layouts {
+                                        "搜索布局名称"
+                                    } else {
+                                        "搜索名称或发布者"
+                                    })
+                                    .desired_width(edit.width()),
+                            );
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 当前整机内存占用：百分比 + 已用 / 总可用
+                        let mem = win::memory_status();
+                        let total_gb = mem.ullTotalPhys as f64 / 1024.0 / 1024.0 / 1024.0;
+                        let used_gb = mem.ullTotalPhys.saturating_sub(mem.ullAvailPhys) as f64
                             / 1024.0
                             / 1024.0
                             / 1024.0;
-                    let pct = if total_gb > 0.0 {
-                        used_gb / total_gb * 100.0
-                    } else {
-                        0.0
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "内存 {:.0}% · 已用 {:.1}/{:.1} GB",
-                            pct, used_gb, total_gb
-                        ))
-                        .size(11.5)
-                        .color(if pct >= 85.0 { pal().amber } else { pal().muted }),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "桌面 {} 个图标 · {} 份布局",
-                            self.lay_icons
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|| "—".into()),
-                            self.layouts.len()
-                        ))
-                        .size(11.5)
-                        .color(pal().muted),
-                    );
-                    ui.add_space(12.0);
-                    if self.is_admin {
-                        let text = match (self.page, self.proc_tab) {
-                            (Page::Processes, ProcTab::Recover) => {
-                                let (total, ok, growth) = self.recover_stats();
-                                format!(
-                                    "可回收 {} 项 · 可重启 {} · 增长 {}",
-                                    total,
-                                    ok,
-                                    fmt_mb(growth)
-                                )
-                            }
-                            (Page::Processes, ProcTab::Compare) => format!(
-                                "已用 {} · 比开机 {:+.0} MB",
-                                fmt_mb(self.cmp.live_used_mb),
-                                self.cmp.used_delta()
-                            ),
-                            _ => format!(
-                                "线外 {} 项 · 可释放 {}",
-                                self.rows.len(),
-                                fmt_mb(self.selected_count().1)
-                            ),
+                        let pct = if total_gb > 0.0 {
+                            used_gb / total_gb * 100.0
+                        } else {
+                            0.0
                         };
-                        ui.label(egui::RichText::new(text).size(11.5).color(pal().muted));
-                    } else {
                         ui.label(
-                            egui::RichText::new("以非管理员运行：恢复与开机采集会失败")
-                                .size(11.5)
-                                .color(pal().amber),
+                            egui::RichText::new(format!(
+                                "内存 {:.0}% · 已用 {:.1}/{:.1} GB",
+                                pct, used_gb, total_gb
+                            ))
+                            .size(11.5)
+                            .color(if pct >= 85.0 {
+                                pal().amber
+                            } else {
+                                pal().muted
+                            }),
                         );
-                    }
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "桌面 {} 个图标 · {} 份布局",
+                                self.lay_icons
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "—".into()),
+                                self.layouts.len()
+                            ))
+                            .size(11.5)
+                            .color(pal().muted),
+                        );
+                        ui.add_space(12.0);
+                        if self.is_admin {
+                            let text = match (self.page, self.proc_tab) {
+                                (Page::Processes, ProcTab::Recover) => {
+                                    let (total, ok, growth) = self.recover_stats();
+                                    format!(
+                                        "可回收 {} 项 · 可重启 {} · 增长 {}",
+                                        total,
+                                        ok,
+                                        fmt_mb(growth)
+                                    )
+                                }
+                                (Page::Processes, ProcTab::Compare) => format!(
+                                    "已用 {} · 比开机 {:+.0} MB",
+                                    fmt_mb(self.cmp.live_used_mb),
+                                    self.cmp.used_delta()
+                                ),
+                                _ => format!(
+                                    "线外 {} 项 · 可释放 {}",
+                                    self.rows.len(),
+                                    fmt_mb(self.selected_count().1)
+                                ),
+                            };
+                            ui.label(egui::RichText::new(text).size(11.5).color(pal().muted));
+                        } else {
+                            ui.label(
+                                egui::RichText::new("以非管理员运行：恢复与开机采集会失败")
+                                    .size(11.5)
+                                    .color(pal().amber),
+                            );
+                        }
+                    });
                 });
-              });
             });
 
         // ---------- 状态栏 ----------
@@ -6018,7 +6300,10 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 let r = ui.max_rect();
                 ui.painter().rect_filled(
-                    egui::Rect::from_min_size(egui::pos2(r.left(), r.top()), egui::vec2(r.width(), 1.0)),
+                    egui::Rect::from_min_size(
+                        egui::pos2(r.left(), r.top()),
+                        egui::vec2(r.width(), 1.0),
+                    ),
                     egui::CornerRadius::ZERO,
                     pal().line,
                 );
@@ -6084,7 +6369,11 @@ impl eframe::App for App {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.status.is_empty() {
-                            ui.label(egui::RichText::new(&self.status).size(11.5).color(pal().accent));
+                            ui.label(
+                                egui::RichText::new(&self.status)
+                                    .size(11.5)
+                                    .color(pal().accent),
+                            );
                         }
                     });
                 });
@@ -6160,7 +6449,11 @@ impl eframe::App for App {
                             .color(pal().amber),
                     );
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("受影响的项目：").size(11.5).color(pal().muted));
+                    ui.label(
+                        egui::RichText::new("受影响的项目：")
+                            .size(11.5)
+                            .color(pal().muted),
+                    );
                     let mut shown = 0;
                     for r in &self.rows {
                         if shown >= 10 {
@@ -6185,11 +6478,23 @@ impl eframe::App for App {
                     }
                     let cli = format!(
                         "MemBase.exe trim --execute --yes{} --only {}",
-                        if self.include_caution { " --include-caution" } else { "" },
-                        if names.is_empty() { "<名字>".to_string() } else { names.join(",") }
+                        if self.include_caution {
+                            " --include-caution"
+                        } else {
+                            ""
+                        },
+                        if names.is_empty() {
+                            "<名字>".to_string()
+                        } else {
+                            names.join(",")
+                        }
                     );
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("等价命令：").size(11.5).color(pal().muted));
+                    ui.label(
+                        egui::RichText::new("等价命令：")
+                            .size(11.5)
+                            .color(pal().muted),
+                    );
                     ui.label(
                         egui::RichText::new(elide(&cli, 70))
                             .size(11.0)
@@ -6215,10 +6520,8 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui
                             .add(
-                                egui::Button::new(
-                                    egui::RichText::new("取消").size(13.5),
-                                )
-                                .min_size(egui::vec2(90.0, 32.0)),
+                                egui::Button::new(egui::RichText::new("取消").size(13.5))
+                                    .min_size(egui::vec2(90.0, 32.0)),
                             )
                             .clicked()
                         {
@@ -6354,11 +6657,9 @@ impl eframe::App for App {
                         .size(12.5),
                     );
                     ui.label(
-                        egui::RichText::new(
-                            "采集完成后任务和程序副本会自动删除，不会常驻后台。",
-                        )
-                        .size(11.5)
-                        .color(pal().muted),
+                        egui::RichText::new("采集完成后任务和程序副本会自动删除，不会常驻后台。")
+                            .size(11.5)
+                            .color(pal().muted),
                     );
                     if let Some(ms) = self.collect_ms {
                         ui.label(
@@ -6674,7 +6975,9 @@ impl eframe::App for App {
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("等价命令：").size(11.5).color(pal().muted),
+                        egui::RichText::new("等价命令：")
+                            .size(11.5)
+                            .color(pal().muted),
                     );
                     ui.label(
                         egui::RichText::new(&cli)
@@ -6751,8 +7054,7 @@ impl eframe::App for App {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("只删这份布局文件，不动桌面上的图标。")
-                            .size(12.5),
+                        egui::RichText::new("只删这份布局文件，不动桌面上的图标。").size(12.5),
                     );
                     ui.label(
                         egui::RichText::new(&file)
@@ -6762,7 +7064,9 @@ impl eframe::App for App {
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("等价命令：").size(11.5).color(pal().muted),
+                        egui::RichText::new("等价命令：")
+                            .size(11.5)
+                            .color(pal().muted),
                     );
                     ui.label(
                         egui::RichText::new(&cli)
@@ -6816,12 +7120,12 @@ impl eframe::App for App {
                     let mut cancel = false;
                     egui::Modal::new(egui::Id::unique("layout_save_modal"))
                         .frame(
-                    egui::Frame::new()
-                        .fill(pal().panel)
-                        .stroke(egui::Stroke::new(1.0, pal().line))
-                        .corner_radius(egui::CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(20, 18)),
-                )
+                            egui::Frame::new()
+                                .fill(pal().panel)
+                                .stroke(egui::Stroke::new(1.0, pal().line))
+                                .corner_radius(egui::CornerRadius::same(10))
+                                .inner_margin(egui::Margin::symmetric(20, 18)),
+                        )
                         .show(&ctx, |ui| {
                             ui.set_width(400.0);
                             ui.add_space(4.0);
@@ -6850,7 +7154,11 @@ impl eframe::App for App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "等价命令：MemBase.exe layout save {}",
-                                    if name.trim().is_empty() { "<名字>" } else { name.trim() }
+                                    if name.trim().is_empty() {
+                                        "<名字>"
+                                    } else {
+                                        name.trim()
+                                    }
                                 ))
                                 .size(11.0)
                                 .monospace()
@@ -6861,7 +7169,9 @@ impl eframe::App for App {
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            egui::RichText::new("保存").size(13.5).color(pal().on_accent),
+                                            egui::RichText::new("保存")
+                                                .size(13.5)
+                                                .color(pal().on_accent),
                                         )
                                         .fill(pal().accent)
                                         .min_size(egui::vec2(110.0, 32.0)),
@@ -7005,7 +7315,7 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
     // DPI 感知 + COM 单线程套间：桌面图标坐标和 shell 接口都依赖它们
-    membase_win::init();
+    plat::init();
     let icon = egui::IconData {
         rgba: include_bytes!("../../../assets/icon_256.rgba").to_vec(),
         width: 256,
@@ -7068,8 +7378,8 @@ impl Canvas {
         let vw = (max_x - min_x).max(1.0);
         let vh = (max_y - min_y).max(1.0);
         const PAD: f32 = 9.0;
-        let scale = (((area.width() - PAD * 2.0) / vw).min((area.height() - PAD * 2.0) / vh))
-            .max(0.02);
+        let scale =
+            (((area.width() - PAD * 2.0) / vw).min((area.height() - PAD * 2.0) / vh)).max(0.02);
         let ox = area.left() + (area.width() - vw * scale) / 2.0 - min_x * scale;
         let oy = area.top() + (area.height() - vh * scale) / 2.0 - min_y * scale;
 
@@ -7121,13 +7431,7 @@ fn mix_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
 }
 
-fn dashed_rect(
-    painter: &egui::Painter,
-    r: egui::Rect,
-    stroke: egui::Stroke,
-    dash: f32,
-    gap: f32,
-) {
+fn dashed_rect(painter: &egui::Painter, r: egui::Rect, stroke: egui::Stroke, dash: f32, gap: f32) {
     let pts = [
         r.left_top(),
         r.right_top(),
@@ -7157,7 +7461,10 @@ fn draw_taskbar(painter: &egui::Painter, screen: egui::Rect, scale: f32) {
             egui::pos2(bar.left(), bar.top()),
             egui::pos2(bar.right(), bar.top()),
         ],
-        egui::Stroke::new(scale.max(0.6), egui::Color32::from_rgba_unmultiplied(0x4A, 0x58, 0x76, 0x55)),
+        egui::Stroke::new(
+            scale.max(0.6),
+            egui::Color32::from_rgba_unmultiplied(0x4A, 0x58, 0x76, 0x55),
+        ),
     );
 
     let cy = bar.center().y;
@@ -7213,12 +7520,7 @@ fn draw_taskbar(painter: &egui::Painter, screen: egui::Rect, scale: f32) {
 }
 
 /// 悬停名称气泡：图标太小认不出时靠它
-fn draw_tooltip(
-    painter: &egui::Painter,
-    area: egui::Rect,
-    anchor: egui::Rect,
-    name: &str,
-) {
+fn draw_tooltip(painter: &egui::Painter, area: egui::Rect, anchor: egui::Rect, name: &str) {
     let galley = painter.layout_no_wrap(
         name.to_string(),
         egui::FontId::proportional(11.5),
@@ -7244,7 +7546,10 @@ fn draw_tooltip(
     painter.rect_stroke(
         pill,
         egui::CornerRadius::same(5),
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0x3E, 0x49, 0x60, 0xAA)),
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(0x3E, 0x49, 0x60, 0xAA),
+        ),
         egui::StrokeKind::Inside,
     );
     painter.galley(

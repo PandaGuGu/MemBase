@@ -37,6 +37,18 @@ impl StartupSource {
         }
     }
     pub fn label(&self) -> &'static str {
+        #[cfg(not(windows))]
+        {
+            return match self {
+                StartupSource::UserRun => "XDG 自启·当前用户",
+                StartupSource::MachineRun => "XDG 自启·本机",
+                StartupSource::MachineRun32 => "XDG 自启·本机（32 位）",
+                StartupSource::UserFolder => "自启目录·当前用户",
+                StartupSource::AllUsersFolder => "自启目录·所有用户",
+                StartupSource::ScheduledTask => "systemd 用户服务",
+            };
+        }
+        #[cfg(windows)]
         match self {
             StartupSource::UserRun => "注册表·当前用户",
             StartupSource::MachineRun => "注册表·本机",
@@ -186,7 +198,10 @@ pub fn parse_task_xml(xml: &str) -> Option<TaskAction> {
     let command = tag_text(xml, "Command")?;
     let mut out = TaskAction {
         command: command.trim().to_string(),
-        arguments: tag_text(xml, "Arguments").unwrap_or_default().trim().to_string(),
+        arguments: tag_text(xml, "Arguments")
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         enabled: true,
         trigger: String::new(),
         hidden: false,
@@ -250,16 +265,14 @@ pub fn build_startup_items(raw: &[StartupRaw], baseline: &BTreeSet<String>) -> V
         let exe = command_exe(&r.command);
         let tier = tier_for(Kind::Process, &exe, &r.command);
         let enabled = r.enabled.unwrap_or(true);
-        let in_baseline = !exe.is_empty()
-            && baseline
-                .iter()
-                .any(|b| b.eq_ignore_ascii_case(&exe));
+        let in_baseline = !exe.is_empty() && baseline.iter().any(|b| b.eq_ignore_ascii_case(&exe));
         let suggestion = match (enabled, tier) {
             (false, _) => "already-off",
             (true, Tier::Blocked) => "keep",
             (true, Tier::Caution) => "review",
             (true, Tier::Suggested) => "disable",
-        };        let mut note = String::new();
+        };
+        let mut note = String::new();
         if in_baseline {
             note.push_str("基准里出现过；");
         }
@@ -336,16 +349,15 @@ mod tests {
 
     #[test]
     fn 不加引号带空格的路径() {
-        assert_eq!(
-            command_exe(r"C:\Program Files\App\app.exe -autorun"),
-            "app"
-        );
+        assert_eq!(command_exe(r"C:\Program Files\App\app.exe -autorun"), "app");
     }
 
     #[test]
     fn rundll32_取被调起的模块() {
         assert_eq!(
-            command_exe(r"C:\Windows\system32\rundll32.exe C:\Windows\system32\shell32.dll,Control_RunDLL"),
+            command_exe(
+                r"C:\Windows\system32\rundll32.exe C:\Windows\system32\shell32.dll,Control_RunDLL"
+            ),
             "shell32"
         );
     }
@@ -398,6 +410,7 @@ mod tests {
         assert!(parse_task_xml("<html>no</html>").is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn 建议与基准命中() {
         let raw = vec![

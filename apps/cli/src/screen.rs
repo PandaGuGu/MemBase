@@ -9,16 +9,32 @@
 //!
 //! 息屏本身无损可逆，所以不像 trim 那样强制 --execute，只提供 --dry-run 供自检。
 
+use crate::plat::screen::{self, ExitKey};
 use crate::{arg_value, has_flag, want_json, EXIT_ACTION_FAILED, EXIT_USAGE};
 use membase_core::bundle::jstr;
-use membase_win::screen::{self, ExitKey};
 
 pub const SCREEN_COMMANDS: &[(&str, &str, &str)] = &[
-    ("off", "立刻关显示器（不锁屏）", "[--seconds N] [--minutes N] [--delay N] [--dry-run] [--json]"),
-    ("status", "显示器 / 通道 / 默认时长 / 退出键 / 上次息屏", "--json"),
-    ("duration", "查看或设置默认息屏时长", "[1:05:09 | 90s | 5m | 0] --json"),
+    (
+        "off",
+        "立刻关显示器（不锁屏）",
+        "[--seconds N] [--minutes N] [--delay N] [--dry-run] [--json]",
+    ),
+    (
+        "status",
+        "显示器 / 通道 / 默认时长 / 退出键 / 上次息屏",
+        "--json",
+    ),
+    (
+        "duration",
+        "查看或设置默认息屏时长",
+        "[1:05:09 | 90s | 5m | 0] --json",
+    ),
     ("key", "查看或设置退出热键", "[esc|space|enter|any] --json"),
-    ("power", "查看或设置「息屏时是否同时关闭显示器」", "[on|off] --json"),
+    (
+        "power",
+        "查看或设置「息屏时是否同时关闭显示器」",
+        "[on|off] --json",
+    ),
 ];
 
 pub fn screen_usage() -> String {
@@ -43,7 +59,7 @@ pub fn screen_usage() -> String {
 
 pub fn cmd_screen(args: &[String]) -> i32 {
     // 读分辨率要 DPI 感知，否则 125% 缩放下报的是逻辑像素
-    membase_win::init();
+    crate::plat::init();
     let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     match sub.as_str() {
@@ -136,7 +152,7 @@ fn screen_off(args: &[String]) -> i32 {
     }
 
     // 先按住系统再关屏：从发消息到面板真灭有一小段空档，别让空闲计时器在那一段里睡过去
-    membase_win::screen::hold_awake(true);
+    crate::plat::screen::hold_awake(true);
     match screen::off() {
         Ok(()) => {
             if secs > 0 {
@@ -150,7 +166,7 @@ fn screen_off(args: &[String]) -> i32 {
                 // 驻留到点：这是「息屏时长」在命令行里的表达，界面版是全屏黑窗口里的倒计时
                 std::thread::sleep(std::time::Duration::from_secs(secs));
                 screen::wake();
-                membase_win::screen::hold_awake(false);
+                crate::plat::screen::hold_awake(false);
                 if want_json(args) {
                     println!(
                         "{{\"ok\":true,\"seconds\":{},\"minutes\":{},\"delay\":{},\"exit_key\":{},\"woke\":true,\"monitors\":{}}}",
@@ -177,7 +193,7 @@ fn screen_off(args: &[String]) -> i32 {
         }
         Err(e) => {
             // 没关成就不用按着了（进程退出时线程级状态也会自己失效，这里只是写明白）
-            membase_win::screen::hold_awake(false);
+            crate::plat::screen::hold_awake(false);
             if want_json(args) {
                 println!("{{\"ok\":false,\"error\":{}}}", jstr(&e));
             } else {
@@ -190,8 +206,8 @@ fn screen_off(args: &[String]) -> i32 {
 
 fn screen_status(args: &[String]) -> i32 {
     let monitors = screen::monitor_count();
-    let (w, h) = membase_win::sys::screen_size();
-    let dpi = membase_win::sys::dpi_scale();
+    let (w, h) = crate::plat::sys::screen_size();
+    let dpi = crate::plat::sys::dpi_scale();
     let last = screen::last_off().unwrap_or_default();
     let channel = screen::probe();
     let secs = screen::default_secs();
@@ -233,7 +249,11 @@ fn screen_status(args: &[String]) -> i32 {
         println!("退出热键     : {}", key.label());
         println!(
             "上次息屏     : {}",
-            if last.is_empty() { "（还没用过）" } else { &last }
+            if last.is_empty() {
+                "（还没用过）"
+            } else {
+                &last
+            }
         );
         println!("记录文件     : {}", screen::last_off_path().display());
     }
@@ -270,7 +290,9 @@ fn screen_duration(args: &[String], sub: &str) -> i32 {
         Some(v) => {
             // `screen minutes 30` 这种老写法：纯数字按分钟理解
             let parsed = if sub == "minutes" && v.chars().all(|c| c.is_ascii_digit()) {
-                v.parse::<u64>().ok().map(|m| (m * 60).min(screen::MAX_SECS))
+                v.parse::<u64>()
+                    .ok()
+                    .map(|m| (m * 60).min(screen::MAX_SECS))
             } else {
                 screen::parse_duration(&v)
             };
@@ -316,7 +338,11 @@ fn screen_power(args: &[String]) -> i32 {
             } else {
                 println!(
                     "同时关闭显示器 : {}",
-                    if on { "开（退出时会尝试叫醒）" } else { "关（只盖全屏黑窗）" }
+                    if on {
+                        "开（退出时会尝试叫醒）"
+                    } else {
+                        "关（只盖全屏黑窗）"
+                    }
                 );
                 println!("设置方法       : MemBase.exe screen power on | off");
             }

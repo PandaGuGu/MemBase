@@ -1,7 +1,7 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
-//! MemBase.exe —— 内存基准线 + 桌面图标布局（命令行逻辑）
+//! MemBase —— 内存基准线 + 桌面图标布局（命令行逻辑）
 //!
-//! 同一份逻辑被两个入口复用：带参数启动的便携版 `MemBase.exe`
+//! 同一份逻辑被两个入口复用：带参数启动的便携版 `MemBase`
 //! （自己接回父控制台），以及独立的控制台版 `membase.exe`。
 //!
 //! 两件本来不相干的事在这里共用一套骨架：
@@ -21,24 +21,28 @@
 
 pub mod mcp;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod layout;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod screen;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use membase_core::{Kind, Tier};
+#[cfg(target_os = "linux")]
+pub use membase_linux as plat;
 #[cfg(windows)]
-use membase_win::{close, compare, restart, snapshot, win};
+pub use membase_win as plat;
+#[cfg(any(windows, target_os = "linux"))]
+use plat::{close, compare, restart, snapshot, win};
 // 常量与平台无关，usage() 在非 Windows 上也要用
 use membase_core as core;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::io::IsTerminal;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::process::Command;
 
 use std::fs;
@@ -51,12 +55,17 @@ const EXIT_NO_BASELINE: i32 = 2;
 const EXIT_IO: i32 = 3;
 const EXIT_ACTION_FAILED: i32 = 4;
 const EXIT_REFUSED: i32 = 5;
+/// 命令表里「哪些平台支持」这一列的实际值
+#[cfg(windows)]
+const PLAT: &str = "windows";
+#[cfg(target_os = "linux")]
+const PLAT: &str = "linux";
 
 fn usage() {
     println!(
-        r#"MemBase.exe {ver} —— 内存基准线 + 桌面图标布局（每个界面操作都有命令）
+        r#"MemBase {ver} —— 内存基准线 + 桌面图标布局（每个界面操作都有命令）
 
-用法: MemBase.exe <命令> [选项]
+用法: MemBase <命令> [选项]
 
   status                     概况：基准线信息 + 当前内存 + 线外计数
   list                       列出线外进程/服务（只读，不动手）
@@ -92,9 +101,9 @@ fn usage() {
 
   transient                  双采样对比：只在前一次出现、后一次消失的「短命项」
 
-  startup                    启动项扫描：注册表 Run / 启动文件夹 / 计划任务（含 \Microsoft\ 下的）
+  startup                    启动项扫描：自启目录 / 自启服务（Windows 另有注册表 Run 与计划任务）
       startup list           来源 / 名称 / 目标进程 / 是否在基准里 / 建议动作
-      --all                  连系统计划任务一起列（VS 安装器的 BackgroundDownload 就在里面）
+      --all                  连非用户级启动项一起列
       startup disable <名称> --execute --yes   禁用（改批准记录或任务状态，不删原值）
       startup enable  <名称> --execute --yes   撤销
 
@@ -114,12 +123,12 @@ fn usage() {
   mcp                        以 MCP 协议（stdio + JSON-RPC 2.0）服务
                              同一套动词暴露给 AI，护栏与命令行完全一致：
                              动手类工具的 execute 与 yes 必须同时为 true
-                             客户端配置：command=MemBase.exe, args=[mcp]
+                             客户端配置：command=MemBase, args=[mcp]
 
   trim                       恢复基准：关掉线外项
       --execute              真正执行（不加就是 dry-run，只出计划）
       --yes                  跳过确认（非交互环境必须带）
-      --include-caution      连 Windows 组件一起处理
+      --include-caution      连系统组件一起处理
       --min-mb / --only / --exclude   同 list
       --max N                一次最多处理 N 项（默认 20，0=不限）
       --plan-out FILE        把计划写成 CSV
@@ -134,7 +143,7 @@ fn usage() {
       --also SEC             再等到第 SEC 秒采第二次（双采样，同一 run 目录）
       --include-self         把采集器自己也算进去
       --self-destruct        采集后删任务和本 exe
-      --task NAME            计划任务名（默认 {task}）
+      --task NAME            开机采集任务名（默认 {task}）
       --keep N               只保留最近 N 个 run_ 目录，老的移进回收站（默认 10，0=不轮换）
 
   compare                    和最近一次基准做 diff
@@ -152,7 +161,7 @@ fn usage() {
       baseline import <FILE> [--label NAME]
                              把包还原成一份新快照；导入后它会是「最新」，即当前基准
 
-  install / uninstall        注册 / 删除开机计划任务
+  install / uninstall        注册 / 删除开机采集任务
       install --at 30 --also 300
                              双采样：第 30 秒与第 300 秒各采一次，用来分「短命项」和「真常驻」
 
@@ -260,7 +269,6 @@ fn positionals<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a String> 
     out
 }
 
-
 // ---------------- 外观（与界面「设置」页共用 theme.txt） ----------------
 
 /// 主题文件路径：和基准线配置同目录的 theme.txt
@@ -285,7 +293,10 @@ pub fn write_theme(dark: bool) -> std::io::Result<()> {
 fn cmd_theme(args: &[String]) {
     let json = want_json(args);
     let pos = positionals(args, &["--out"]);
-    let sub = pos.first().map(|s| s.to_lowercase()).unwrap_or_else(|| "get".into());
+    let sub = pos
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "get".into());
     let value = pos.get(1).map(|s| s.to_lowercase());
 
     match sub.as_str() {
@@ -295,7 +306,7 @@ fn cmd_theme(args: &[String]) {
                 Some("dark") | Some("深色") | Some("黑") => true,
                 Some("light") | Some("浅色") | Some("白") => false,
                 _ => {
-                    eprintln!("用法: MemBase.exe theme set light|dark");
+                    eprintln!("用法: MemBase theme set light|dark");
                     std::process::exit(EXIT_USAGE);
                 }
             };
@@ -361,15 +372,15 @@ fn cmd_config(args: &[String]) {
             }
             // 界面「打开数据目录」的等价命令；--json 时仍会把路径打出来
             if has_flag(args, "--open") {
-                #[cfg(windows)]
-                membase_win::win::open_folder(&effective);
+                #[cfg(any(windows, target_os = "linux"))]
+                plat::win::open_folder(&effective);
             }
         }
         "set" => {
             let dir = match pos.get(1) {
                 Some(d) => d.to_string(),
                 None => {
-                    eprintln!("用法: MemBase.exe config set <目录>");
+                    eprintln!("用法: MemBase config set <目录>");
                     std::process::exit(EXIT_USAGE);
                 }
             };
@@ -391,7 +402,9 @@ fn cmd_config(args: &[String]) {
                     } else {
                         println!("已设置数据目录：{}", dir);
                         println!("  写入 : {}", path.display());
-                        println!("  提示 : 新目录还没有基准线的话，用 `MemBase.exe baseline capture`");
+                        println!(
+                            "  提示 : 新目录还没有基准线的话，用 `MemBase baseline capture`"
+                        );
                         println!("         或 GUI 的「扫描当前 → 设为基准」建一份");
                     }
                 }
@@ -401,26 +414,24 @@ fn cmd_config(args: &[String]) {
                 }
             }
         }
-        "clear" | "reset" => {
-            match cfg::save(&cfg::Config::default()) {
-                Ok(_) => {
-                    let eff = cfg::data_root(None);
-                    if json {
-                        println!(
-                            "{{\"ok\":true,\"data_root\":{},\"source\":{}}}",
-                            jstr(&eff),
-                            jstr("系统默认")
-                        );
-                    } else {
-                        println!("已清除配置，恢复系统默认：{}", eff);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[x] 写配置失败: {}", e);
-                    std::process::exit(EXIT_IO);
+        "clear" | "reset" => match cfg::save(&cfg::Config::default()) {
+            Ok(_) => {
+                let eff = cfg::data_root(None);
+                if json {
+                    println!(
+                        "{{\"ok\":true,\"data_root\":{},\"source\":{}}}",
+                        jstr(&eff),
+                        jstr("系统默认")
+                    );
+                } else {
+                    println!("已清除配置，恢复系统默认：{}", eff);
                 }
             }
-        }
+            Err(e) => {
+                eprintln!("[x] 写配置失败: {}", e);
+                std::process::exit(EXIT_IO);
+            }
+        },
         other => {
             eprintln!("未知子命令: config {}", other);
             std::process::exit(EXIT_USAGE);
@@ -441,15 +452,25 @@ fn cmd_baseline(args: &[String]) {
         .unwrap_or("info");
 
     match sub {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         "capture" => {
             // 立刻扫描当前状态，直接落成一份新基准（不用等开机 60 秒）
             let label = arg_value(args, "--label").unwrap_or_else(|| "now".to_string());
             let safe: String = label
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
-            let label = if safe.is_empty() { "now".to_string() } else { safe };
+            let label = if safe.is_empty() {
+                "now".to_string()
+            } else {
+                safe
+            };
 
             let snap = snapshot::snapshot_now(true);
             let run_dir = snapshot::new_run_dir(&root);
@@ -483,7 +504,7 @@ fn cmd_baseline(args: &[String]) {
             }
         }
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         "capture" => {
             eprintln!("[x] baseline capture 需要 Windows（要读进程和服务表）");
             std::process::exit(EXIT_USAGE);
@@ -493,7 +514,10 @@ fn cmd_baseline(args: &[String]) {
             let dir = match bundle::find_latest_baseline(&root) {
                 Some(d) => d,
                 None => {
-                    eprintln!("[x] 没有基准快照：{}（先跑 MemBase.exe collect）", root.display());
+                    eprintln!(
+                        "[x] 没有基准快照：{}（先跑 MemBase collect）",
+                        root.display()
+                    );
                     std::process::exit(EXIT_NO_BASELINE);
                 }
             };
@@ -505,7 +529,11 @@ fn cmd_baseline(args: &[String]) {
                 Ok(i) => i,
                 Err(e) => {
                     if json {
-                        println!("{{\"ok\":false,\"dir\":{},\"error\":{}}}", jstr(&dir.to_string_lossy()), jstr(&e));
+                        println!(
+                            "{{\"ok\":false,\"dir\":{},\"error\":{}}}",
+                            jstr(&dir.to_string_lossy()),
+                            jstr(&e)
+                        );
                     } else {
                         eprintln!("[x] 校验失败: {}", e);
                     }
@@ -590,8 +618,7 @@ fn cmd_baseline(args: &[String]) {
                     std::process::exit(EXIT_NO_BASELINE);
                 }
             };
-            let base_captured =
-                bundle::snapshot_meta(&dir, "CapturedAtLocal").unwrap_or_default();
+            let base_captured = bundle::snapshot_meta(&dir, "CapturedAtLocal").unwrap_or_default();
             let stamp = {
                 let s = bundle::stamp_from_local(&base_captured);
                 if s.is_empty() {
@@ -602,9 +629,7 @@ fn cmd_baseline(args: &[String]) {
             };
             let out = match arg_value(args, "--to") {
                 Some(p) => PathBuf::from(p),
-                None => root
-                    .join("exports")
-                    .join(format!("baseline_{}.mbz", stamp)),
+                None => root.join("exports").join(format!("baseline_{}.mbz", stamp)),
             };
             match bundle::export_baseline(&dir, &out) {
                 Ok(r) => {
@@ -636,7 +661,9 @@ fn cmd_baseline(args: &[String]) {
             let pkg = match pos.iter().find(|p| !matches!(p.as_str(), "import")) {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    eprintln!("用法: MemBase.exe baseline import <包文件.mbz> [--label NAME] [--force]");
+                    eprintln!(
+                        "用法: MemBase baseline import <包文件.mbz> [--label NAME] [--force]"
+                    );
                     std::process::exit(EXIT_USAGE);
                 }
             };
@@ -669,7 +696,7 @@ fn cmd_baseline(args: &[String]) {
                         println!("  包   : {}", pkg.display());
                         println!("  落地 : {}", r.dir.display());
                         println!("  采集 : {}", captured);
-                        println!("  注意 : 导入的快照是「最新」的一份，MemBase.exe status/trim 会以它为基准");
+                        println!("  注意 : 导入的快照是「最新」的一份，MemBase status/trim 会以它为基准");
                     }
                 }
                 Err(e) => {
@@ -740,7 +767,10 @@ fn json_str_field(text: &str, key: &str) -> Option<String> {
 fn json_num_field(text: &str, key: &str) -> Option<f64> {
     let pat = format!("\"{}\"", key);
     let i = text.find(&pat)?;
-    let rest = text[i + pat.len()..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = text[i + pat.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
     let end = rest
         .find(|c: char| c == ',' || c == '\n' || c == '}')
         .unwrap_or(rest.len());
@@ -750,12 +780,16 @@ fn json_num_field(text: &str, key: &str) -> Option<f64> {
 // ---------------- 短命项（双采样对比） ----------------
 
 /// 在 root 下找「最近一次带 ≥2 个采样的 run_*」，按开机秒数排序返回各 label。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn latest_multi_sample_run(root: &Path) -> Option<(PathBuf, Vec<(String, PathBuf)>)> {
     let mut best: Option<(std::time::SystemTime, PathBuf, Vec<(String, PathBuf)>)> = None;
     for e in fs::read_dir(root).ok()?.flatten() {
         let p = e.path();
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         if !p.is_dir() || !name.starts_with("run_") {
             continue;
         }
@@ -788,13 +822,13 @@ fn latest_multi_sample_run(root: &Path) -> Option<(PathBuf, Vec<(String, PathBuf
     best.map(|(_, dir, labels)| (dir, labels))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn boot_offset_of(label: &str) -> Option<u64> {
     let s = label.strip_prefix("T+")?;
     s.trim_end_matches('s').parse::<u64>().ok()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_transient(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -803,11 +837,11 @@ fn cmd_transient(args: &[String]) {
     let Some((run_dir, labels)) = latest_multi_sample_run(&root) else {
         if json {
             println!(
-                "{{\"ok\":false,\"error\":\"no_dual_sample\",\"hint\":\"先注册双采样：MemBase.exe install --at 30 --also 300\",\"transient\":[],\"appeared\":[]}}"
+                "{{\"ok\":false,\"error\":\"no_dual_sample\",\"hint\":\"先注册双采样：MemBase install --at 30 --also 300\",\"transient\":[],\"appeared\":[]}}"
             );
         } else {
             eprintln!(
-                "[x] 没有双采样快照：{} 下每个 run_* 都只有一个采样点。\n    先注册双采样：MemBase.exe install --at 30 --also 300",
+                "[x] 没有双采样快照：{} 下每个 run_* 都只有一个采样点。\n    先注册双采样：MemBase install --at 30 --also 300",
                 root.display()
             );
         }
@@ -889,11 +923,7 @@ fn cmd_transient(args: &[String]) {
         println!("\n这些是「起了又退」的，不该算进常驻基线；判断瘦身收益时要扣掉。");
     }
     if !appeared.is_empty() {
-        println!(
-            "\n后出现的（{} 才起来）：{} 项",
-            last_label,
-            appeared.len()
-        );
+        println!("\n后出现的（{} 才起来）：{} 项", last_label, appeared.len());
         for (n, mb, inst) in appeared.iter().take(15) {
             println!("  {:<34} {:>7.1} MB  {}", elide_cli(n, 34), mb, inst);
         }
@@ -902,7 +932,7 @@ fn cmd_transient(args: &[String]) {
 
 // ---------------- 基准 / 实时数据（Windows） ----------------
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct Baseline {
     dir: PathBuf,
     captured: String,
@@ -911,25 +941,25 @@ struct Baseline {
     svcs: BTreeMap<String, String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn load_baseline(root: &Path) -> Result<Baseline, i32> {
     load_baseline_label(root, None)
 }
 
 /// 按 label 取基准（`T+30s` / `T+300s` / `now`）；`None` = 最新那份
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn load_baseline_label(root: &Path, label: Option<&str>) -> Result<Baseline, i32> {
     let dir = match compare::find_baseline(root, label) {
         Some(d) => d,
         None => {
             match label {
                 Some(l) => eprintln!(
-                    "[x] 在 {} 下找不到 label 为 {} 的快照（用 `MemBase.exe status` 看现有采样点）",
+                    "[x] 在 {} 下找不到 label 为 {} 的快照（用 `MemBase status` 看现有采样点）",
                     root.display(),
                     l
                 ),
                 None => eprintln!(
-                    "[x] 没有基准快照：{}（先跑 MemBase.exe collect）",
+                    "[x] 没有基准快照：{}（先跑 MemBase collect）",
                     root.display()
                 ),
             }
@@ -942,8 +972,9 @@ fn load_baseline_label(root: &Path, label: Option<&str>) -> Result<Baseline, i32
     let procs = core::parse_by_name(
         &fs::read_to_string(dir.join("processes_by_name.csv")).unwrap_or_default(),
     );
-    let svcs =
-        core::parse_service_states(&fs::read_to_string(dir.join("services.csv")).unwrap_or_default());
+    let svcs = core::parse_service_states(
+        &fs::read_to_string(dir.join("services.csv")).unwrap_or_default(),
+    );
     Ok(Baseline {
         dir,
         captured,
@@ -953,7 +984,7 @@ fn load_baseline_label(root: &Path, label: Option<&str>) -> Result<Baseline, i32
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct LiveData {
     procs: Vec<core::LiveProc>,
     svcs: Vec<core::LiveSvc>,
@@ -962,7 +993,7 @@ struct LiveData {
     proc_count: usize,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn live_now() -> LiveData {
     let snap = snapshot::snapshot_now(true);
     let procs = snap
@@ -999,7 +1030,7 @@ fn live_now() -> LiveData {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn build_current_plan(root: &Path, min_mb: f64) -> Result<(Baseline, Vec<core::PlanItem>), i32> {
     let base = load_baseline(root)?;
     let live = live_now();
@@ -1017,7 +1048,7 @@ fn build_current_plan(root: &Path, min_mb: f64) -> Result<(Baseline, Vec<core::P
     Ok((base, plan))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn filter_plan(
     plan: Vec<core::PlanItem>,
     only: &[String],
@@ -1025,17 +1056,10 @@ fn filter_plan(
 ) -> Vec<core::PlanItem> {
     plan.into_iter()
         .filter(|p| {
-            if !only.is_empty()
-                && !only
-                    .iter()
-                    .any(|pat| core::wildcard_match(&p.name, pat))
-            {
+            if !only.is_empty() && !only.iter().any(|pat| core::wildcard_match(&p.name, pat)) {
                 return false;
             }
-            if exclude
-                .iter()
-                .any(|pat| core::wildcard_match(&p.name, pat))
-            {
+            if exclude.iter().any(|pat| core::wildcard_match(&p.name, pat)) {
                 return false;
             }
             true
@@ -1043,7 +1067,7 @@ fn filter_plan(
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn item_json(
     it: &core::PlanItem,
     include_caution: bool,
@@ -1087,8 +1111,11 @@ fn item_json(
     )
 }
 
-#[cfg(windows)]
-fn plan_counts(plan: &[core::PlanItem], include_caution: bool) -> (usize, usize, usize, usize, f64) {
+#[cfg(any(windows, target_os = "linux"))]
+fn plan_counts(
+    plan: &[core::PlanItem],
+    include_caution: bool,
+) -> (usize, usize, usize, usize, f64) {
     let suggested = plan.iter().filter(|p| p.tier == Tier::Suggested).count();
     let caution = plan.iter().filter(|p| p.tier == Tier::Caution).count();
     let blocked = plan.iter().filter(|p| p.tier == Tier::Blocked).count();
@@ -1096,7 +1123,7 @@ fn plan_counts(plan: &[core::PlanItem], include_caution: bool) -> (usize, usize,
     (suggested, caution, blocked, n, mb)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn tier_label(t: Tier) -> &'static str {
     match t {
         Tier::Suggested => "建议",
@@ -1108,7 +1135,7 @@ fn tier_label(t: Tier) -> &'static str {
 // ---------------- 子命令 ----------------
 
 /// 同一个 run 目录下的其它采样点（双采样时会有 T+30s / T+300s 两个）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn sibling_labels(dir: &Path) -> Vec<String> {
     let mut out: Vec<(u64, String)> = Vec::new();
     let Some(run) = dir.parent() else {
@@ -1127,7 +1154,7 @@ fn sibling_labels(dir: &Path) -> Vec<String> {
     out.into_iter().map(|(_, l)| l).collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_status(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -1195,7 +1222,10 @@ fn cmd_status(args: &[String]) {
         ca,
         bl
     );
-    println!("可处理   : {} 项，预计回收约 {:.0} MB（按宿主去重）", act, act_mb);
+    println!(
+        "可处理   : {} 项，预计回收约 {:.0} MB（按宿主去重）",
+        act, act_mb
+    );
     if !heal.is_empty() {
         let names: Vec<String> = heal.keys().cloned().collect();
         println!("自愈型   : {} 个（{}）", names.len(), names.join(" / "));
@@ -1211,7 +1241,7 @@ fn cmd_status(args: &[String]) {
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_list(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -1274,7 +1304,11 @@ fn cmd_list(args: &[String]) {
         } else {
             "        "
         };
-        let tail = if p.path.is_empty() { &p.reason } else { &p.path };
+        let tail = if p.path.is_empty() {
+            &p.reason
+        } else {
+            &p.path
+        };
         println!(
             "{} {} {:<9} {:<28} {:>8.0} MB  {}",
             mark,
@@ -1287,7 +1321,7 @@ fn cmd_list(args: &[String]) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_trim(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -1371,7 +1405,11 @@ fn cmd_trim(args: &[String]) {
             );
         }
         for p in &targets {
-            let tail = if p.path.is_empty() { &p.reason } else { &p.path };
+            let tail = if p.path.is_empty() {
+                &p.reason
+            } else {
+                &p.path
+            };
             println!(
                 "  {} {:<28} {:>7.0} MB  {}",
                 core::kind_name(p.kind),
@@ -1418,7 +1456,10 @@ fn cmd_trim(args: &[String]) {
         let mode_desc = if !opts.graceful {
             "直接终止（--force）".to_string()
         } else if opts.force {
-            format!("有窗口的先发关闭请求，{} 秒后仍未退出的才强制结束", grace_sec)
+            format!(
+                "有窗口的先发关闭请求，{} 秒后仍未退出的才强制结束",
+                grace_sec
+            )
         } else {
             format!("有窗口的先发关闭请求，{} 秒后仍未退出的保留不动", grace_sec)
         };
@@ -1542,36 +1583,36 @@ fn cmd_trim(args: &[String]) {
 // ---------------- 自描述的命令表 ----------------
 
 const COMMANDS: &[(&str, &str, &str, &str)] = &[
-    ("status", "概况：基准线 + 当前内存 + 线外计数", "", "windows"),
-    ("list", "列出线外进程/服务（只读）", "--all --min-mb --only --exclude --include-caution", "windows"),
-    ("plan", "只生成线外计划，不执行", "--min-mb --only --exclude --include-caution --to FILE", "windows"),
-    ("trim", "恢复基准：先礼后兵地关掉线外项", "--execute --yes --include-caution --max --min-mb --only --exclude --plan-out --grace-wait --force --no-force", "windows"),
-    ("slim", "基线瘦身：砍掉基准里开机就不需要的服务（禁用 / 卸载 Store 应用）", "--min-mb --include-caution --only --exclude --execute --yes", "windows"),
-    ("restart", "局部重启：关掉再拉起，报告实测回收量", "<进程名|PID|服务名> --execute --yes --wait --path --grace-wait --force --no-force", "windows"),
-    ("feature", "已知功能开关（只写 HKCU）：列出 / 关掉 / 撤销", "list|off|on <key> --execute --yes --no-restart --wait", "windows"),
-    ("startup", "启动项扫描：注册表 Run / 启动文件夹 / 非 Microsoft 计划任务", "list|disable|enable <名称> --execute --yes", "windows"),
-    ("transient", "双采样对比：列出只在前一次出现的短命项", "--min-mb --json", "windows"),
-    ("kill", "原子操作：终止指定进程（名字或 PID）", "<name|pid> --execute --out --grace-wait --force --no-force", "windows"),
-    ("svc", "原子操作：停止/启动/禁止自启单个服务", "stop|start|disable|enable <service> --execute", "windows"),
-    ("protect", "保护名单（勾选保护 = 永不处理）", "list|add|remove|clear [名字...]", "windows"),
-    ("collect", "采集一次快照", "--out --at --include-self --self-destruct --task", "windows"),
-    ("compare", "和最近一次基准做 diff", "--min-mb --exclude", "windows"),
+    ("status", "概况：基准线 + 当前内存 + 线外计数", "", PLAT),
+    ("list", "列出线外进程/服务（只读）", "--all --min-mb --only --exclude --include-caution", PLAT),
+    ("plan", "只生成线外计划，不执行", "--min-mb --only --exclude --include-caution --to FILE", PLAT),
+    ("trim", "恢复基准：先礼后兵地关掉线外项", "--execute --yes --include-caution --max --min-mb --only --exclude --plan-out --grace-wait --force --no-force", PLAT),
+    ("slim", "基线瘦身：砍掉基准里开机就不需要的服务（Windows 还会卸载 Store 应用）", "--min-mb --include-caution --only --exclude --execute --yes", PLAT),
+    ("restart", "局部重启：关掉再拉起，报告实测回收量", "<进程名|PID|服务名> --execute --yes --wait --path --grace-wait --force --no-force", PLAT),
+    ("feature", "已知功能开关（只写 HKCU，仅 Windows）：列出 / 关掉 / 撤销", "list|off|on <key> --execute --yes --no-restart --wait", "windows"),
+    ("startup", "启动项扫描：自启目录 / 自启服务（Windows 另有注册表 Run 与计划任务）", "list|disable|enable <名称> --execute --yes", PLAT),
+    ("transient", "双采样对比：列出只在前一次出现的短命项", "--min-mb --json", PLAT),
+    ("kill", "原子操作：终止指定进程（名字或 PID）", "<name|pid> --execute --out --grace-wait --force --no-force", PLAT),
+    ("svc", "原子操作：停止/启动/禁止自启单个服务", "stop|start|disable|enable <service> --execute", PLAT),
+    ("protect", "保护名单（勾选保护 = 永不处理）", "list|add|remove|clear [名字...]", PLAT),
+    ("collect", "采集一次快照", "--out --at --include-self --self-destruct --task", PLAT),
+    ("compare", "和最近一次基准做 diff", "--min-mb --exclude", PLAT),
     ("baseline", "基准线：查看/校验/采集当前态/导出/导入", "info|verify|capture|export|import [包] [--to FILE] [--label NAME]", "all"),
-    ("install", "注册开机计划任务", "--out --at --task", "windows"),
-    ("uninstall", "删除开机计划任务", "--task", "windows"),
-    ("layout", "桌面图标布局：保存/差异/恢复/修复缓存", "list|save|restore|diff|show|delete|status|probe|repair|dir|flags [名字] [--execute --yes --positions --open --snap-grid on|off]", "windows"),
+    ("install", "注册开机计划任务", "--out --at --task", PLAT),
+    ("uninstall", "删除开机计划任务", "--task", PLAT),
+    ("layout", "桌面图标布局：保存/差异/恢复/修复缓存", "list|save|restore|diff|show|delete|status|probe|repair|dir|flags [名字] [--execute --yes --positions --open --snap-grid on|off]", PLAT),
     ("theme", "外观：查看/切换浅色深色", "get|set light|dark", "all"),
-    ("screen", "息屏：只关显示器，不锁屏（热键退出 / 定时自动亮）", "off|status|duration|key [--seconds N --exit-key K --delay N --dry-run]", "windows"),
-    ("ui", "打开界面（可指定落在哪一页）", "--page layouts|baseline|protect|boot|cli|tools|settings", "windows"),
+    ("screen", "息屏：只关显示器，不锁屏（热键退出 / 定时自动亮）", "off|status|duration|key [--seconds N --exit-key K --delay N --dry-run]", PLAT),
+    ("ui", "打开界面（可指定落在哪一页）", "--page layouts|baseline|protect|boot|cli|tools|settings", PLAT),
     ("config", "数据目录配置：查看/修改/清除", "get|set <目录>|clear [--open]", "all"),
     ("commands", "列出所有命令与参数（本表）", "", "all"),
-    ("mcp", "以 MCP 协议（stdio）服务，供 AI 直接调用", "", "windows"),
+    ("mcp", "以 MCP 协议（stdio）服务，供 AI 直接调用", "", PLAT),
     ("version", "打印版本", "", "all"),
 ];
 
 /// 界面动作表导出成 JSON：每个按钮的等价命令都在这里，
 /// 这样「人能点的脚本一定能发」这件事是可被机器检查的。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn actions_json() -> String {
     layout::ACTIONS
         .iter()
@@ -1589,7 +1630,7 @@ fn actions_json() -> String {
         .join(",")
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn actions_json() -> String {
     String::new()
 }
@@ -1620,7 +1661,7 @@ fn cmd_commands(args: &[String]) {
         return;
     }
     println!(
-        "MemBase.exe {}  数据目录 {}",
+        "MemBase {}  数据目录 {}",
         membase_core::VERSION,
         core::default_root()
     );
@@ -1631,7 +1672,7 @@ fn cmd_commands(args: &[String]) {
             println!("  {:<10}   {}", "", a);
         }
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         println!();
         println!("界面动作 → 命令（界面「命令行」页同源）:");
@@ -1643,7 +1684,7 @@ fn cmd_commands(args: &[String]) {
 
 // ---------------- 原子操作：单进程 / 单服务 ----------------
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_kill(args: &[String]) {
     let json = want_json(args);
     let execute = has_flag(args, "--execute");
@@ -1651,7 +1692,7 @@ fn cmd_kill(args: &[String]) {
     let target = match pos.first() {
         Some(t) => t.to_string(),
         None => {
-            eprintln!("用法: MemBase.exe kill <进程名|PID> [--execute] [--grace-wait N] [--force|--no-force] [--json]");
+            eprintln!("用法: MemBase kill <进程名|PID> [--execute] [--grace-wait N] [--force|--no-force] [--json]");
             std::process::exit(EXIT_USAGE);
         }
     };
@@ -1670,7 +1711,11 @@ fn cmd_kill(args: &[String]) {
 
     if hits.is_empty() {
         if json {
-            println!("{{\"ok\":false,\"target\":{},\"count\":0,\"message\":{}}}", jstr(&target), jstr("没找到匹配的进程"));
+            println!(
+                "{{\"ok\":false,\"target\":{},\"count\":0,\"message\":{}}}",
+                jstr(&target),
+                jstr("没找到匹配的进程")
+            );
         } else {
             println!("没找到匹配的进程：{}", target);
         }
@@ -1697,13 +1742,35 @@ fn cmd_kill(args: &[String]) {
         if json {
             let arr: Vec<String> = hits
                 .iter()
-                .map(|p| format!("{{\"pid\":{},\"name\":{},\"mem_mb\":{:.1},\"path\":{}}}", p.pid, jstr(&p.name), p.ws_mb.unwrap_or(0.0), jstr(&p.path)))
+                .map(|p| {
+                    format!(
+                        "{{\"pid\":{},\"name\":{},\"mem_mb\":{:.1},\"path\":{}}}",
+                        p.pid,
+                        jstr(&p.name),
+                        p.ws_mb.unwrap_or(0.0),
+                        jstr(&p.path)
+                    )
+                })
                 .collect();
-            println!("{{\"mode\":\"dry_run\",\"target\":{},\"count\":{},\"items\":[{}]}}", jstr(&target), hits.len(), arr.join(","));
+            println!(
+                "{{\"mode\":\"dry_run\",\"target\":{},\"count\":{},\"items\":[{}]}}",
+                jstr(&target),
+                hits.len(),
+                arr.join(",")
+            );
         } else {
-            println!("[dry-run] 将终止 {} 个进程（加 --execute 才执行）", hits.len());
+            println!(
+                "[dry-run] 将终止 {} 个进程（加 --execute 才执行）",
+                hits.len()
+            );
             for p in &hits {
-                println!("  pid {:<7} {:<24} {:>7.1} MB  {}", p.pid, p.name, p.ws_mb.unwrap_or(0.0), p.path);
+                println!(
+                    "  pid {:<7} {:<24} {:>7.1} MB  {}",
+                    p.pid,
+                    p.name,
+                    p.ws_mb.unwrap_or(0.0),
+                    p.path
+                );
             }
         }
         return;
@@ -1750,13 +1817,15 @@ fn cmd_kill(args: &[String]) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_svc(args: &[String]) {
     let json = want_json(args);
     let execute = has_flag(args, "--execute");
     let pos = positionals(args, &["--out"]);
     if pos.len() < 2 {
-        eprintln!("用法: MemBase.exe svc <stop|start|disable|enable> <服务名> [--execute] [--json]");
+        eprintln!(
+            "用法: MemBase svc <stop|start|disable|enable> <服务名> [--execute] [--json]"
+        );
         eprintln!("  disable = start=disabled，下次开机不再起来（只 stop 的话重启就回来了）");
         eprintln!("  enable  = 恢复成手动启动（不会自动拉起）");
         std::process::exit(EXIT_USAGE);
@@ -1805,14 +1874,23 @@ fn cmd_svc(args: &[String]) {
                 _ => "已恢复为手动启动",
             };
             if json {
-                println!("{{\"ok\":true,\"action\":{},\"service\":{}}}", jstr(&action), jstr(&name));
+                println!(
+                    "{{\"ok\":true,\"action\":{},\"service\":{}}}",
+                    jstr(&action),
+                    jstr(&name)
+                );
             } else {
                 println!("{}：{}", verb, name);
             }
         }
         Err(e) => {
             if json {
-                println!("{{\"ok\":false,\"action\":{},\"service\":{},\"error\":{}}}", jstr(&action), jstr(&name), jstr(&e));
+                println!(
+                    "{{\"ok\":false,\"action\":{},\"service\":{},\"error\":{}}}",
+                    jstr(&action),
+                    jstr(&name),
+                    jstr(&e)
+                );
             } else {
                 eprintln!("失败：{}", e);
             }
@@ -1828,7 +1906,7 @@ fn cmd_svc(args: &[String]) {
 ///   * 只停进程 → 下次开机它又被拉起来。
 ///
 /// 禁用走 `StartupApproved` / `schtasks /change /disable`，不删原值，随时可撤销。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn stop_and_disable_startup(
     exe: &str,
     source: Option<core::startup::StartupSource>,
@@ -1859,14 +1937,14 @@ fn stop_and_disable_startup(
             let _ = close::close_group(exe, &targets, opts, &protected);
         }
     }
-    membase_win::startup::set_enabled(src, name, false)
+    plat::startup::set_enabled(src, name, false)
 }
 
-/// `MemBase.exe slim`：以开机基准为输入，列出「开机就有、但根本不需要」的服务。
+/// `MemBase slim`：以开机基准为输入，列出「开机就有、但根本不需要」的服务。
 ///
 /// 和 `trim` 是反的：`trim` 关掉「基准里没有、现在却在跑」的线外项；
 /// `slim` 动的是基准本身——它改的是**下一次开机的起点**，不是这一秒的占用。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_slim(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -1916,7 +1994,7 @@ fn cmd_slim(args: &[String]) {
     // 旧版 startup 一刀切跳过 Microsoft 目录后，trim / slim / feature 三条路也都够不着。
     // 这里按「进程真的在跑 + 内存过阈值」把它捞回来，系统任务里的空挂项自然不出现。
     let nodes = proc_nodes();
-    let startup_raw = membase_win::startup::scan();
+    let startup_raw = plat::startup::scan();
     let startup_items =
         core::startup::build_startup_items(&startup_raw, &baseline_proc_names(&root));
     let mut mem_by_exe: BTreeMap<String, f64> = BTreeMap::new();
@@ -1937,10 +2015,11 @@ fn cmd_slim(args: &[String]) {
     items.extend(startup_trim);
 
     // 功能开关：以「当前还开着 + 证据进程在跑」为准，折成同样的清单行。
-    // 只写 HKCU，动作名 feature-off，撤销在 `MemBase.exe feature on <key>`。
+    // 只写 HKCU，动作名 feature-off，撤销在 `MemBase feature on <key>`。
     let states = feature_states();
     let evs = feature_evidence_map(&nodes);
-    let mut feature_items = core::build_feature_items(core::feature::FEATURE_SWITCHES, &states, &evs);
+    let mut feature_items =
+        core::build_feature_items(core::feature::FEATURE_SWITCHES, &states, &evs);
     if !only.is_empty() {
         feature_items.retain(|it| only.iter().any(|n| core::wildcard_match(&it.name, n)));
     }
@@ -1983,7 +2062,11 @@ fn cmd_slim(args: &[String]) {
             return;
         }
     } else {
-        println!("[..] 基准：{}（{} 采集）", base.dir.display(), base.captured);
+        println!(
+            "[..] 基准：{}（{} 采集）",
+            base.dir.display(),
+            base.captured
+        );
         if items.is_empty() {
             println!("基准里没有值得砍的自启服务（阈值 {:.0} MB）", min_mb);
             return;
@@ -2010,18 +2093,21 @@ fn cmd_slim(args: &[String]) {
         println!();
         if feature_count > 0 {
             println!(
-                "（其中 {} 项是功能开关：只写 HKCU，撤销用 MemBase.exe feature on <key>）",
+                "（其中 {} 项是功能开关：只写 HKCU，撤销用 MemBase feature on <key>）",
                 feature_count
             );
         }
         if startup_count > 0 {
             println!(
-                "（其中 {} 项是启动项：停进程 + 禁用启动项，撤销用 MemBase.exe startup enable <名称>）",
+                "（其中 {} 项是启动项：停进程 + 禁用启动项，撤销用 MemBase startup enable <名称>）",
                 startup_count
             );
         }
         if !include_caution {
+            #[cfg(windows)]
             println!("（Windows 目录下的系统组件默认不列，加 --include-caution 查看）");
+            #[cfg(target_os = "linux")]
+            println!("（/usr/lib/systemd 下的系统组件默认不列，加 --include-caution 查看）");
         }
         if already > 0 {
             println!("（另有 {} 项已经禁用或已卸载，跳过）", already);
@@ -2037,13 +2123,13 @@ fn cmd_slim(args: &[String]) {
     for it in &items {
         let r = match it.action {
             core::TrimAction::DisableService => win::disable_service_start(&it.name),
-            core::TrimAction::UninstallAppx => {
-                remove_appx(it.appx.as_deref().unwrap_or_default())
+            core::TrimAction::UninstallAppx => remove_appx(it.appx.as_deref().unwrap_or_default()),
+            core::TrimAction::FeatureOff => {
+                match it.feature.and_then(core::feature::feature_by_key) {
+                    Some(sw) => apply_switch(sw, true).map(|_| ()),
+                    None => Err(format!("开关键不存在: {}", it.name)),
+                }
             }
-            core::TrimAction::FeatureOff => match it.feature.and_then(core::feature::feature_by_key) {
-                Some(sw) => apply_switch(sw, true).map(|_| ()),
-                None => Err(format!("开关键不存在: {}", it.name)),
-            },
             core::TrimAction::StopAndDisableStartup => {
                 stop_and_disable_startup(&it.host, it.startup_source, &it.startup_name)
             }
@@ -2064,14 +2150,17 @@ fn cmd_slim(args: &[String]) {
         }
     }
     if !json {
-        println!("\n完成：成功 {}，失败 {}。这些改动在**下次开机**才反映到基准上。", ok, fail);
+        println!(
+            "\n完成：成功 {}，失败 {}。这些改动在**下次开机**才反映到基准上。",
+            ok, fail
+        );
     }
 }
 
 // ---------------- 启动项 ----------------
 
 /// 基准里出现过的进程名（用来判断「这条启动项是不是真常驻」）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn baseline_proc_names(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let Some(dir) = compare::find_latest_baseline(root) else {
@@ -2096,7 +2185,7 @@ fn baseline_proc_names(root: &Path) -> BTreeSet<String> {
     out
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_startup(args: &[String]) {
     let json = want_json(args);
     let execute = has_flag(args, "--execute");
@@ -2108,7 +2197,7 @@ fn cmd_startup(args: &[String]) {
         .unwrap_or_else(|| "list".into());
 
     let root = root_arg(args);
-    let raw = membase_win::startup::scan();
+    let raw = plat::startup::scan();
     let baseline = baseline_proc_names(&root);
     let items = core::startup::build_startup_items(&raw, &baseline);
 
@@ -2117,10 +2206,8 @@ fn cmd_startup(args: &[String]) {
         // 但 `--all` 要能看到它们 —— VS 安装器的 BackgroundDownload 就在里面。
         let all = has_flag(args, "--all");
         let system_count = items.iter().filter(|i| i.system).count();
-        let shown: Vec<&core::startup::StartupItem> = items
-            .iter()
-            .filter(|i| all || !i.system)
-            .collect();
+        let shown: Vec<&core::startup::StartupItem> =
+            items.iter().filter(|i| all || !i.system).collect();
 
         if json {
             let arr: Vec<String> = shown
@@ -2186,14 +2273,24 @@ fn cmd_startup(args: &[String]) {
         }
         println!();
         if system_count > 0 && !all {
-            println!(
+            #[cfg(windows)]
+            let hidden_note = format!(
                 "（另有 {} 个系统计划任务（\\Microsoft\\ 下）默认不列，加 --all 查看）",
                 system_count
             );
+            #[cfg(target_os = "linux")]
+            let hidden_note = format!(
+                "（另有 {} 个系统级 unit 默认不列，加 --all 查看）",
+                system_count
+            );
+            println!("{}", hidden_note);
         }
-        println!("禁用一项：MemBase.exe startup disable <名称> --execute --yes");
-        println!("撤销    ：MemBase.exe startup enable  <名称> --execute --yes");
+        println!("禁用一项：MemBase startup disable <名称> --execute --yes");
+        println!("撤销    ：MemBase startup enable  <名称> --execute --yes");
+        #[cfg(windows)]
         println!("禁用只改「启动批准记录 / 任务状态」，**不删原始命令行**，随时可撤销。");
+        #[cfg(target_os = "linux")]
+        println!("禁用只写 XDG 覆盖文件 / systemctl disable，**不删原始文件**，随时可撤销。");
         return;
     }
 
@@ -2201,14 +2298,20 @@ fn cmd_startup(args: &[String]) {
         "disable" | "off" => false,
         "enable" | "on" => true,
         other => {
-            eprintln!("未知子命令: startup {}（可用 list / disable / enable）", other);
+            eprintln!(
+                "未知子命令: startup {}（可用 list / disable / enable）",
+                other
+            );
             std::process::exit(EXIT_USAGE);
         }
     };
     let key = match pos.get(1) {
         Some(k) => k.trim().to_string(),
         None => {
-            eprintln!("用法: MemBase.exe startup {} <名称> [--execute --yes] [--json]", if enable { "enable" } else { "disable" });
+            eprintln!(
+                "用法: MemBase startup {} <名称> [--execute --yes] [--json]",
+                if enable { "enable" } else { "disable" }
+            );
             std::process::exit(EXIT_USAGE);
         }
     };
@@ -2217,7 +2320,9 @@ fn cmd_startup(args: &[String]) {
         .filter(|i| {
             i.name.eq_ignore_ascii_case(&key)
                 || i.exe.eq_ignore_ascii_case(&key)
-                || i.name.trim_start_matches('\\').eq_ignore_ascii_case(key.trim_start_matches('\\'))
+                || i.name
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case(key.trim_start_matches('\\'))
         })
         .collect();
     if hits.is_empty() {
@@ -2251,16 +2356,29 @@ fn cmd_startup(args: &[String]) {
             );
             println!("          {}", it.command);
             if enable {
-                println!("          方式：写批准记录为启用 / schtasks /enable（原值不动）");
+                #[cfg(windows)]
+                let method = "写批准记录为启用 / schtasks /enable（原值不动）";
+                #[cfg(target_os = "linux")]
+                let method = if it.source == core::startup::StartupSource::ScheduledTask {
+                    "systemctl --user enable（单元保留）"
+                } else {
+                    "写 XDG 覆盖文件 Hidden=false（原文件不动）"
+                };
+                println!("          方式：{}", method);
             } else {
-                println!(
-                    "          方式：{}",
-                    if it.source == core::startup::StartupSource::ScheduledTask {
-                        "schtasks /change /disable（任务保留，随时可恢复）"
-                    } else {
-                        "写 StartupApproved 批准记录（不删原命令行）"
-                    }
-                );
+                #[cfg(windows)]
+                let method = if it.source == core::startup::StartupSource::ScheduledTask {
+                    "schtasks /change /disable（任务保留，随时可恢复）"
+                } else {
+                    "写 StartupApproved 批准记录（不删原命令行）"
+                };
+                #[cfg(target_os = "linux")]
+                let method = if it.source == core::startup::StartupSource::ScheduledTask {
+                    "systemctl --user disable（单元保留，随时可恢复）"
+                } else {
+                    "写 XDG 覆盖文件 Hidden=true（不删原文件）"
+                };
+                println!("          方式：{}", method);
             }
             println!("加 --execute --yes 真正执行。");
         }
@@ -2270,7 +2388,7 @@ fn cmd_startup(args: &[String]) {
         eprintln!("[!] 改启动项要显式加 --yes");
         std::process::exit(EXIT_REFUSED);
     }
-    match membase_win::startup::set_enabled(it.source, &it.name, enable) {
+    match plat::startup::set_enabled(it.source, &it.name, enable) {
         Ok(()) => {
             if json {
                 println!(
@@ -2295,12 +2413,10 @@ fn cmd_startup(args: &[String]) {
     }
 }
 
-
-
 // ---------------- 功能开关（只写 HKCU） ----------------
 
 /// 当前进程树，喂给 core 做「证据进程归属」统计
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn proc_nodes() -> Vec<core::feature::ProcNode> {
     snapshot::snapshot_now(true)
         .procs
@@ -2315,7 +2431,7 @@ fn proc_nodes() -> Vec<core::feature::ProcNode> {
 }
 
 /// 读一条开关的全部注册表值，合并成一个状态
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn switch_state(sw: &core::feature::FeatureSwitch) -> core::feature::SwitchState {
     let states: Vec<core::feature::SwitchState> = sw
         .values
@@ -2330,7 +2446,7 @@ fn switch_state(sw: &core::feature::FeatureSwitch) -> core::feature::SwitchState
     core::feature::combine_state(&states)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn feature_states() -> BTreeMap<&'static str, core::feature::SwitchState> {
     core::feature::FEATURE_SWITCHES
         .iter()
@@ -2338,7 +2454,7 @@ fn feature_states() -> BTreeMap<&'static str, core::feature::SwitchState> {
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn feature_evidence_map(
     nodes: &[core::feature::ProcNode],
 ) -> BTreeMap<&'static str, core::feature::FeatureEvidence> {
@@ -2349,7 +2465,7 @@ fn feature_evidence_map(
 }
 
 /// 写入一条开关的目标状态。`off = true` 写关掉的值，否则写回/删除回到默认。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn apply_switch(sw: &core::feature::FeatureSwitch, off: bool) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
     for v in sw.values {
@@ -2364,7 +2480,10 @@ fn apply_switch(sw: &core::feature::FeatureSwitch, off: bool) -> Result<Vec<Stri
                 }
                 None => {
                     win::delete_user_reg_value(v.key_path, v.value)?;
-                    done.push(format!(r"HKCU\{}\{} 已删除（回系统默认）", v.key_path, v.value));
+                    done.push(format!(
+                        r"HKCU\{}\{} 已删除（回系统默认）",
+                        v.key_path, v.value
+                    ));
                 }
             }
         }
@@ -2373,7 +2492,7 @@ fn apply_switch(sw: &core::feature::FeatureSwitch, off: bool) -> Result<Vec<Stri
 }
 
 /// 找某个进程名当前的可执行路径（重启时按这条路径拉起）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn live_exe_path(name: &str) -> String {
     restart::processes_named(name)
         .into_iter()
@@ -2382,7 +2501,7 @@ fn live_exe_path(name: &str) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_feature(args: &[String]) {
     let json = want_json(args);
     let execute = has_flag(args, "--execute");
@@ -2391,7 +2510,10 @@ fn cmd_feature(args: &[String]) {
     let settle_ms = (num_arg(args, "--wait", 3.0).max(0.5) * 1000.0) as u32;
 
     let pos = positionals(args, &["--out", "--wait"]);
-    let sub = pos.first().map(|s| s.to_lowercase()).unwrap_or_else(|| "list".into());
+    let sub = pos
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "list".into());
 
     // ---- list：开关值 + 证据 + 结论 ----
     if sub == "list" || sub == "ls" {
@@ -2432,7 +2554,10 @@ fn cmd_feature(args: &[String]) {
         }
         println!("功能开关（只写 HKCU，不碰组策略；改完下次开机 / 重启宿主才见效）\n");
         for sw in core::feature::FEATURE_SWITCHES {
-            let st = states.get(sw.key).copied().unwrap_or(core::feature::SwitchState::Missing);
+            let st = states
+                .get(sw.key)
+                .copied()
+                .unwrap_or(core::feature::SwitchState::Missing);
             let ev = evs.get(sw.key).copied().unwrap_or_default();
             let vd = core::feature::feature_verdict(st, &ev);
             println!("[{}] {:<20} {}", vd.label(), sw.key, sw.label);
@@ -2461,8 +2586,8 @@ fn cmd_feature(args: &[String]) {
             }
             println!();
         }
-        println!("关掉某项：MemBase.exe feature off <key> --execute --yes");
-        println!("撤销    ：MemBase.exe feature on <key> --execute --yes");
+        println!("关掉某项：MemBase feature off <key> --execute --yes");
+        println!("撤销    ：MemBase feature on <key> --execute --yes");
         return;
     }
 
@@ -2479,7 +2604,7 @@ fn cmd_feature(args: &[String]) {
         Some(k) => k.to_string(),
         None => {
             eprintln!(
-                "用法: MemBase.exe feature {} <key> [--execute --yes] [--no-restart]\n可选 key: {}",
+                "用法: MemBase feature {} <key> [--execute --yes] [--no-restart]\n可选 key: {}",
                 if off { "off" } else { "on" },
                 core::feature::feature_keys().join(", ")
             );
@@ -2526,14 +2651,12 @@ fn cmd_feature(args: &[String]) {
             );
             for v in sw.values {
                 match (off, v.on) {
-                    (true, _) => println!(
-                        "          写 HKCU\\{}\\{} = {}",
-                        v.key_path, v.value, v.off
-                    ),
-                    (false, Some(on)) => println!(
-                        "          写 HKCU\\{}\\{} = {}",
-                        v.key_path, v.value, on
-                    ),
+                    (true, _) => {
+                        println!("          写 HKCU\\{}\\{} = {}", v.key_path, v.value, v.off)
+                    }
+                    (false, Some(on)) => {
+                        println!("          写 HKCU\\{}\\{} = {}", v.key_path, v.value, on)
+                    }
                     (false, None) => {
                         println!("          删 HKCU\\{}\\{}", v.key_path, v.value)
                     }
@@ -2651,7 +2774,11 @@ fn cmd_feature(args: &[String]) {
     if after_verdict == core::feature::FeatureVerdict::OffButAlive {
         println!(
             "  注意：开关已经是关的，实例仍在跑。这台机器上重启 {} 也回收不到（关掉就自愈），",
-            if sw.host_proc.is_empty() { sw.evidence_proc } else { sw.host_proc }
+            if sw.host_proc.is_empty() {
+                sw.evidence_proc
+            } else {
+                sw.host_proc
+            }
         );
         println!("        真实成因不在这个开关上，别把它算进收益。");
     }
@@ -2662,7 +2789,7 @@ fn cmd_feature(args: &[String]) {
 
 // ---------------- 局部重启 ----------------
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_restart(args: &[String]) {
     let json = want_json(args);
     let execute = has_flag(args, "--execute");
@@ -2672,7 +2799,7 @@ fn cmd_restart(args: &[String]) {
     let target = match pos.first() {
         Some(t) => t.to_string(),
         None => {
-            eprintln!("用法: MemBase.exe restart <进程名|PID|服务名> [--execute --yes] [--wait N] [--json]");
+            eprintln!("用法: MemBase restart <进程名|PID|服务名> [--execute --yes] [--wait N] [--json]");
             std::process::exit(EXIT_USAGE);
         }
     };
@@ -2695,7 +2822,8 @@ fn cmd_restart(args: &[String]) {
             std::process::exit(EXIT_NO_BASELINE);
         }
         let tier = core::tier_for(Kind::Service, &target, "");
-        let check = core::feature::restart_check(core::feature::RestartKind::Service, &target, "", tier);
+        let check =
+            core::feature::restart_check(core::feature::RestartKind::Service, &target, "", tier);
         if !check.allowed {
             eprintln!("[!] 拒绝：{}（{}）", target, check.reason);
             std::process::exit(EXIT_REFUSED);
@@ -2711,7 +2839,16 @@ fn cmd_restart(args: &[String]) {
                     mb
                 );
             } else {
-                println!("[dry-run] 将重启服务 {}（当前 {} / {:.1} MB）", target, if pid.is_some() { "运行中" } else { "已停止" }, mb);
+                println!(
+                    "[dry-run] 将重启服务 {}（当前 {} / {:.1} MB）",
+                    target,
+                    if pid.is_some() {
+                        "运行中"
+                    } else {
+                        "已停止"
+                    },
+                    mb
+                );
                 println!("          stop → start，执行后按实测报告宿主工作集变化");
             }
             return;
@@ -2739,7 +2876,8 @@ fn cmd_restart(args: &[String]) {
             .find(|p| !p.is_empty())
             .unwrap_or_default(),
     };
-    let check = core::feature::restart_check(core::feature::RestartKind::Process, &name, &exe, tier);
+    let check =
+        core::feature::restart_check(core::feature::RestartKind::Process, &name, &exe, tier);
     if !check.allowed {
         eprintln!("[!] 拒绝重启 {}：{}", name, check.reason);
         std::process::exit(EXIT_REFUSED);
@@ -2783,7 +2921,10 @@ fn cmd_restart(args: &[String]) {
             if hits.len() > 1 {
                 println!("          注意：按名字重启会把同名实例全部关掉再拉起");
             }
-            println!("          执行后等 {} 毫秒再实测回收量（不报理论值）", settle_ms);
+            println!(
+                "          执行后等 {} 毫秒再实测回收量（不报理论值）",
+                settle_ms
+            );
         }
         return;
     }
@@ -2833,7 +2974,7 @@ fn cmd_restart(args: &[String]) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn print_restart(rep: &restart::RestartReport, json: bool) {
     if json {
         println!(
@@ -2866,24 +3007,26 @@ fn print_restart(rep: &restart::RestartReport, json: bool) {
     }
 }
 
-
 /// 卸载 Store 应用：实现在 win crate（界面与命令行共用同一份，别各写一套）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn remove_appx(full_name: &str) -> Result<(), String> {
     win::remove_appx(full_name)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn elide_cli(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", chars[..max.saturating_sub(1)].iter().collect::<String>())
+        format!(
+            "{}…",
+            chars[..max.saturating_sub(1)].iter().collect::<String>()
+        )
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_plan(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -2901,13 +3044,18 @@ fn cmd_plan(args: &[String]) {
     let (sg, ca, bl, act, act_mb) = plan_counts(&plan, include_caution);
 
     if let Some(path) = arg_value(args, "--to") {
-        let mut csv = String::from("Kind,Name,Pids,Instances,MemMB,Tier,Protect,Actionable,Reason\n");
+        let mut csv =
+            String::from("Kind,Name,Pids,Instances,MemMB,Tier,Protect,Actionable,Reason\n");
         for p in &plan {
             csv.push_str(&format!(
                 "{},{},{},{},{:.1},{},{},{},{}\n",
                 core::kind_name(p.kind),
                 p.name,
-                p.pids().iter().map(|x| x.to_string()).collect::<Vec<_>>().join("|"),
+                p.pids()
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join("|"),
                 p.instances,
                 p.mem_mb,
                 core::tier_name(p.tier),
@@ -2926,7 +3074,10 @@ fn cmd_plan(args: &[String]) {
     }
 
     if json {
-        let items: Vec<String> = plan.iter().map(|p| item_json(p, include_caution, &heal)).collect();
+        let items: Vec<String> = plan
+            .iter()
+            .map(|p| item_json(p, include_caution, &heal))
+            .collect();
         println!(
             "{{\"mode\":\"plan\",\"baseline\":{},\"counts\":{{\"total\":{},\"suggested\":{},\"caution\":{},\"blocked\":{},\"actionable\":{},\"actionable_mb\":{:.1}}},\"items\":[{}]}}",
             jstr(&base.dir.to_string_lossy()),
@@ -2968,7 +3119,7 @@ fn cmd_plan(args: &[String]) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_protect(args: &[String]) {
     let root = root_arg(args);
     let json = want_json(args);
@@ -3018,7 +3169,7 @@ fn cmd_protect(args: &[String]) {
     match sub {
         "add" => {
             if names.is_empty() {
-                eprintln!("用法: MemBase.exe protect add <名字[,名字...]>");
+                eprintln!("用法: MemBase protect add <名字[,名字...]>");
                 std::process::exit(EXIT_USAGE);
             }
             for n in names {
@@ -3074,9 +3225,9 @@ fn cmd_protect(args: &[String]) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 /// 一次采集的摘要（只用来打印，不进快照文件）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct SnapStats {
     procs: usize,
     svcs: usize,
@@ -3086,19 +3237,19 @@ struct SnapStats {
 }
 
 /// 自愈型进程的记录文件（数据目录里的第 5 类内容，只读信息）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn selfheal_file(root: &Path) -> PathBuf {
     root.join("selfheal.txt")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn read_selfheal(root: &Path) -> BTreeMap<String, String> {
     core::selfheal::parse(&fs::read_to_string(selfheal_file(root)).unwrap_or_default())
 }
 
 /// 记一条「杀掉又回来了」的结论。只有真的跑过 `restart` 才会写，
 /// 不做自动探测 —— 探测本身就要杀进程，那正是要避免的打地鼠。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn note_selfheal(root: &Path, name: &str) {
     let p = selfheal_file(root);
     let text = fs::read_to_string(&p).unwrap_or_default();
@@ -3117,7 +3268,7 @@ pub fn note_selfheal(root: &Path, name: &str) {
 ///
 /// 数据目录里只有 `run_*` 会无限增长（每次开机一个）。早先只能手动清，
 /// 2026-10-22 实测已经堆到 11 个 —— 改成自动保留最近 `keep` 个，老的走回收站。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn rotate_runs(root: &Path, keep: usize) -> Vec<String> {
     if keep == 0 {
         return Vec::new();
@@ -3140,7 +3291,7 @@ fn rotate_runs(root: &Path, keep: usize) -> Vec<String> {
     done
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_collect(args: &[String]) {
     let out = root_arg(args);
     let at = num_arg(args, "--at", 60.0) as u64;
@@ -3235,10 +3386,7 @@ fn cmd_collect(args: &[String]) {
         if let Some((p, s)) = &second {
             println!(
                 "[OK] 第二次采集：{} 个进程 / {} 个服务，开机第 {} 秒，已用 {} MB",
-                s.procs,
-                s.svcs,
-                s.uptime_s,
-                s.used_mb
+                s.procs, s.svcs, s.uptime_s, s.used_mb
             );
             println!("     输出：{}", p.display());
         }
@@ -3252,26 +3400,38 @@ fn cmd_collect(args: &[String]) {
     }
 
     if self_destruct {
-        let _ = Command::new("schtasks")
-            .args(["/Delete", "/TN", &task, "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-        if let Ok(exe) = std::env::current_exe() {
-            let p = exe.to_string_lossy().to_string();
-            // 自己删不掉自己：等两秒再让 cmd 动手。
-            // 这里必须用 raw_arg：`.arg(line)` 会把内层引号转义成 \"，
-            // 而 cmd 不认这种转义，del 收到的是坏路径（报“文件名、目录名或卷标语法不正确”）。
-            // /S 让 cmd 只剥掉最外层引号，路径两侧的引号原样留给 del。
-            let line = format!("/S /C \"ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"\"", p);
-            let _ = Command::new("cmd")
-                .raw_arg(line)
+        #[cfg(windows)]
+        {
+            let _ = Command::new("schtasks")
+                .args(["/Delete", "/TN", &task, "/F"])
                 .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
+                .status();
+            if let Ok(exe) = std::env::current_exe() {
+                let p = exe.to_string_lossy().to_string();
+                // 自己删不掉自己：等两秒再让 cmd 动手。
+                // 这里必须用 raw_arg：`.arg(line)` 会把内层引号转义成 \"，
+                // 而 cmd 不认这种转义，del 收到的是坏路径（报“文件名、目录名或卷标语法不正确”）。
+                // /S 让 cmd 只剥掉最外层引号，路径两侧的引号原样留给 del。
+                let line = format!("/S /C \"ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"\"", p);
+                let _ = Command::new("cmd")
+                    .raw_arg(line)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // systemd 用户 timer 采完即摘掉；二进制留着，下次 install 直接复用
+            if let Err(e) = plat::task::uninstall(&task) {
+                eprintln!("[!] 清理开机采集 timer 失败: {}", e);
+            } else {
+                println!("[ok] 已摘掉开机采集 timer（{}）", task);
+            }
         }
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_compare(args: &[String]) {
     let root = root_arg(args);
     let min_mb = num_arg(args, "--min-mb", 10.0);
@@ -3303,11 +3463,13 @@ fn cmd_compare(args: &[String]) {
     let mut items: Vec<String> = Vec::new();
     let mut total_delta = 0.0f64;
     for d in &diffs {
-        if excludes.iter().any(|pat| core::wildcard_match(&d.name, pat)) {
+        if excludes
+            .iter()
+            .any(|pat| core::wildcard_match(&d.name, pat))
+        {
             continue;
         }
-        if d.delta.abs() < min_mb
-            && !matches!(d.kind, core::DeltaKind::New | core::DeltaKind::Gone)
+        if d.delta.abs() < min_mb && !matches!(d.kind, core::DeltaKind::New | core::DeltaKind::Gone)
         {
             continue;
         }
@@ -3341,10 +3503,9 @@ fn cmd_compare(args: &[String]) {
     );
 }
 
-
-/// `MemBase.exe ui`：把界面拉起来。页面切换本身也有命令入口，
+/// `MemBase ui`：把界面拉起来。页面切换本身也有命令入口，
 /// 这样「界面上的每个操作」连「打开界面并停在布局页」都能被脚本表达。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_ui(args: &[String]) {
     let page = arg_value(args, "--page").unwrap_or_default();
     let cur = match std::env::current_exe() {
@@ -3361,7 +3522,20 @@ fn cmd_ui(args: &[String]) {
     let gui = if is_gui {
         cur.clone()
     } else {
-        cur.with_file_name("MemBase.exe")
+        #[cfg(windows)]
+        {
+            cur.with_file_name("MemBase")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Linux 没有 .exe 后缀：优先找同目录的 MemBase（GUI 目标名）
+            let plain = cur.with_file_name("MemBase");
+            if plain.is_file() {
+                plain
+            } else {
+                cur.with_file_name("MemBase")
+            }
+        }
     };
     if !gui.is_file() {
         eprintln!("[x] 找不到界面程序：{}", gui.display());
@@ -3392,7 +3566,7 @@ fn cmd_ui(args: &[String]) {
 
 /// 注册开机采集任务。XML、拷 exe、调 schtasks 都在 membase-win::task 里，
 /// GUI 的按钮走的是同一份实现。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_install(args: &[String]) {
     let out = root_arg(args);
     let at = num_arg(args, "--at", 60.0) as u64;
@@ -3403,7 +3577,7 @@ fn cmd_install(args: &[String]) {
     let json = want_json(args);
 
     let cur = std::env::current_exe().expect("取不到自身路径");
-    let res = membase_win::task::install(&cur, &out, at, also, &task);
+    let res = plat::task::install(&cur, &out, at, also, &task);
     let ok = res.is_ok();
     let target = res
         .as_ref()
@@ -3421,13 +3595,19 @@ fn cmd_install(args: &[String]) {
             jstr(&out.to_string_lossy())
         );
     } else if ok {
+        #[cfg(windows)]
         println!("[OK] 计划任务已注册：{}（开机触发，SYSTEM，无窗口）", task);
+        #[cfg(target_os = "linux")]
+        println!(
+            "[OK] systemd 用户 timer 已注册：{}（登录后在开机第 {} 秒触发）",
+            task, at
+        );
         match also {
             Some(s) => println!(
-                "     下次开机在第 {} 秒与第 {} 秒各采一次（双采样），采完任务和 exe 自动消失",
+                "     下次开机在第 {} 秒与第 {} 秒各采一次（双采样），采完自动摘掉任务",
                 at, s
             ),
-            None => println!("     下次开机会自动采集一次，随后任务和 exe 自动消失"),
+            None => println!("     下次开机会自动采集一次，随后自动摘掉任务"),
         }
     } else {
         eprintln!("[x] {}", res.unwrap_err());
@@ -3437,24 +3617,27 @@ fn cmd_install(args: &[String]) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cmd_uninstall(args: &[String]) {
     let task = task_arg(args);
     let json = want_json(args);
-    let res = membase_win::task::uninstall(&task);
+    let res = plat::task::uninstall(&task);
     let ok = res.is_ok();
     if json {
         println!("{{\"ok\":{},\"task\":{}}}", ok, jstr(&task));
     } else if let Err(e) = &res {
         eprintln!("[x] 删除失败：{}", e);
     } else {
+        #[cfg(windows)]
         println!("[OK] 已删除计划任务：{}", task);
+        #[cfg(target_os = "linux")]
+        println!("[OK] 已删除 systemd 用户 timer：{}", task);
     }
 }
 
 // ---------------- 入口 ----------------
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn dispatch(cmd: &str, rest: &[String]) {
     match cmd {
         "status" => cmd_status(rest),
@@ -3463,7 +3646,18 @@ fn dispatch(cmd: &str, rest: &[String]) {
         "trim" | "restore" => cmd_trim(rest),
         "slim" => cmd_slim(rest),
         "restart" => cmd_restart(rest),
-        "feature" | "switch" => cmd_feature(rest),
+        "feature" | "switch" => {
+            #[cfg(windows)]
+            cmd_feature(rest);
+            #[cfg(target_os = "linux")]
+            {
+                let _ = rest;
+                eprintln!(
+                    "Linux 没有注册表功能开关；请用 `startup` / `svc` / `slim` 管理自启与服务"
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
         "startup" | "start" => cmd_startup(rest),
         "transient" | "short-lived" => cmd_transient(rest),
         "kill" => cmd_kill(rest),
@@ -3483,7 +3677,7 @@ fn dispatch(cmd: &str, rest: &[String]) {
 }
 
 pub fn run() {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     if std::io::stdout().is_terminal() {
         win::console_utf8();
     }
@@ -3513,13 +3707,13 @@ pub fn run() {
         }
         "mcp" => {
             // MCP 服务端：走 stdio 的 JSON-RPC，把同一套动词暴露给 AI
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 std::process::exit(mcp::serve());
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
-                eprintln!("MemBase.exe mcp 只支持 Windows（工具本身依赖 Win32）");
+                eprintln!("MemBase mcp 只支持 Windows（工具本身依赖 Win32）");
                 std::process::exit(EXIT_USAGE);
             }
         }
@@ -3532,44 +3726,44 @@ pub fn run() {
             return;
         }
         "screen" | "display" => {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 std::process::exit(screen::cmd_screen(&argv[2..]));
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
-                eprintln!("MemBase.exe screen 只支持 Windows");
+                eprintln!("MemBase screen 只支持 Windows");
                 std::process::exit(EXIT_USAGE);
             }
         }
         "ui" | "gui" => {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 cmd_ui(&argv[2..]);
             }
-            #[cfg(not(windows))]
-            eprintln!("MemBase.exe ui 只支持 Windows");
+            #[cfg(not(any(windows, target_os = "linux")))]
+            eprintln!("MemBase ui 只支持 Windows");
             return;
         }
         "layout" | "layouts" | "desk" => {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 std::process::exit(layout::cmd_layout(&argv[2..]));
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
-                eprintln!("MemBase.exe layout 只支持 Windows（依赖 explorer 的桌面 ListView）");
+                eprintln!("MemBase layout 只支持 Windows（依赖 explorer 的桌面 ListView）");
                 std::process::exit(EXIT_USAGE);
             }
         }
         _ => {}
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     dispatch(cmd, &argv[2..]);
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = cmd;
-        eprintln!("MemBase.exe 的采集/清理与桌面布局只支持 Windows；纯逻辑部分用 `cargo test -p membase-core` 验证。");
+        eprintln!("MemBase 的采集/清理与桌面布局只支持 Windows；纯逻辑部分用 `cargo test -p membase-core` 验证。");
         std::process::exit(EXIT_USAGE);
     }
 }

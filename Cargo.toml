@@ -15,10 +15,14 @@ authors = ["PandaGuGu"]
 [workspace.dependencies]
 membase-core = { path = "crates/core" }
 membase-win = { path = "crates/win" }
+membase-linux = { path = "crates/linux" }
 membase-cli = { path = "apps/cli" }
 eframe = { version = "0.37.0", default-features = false, features = [
     "glow",
     "default_fonts",
+    # Linux 上必须显式选后端；Windows 构建时这两个 feature 不产生额外依赖
+    "x11",
+    "wayland",
 ] }
 rfd = "0.17"
 anyhow = "1"

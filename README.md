@@ -266,17 +266,53 @@ MCP 层不引入任何新依赖（只用已在编译的 `serde_json`），手写
 | 主题 / 数据目录配置 | `%APPDATA%\MemBase\theme.txt`、`%APPDATA%\MemBase\config.json` |
 | 内存基准线 | `C:\ProgramData\MemBaseline\run_*\T+60s\` |
 
+## Linux 版本
+
+Linux 端与 Windows 共用同一套 core 逻辑、CLI 和 GUI，只把平台层换成 `crates/linux`：
+
+| 能力 | Linux 实现 |
+|---|---|
+| 进程采集 | `/proc`：RSS / RssAnon / 线程 / fd / 启动时刻，字段与 Windows 快照同构 |
+| 服务 | systemd（`systemctl show`），支持停止 / 启动 / 禁止自启 |
+| 启动项 | XDG autostart（`~/.config/autostart`、`/etc/xdg/autostart`）+ systemd 用户服务 |
+| 开机采集 | systemd **用户 timer**：登录后第 N 秒采集，采完自动摘掉（`install` / `uninstall`） |
+| 息屏 | X11 `xset dpms force off`；界面黑屏层用 X11 监听按键 / 鼠标退出 |
+| 桌面图标布局 | Xfce（读写 `xfdesktop` 的 `~/.config/xfce4/desktop/icons.screen*.rc`） |
+| 数据 / 配置目录 | `~/.local/share/membase`、`~/.config/membase`（`MEMBASE_ROOT` / `--out` 可改） |
+
+Linux 上的数据位置：
+
+| 数据 | 位置 |
+|---|---|
+| 桌面布局 | `~/.config/DesktopIconPos/layouts/*.json` |
+| 主题 / 配置 | `~/.config/membase/theme.txt`、`~/.config/membase/config.json` |
+| 内存基准线 | `~/.local/share/membase/run_*/T+60s/` |
+
+已知差异（命令会明确提示，不会静默改坏东西）：
+
+- 注册表功能开关 `feature`、Store 应用卸载：Linux 没有对应物；`slim` 只禁用服务
+- 桌面布局目前只支持 Xfce；GNOME / KDE / 纯 Wayland 会提示不支持
+- 关显示器依赖 X11 + DPMS；纯 Wayland 会话只能显示全屏黑窗，不关屏
+- 普通用户采集时别的账户进程读不全（`system.json` 的 `Elevated=false`，内存列留空而不是写 0）
+
+
 ## 构建与测试
 
-需要 Windows 10/11 + Rust 1.75 以上。
+Windows 需要 Windows 10/11；Linux 需要 X11 桌面（桌面布局功能目前只支持 Xfce）。两边都需要 Rust 1.75 以上。
 
 ```bash
+# Windows
 cargo build --workspace --release
 # target\release\MemBase.exe   唯一产物：界面（带参数即命令行）
 
-cargo test -p membase-core    # 73 个纯逻辑测试
-cargo test -p membase-win     # 18 个平台层测试（1 个需真实桌面会话的用例默认忽略）
-python tools/verify.py        # 130 项全量验收（命令行动词 + 每页截图 + 动作表一致性）
+# Linux
+cargo build -p membase-cli -p membase-ui --release
+# target/release/membase-cli   控制台
+# target/release/MemBase       界面（无参数启动；带参数等同 membase-cli）
+
+cargo test -p membase-core    # 纯逻辑测试（按平台各跑一套名单）
+cargo test -p membase-win     # 18 个平台层测试（仅 Windows）
+python tools/verify.py        # 130 项全量验收（仅 Windows；命令行动词 + 每页截图 + 动作表一致性）
 python tools/verify.py --fast # 跳过 12 页截图与黑屏层，只验命令行，约 10 秒
 ```
 

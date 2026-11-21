@@ -47,7 +47,8 @@ fn pe_link_timestamp() -> Option<i64> {
     }
     let mut off = [0u8; 4];
     off.copy_from_slice(&dos[0x3C..0x40]);
-    f.seek(SeekFrom::Start(u32::from_le_bytes(off) as u64)).ok()?;
+    f.seek(SeekFrom::Start(u32::from_le_bytes(off) as u64))
+        .ok()?;
     let mut coff = [0u8; 12];
     f.read_exact(&mut coff).ok()?;
     if &coff[0..4] != b"PE\0\0" {
@@ -62,14 +63,18 @@ fn pe_link_timestamp() -> Option<i64> {
 }
 
 /// 默认数据目录
+#[cfg(windows)]
 pub const DEFAULT_ROOT: &str = r"C:\ProgramData\MemBaseline";
+/// Linux 用 XDG 数据目录：普通用户可写，不需要 root
+#[cfg(not(windows))]
+pub const DEFAULT_ROOT: &str = "/var/lib/membase";
 /// 默认计划任务名
 pub const DEFAULT_TASK: &str = "MemBaseline_CollectOnBoot";
 
 /// 数据目录解析顺序：
 ///   1. 环境变量 MEMBASE_ROOT
-///   2. %ProgramData%\MemBaseline（系统目录被重定向时也正确）
-///   3. 内置默认值（跑在没有 ProgramData 的环境时兜底）
+///   2. Windows: %ProgramData%\MemBaseline；Linux: $XDG_DATA_HOME/membase
+///   3. 内置默认值（跑在没有上述环境变量的环境里兜底）
 /// 命令行参数 --out 的优先级高于以上全部。
 pub fn default_root() -> String {
     if let Ok(v) = std::env::var("MEMBASE_ROOT") {
@@ -78,10 +83,28 @@ pub fn default_root() -> String {
             return v;
         }
     }
-    if let Ok(pd) = std::env::var("ProgramData") {
-        let pd = pd.trim().trim_end_matches('\\');
-        if !pd.is_empty() {
-            return format!("{}\\MemBaseline", pd);
+    #[cfg(windows)]
+    {
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let pd = pd.trim().trim_end_matches('\\');
+            if !pd.is_empty() {
+                return format!("{}\\MemBaseline", pd);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            let xdg = xdg.trim().trim_end_matches('/');
+            if !xdg.is_empty() {
+                return format!("{}/membase", xdg);
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let home = home.trim().trim_end_matches('/');
+            if !home.is_empty() {
+                return format!("{}/.local/share/membase", home);
+            }
         }
     }
     DEFAULT_ROOT.to_string()
@@ -102,6 +125,7 @@ use std::collections::BTreeMap;
 
 // ---------------- 保护名单 ----------------
 
+#[cfg(windows)]
 pub const CRITICAL_PROCS: &[&str] = &[
     "System",
     "Idle",
@@ -136,6 +160,7 @@ pub const CRITICAL_PROCS: &[&str] = &[
     "TiWorker",
 ];
 
+#[cfg(windows)]
 pub const CAUTION_NAMES: &[&str] = &[
     "explorer",
     "taskhostw",
@@ -167,6 +192,7 @@ pub const CAUTION_NAMES: &[&str] = &[
     "OpenConsole",
 ];
 
+#[cfg(windows)]
 pub const CRITICAL_SERVICES: &[&str] = &[
     "RpcSs",
     "RpcEptMapper",
@@ -221,6 +247,156 @@ pub const CRITICAL_SERVICES: &[&str] = &[
     "TokenBroker",
 ];
 
+// ---------------- Linux 名单 ----------------
+//
+// /proc/<pid>/comm 最多 15 个字符，这里按截断后的写法匹配；
+// 内核线程用通配符（kworker/* 之类），名称后面带斜杠/数字都算。
+
+#[cfg(not(windows))]
+pub const CRITICAL_PROCS: &[&str] = &[
+    "systemd",
+    "init",
+    "kthreadd",
+    "kworker*",
+    "ksoftirqd*",
+    "kdevtmpfs",
+    "kblockd",
+    "kcompactd*",
+    "kswapd*",
+    "khugepaged",
+    "rcu_*",
+    "rcuc*",
+    "rcuo*",
+    "migration/*",
+    "watchdog/*",
+    "cpuhp/*",
+    "idle_inject/*",
+    "jbd2/*",
+    "kauditd",
+    "kworker*",
+    "mpt_*",
+    "scsi_*",
+    "irq/*",
+    "dbus-daemon",
+    "dbus-broker",
+    "systemd-journal",
+    "systemd-udevd",
+    "systemd-logind",
+    "systemd-resolve",
+    "systemd-timesyn",
+    "systemd-network",
+    "Xorg",
+    "Xwayland",
+    "xfwm4",
+    "xfdesktop",
+    "xfce4-panel",
+    "gnome-shell",
+    "mutter",
+    "kwin_x11",
+    "kwin_wayland",
+    "plasmashell",
+    "cinnamon",
+    "mate-panel",
+    "lxsession",
+    "pipewire",
+    "pipewire-pulse",
+    "wireplumber",
+    "pulseaudio",
+    "polkitd",
+    "sshd",
+    "chronyd",
+    "NetworkManager",
+    "wpa_supplicant",
+    "gdm",
+    "gdm-session-wor",
+    "lightdm",
+    "sddm",
+    "sudo",
+];
+
+#[cfg(not(windows))]
+pub const CAUTION_NAMES: &[&str] = &[
+    "bash",
+    "zsh",
+    "sh",
+    "dash",
+    "fish",
+    "tmux",
+    "screen",
+    "xfce4-terminal",
+    "gnome-terminal-",
+    "konsole",
+    "xterm",
+    "code",
+    "codium",
+    "git",
+    "make",
+    "cargo",
+    "rustc",
+    "cc1",
+    "python3",
+    "python",
+    "node",
+    "npm",
+    "java",
+    "docker",
+    "containerd",
+    "podman",
+    "snapd",
+    "packagekitd",
+];
+
+#[cfg(not(windows))]
+pub const CRITICAL_SERVICES: &[&str] = &[
+    "systemd-journald.service",
+    "systemd-journald",
+    "systemd-udevd.service",
+    "systemd-udevd",
+    "systemd-logind.service",
+    "systemd-logind",
+    "systemd-resolved.service",
+    "systemd-resolved",
+    "systemd-timesyncd.service",
+    "systemd-timesyncd",
+    "systemd-networkd.service",
+    "systemd-networkd",
+    "systemd-hostnamed.service",
+    "dbus.service",
+    "dbus",
+    "dbus-broker.service",
+    "dbus-broker",
+    "NetworkManager.service",
+    "NetworkManager",
+    "wpa_supplicant.service",
+    "wpa_supplicant",
+    "ssh.service",
+    "ssh",
+    "sshd.service",
+    "sshd",
+    "cron.service",
+    "cron",
+    "rsyslog.service",
+    "rsyslog",
+    "polkit.service",
+    "polkit",
+    "accounts-daemon.service",
+    "accounts-daemon",
+    "upower.service",
+    "udisks2.service",
+    "gdm.service",
+    "lightdm.service",
+    "sddm.service",
+    "x11-common.service",
+    "ufw.service",
+    "nftables.service",
+    "apparmor.service",
+    "snapd.service",
+    "packagekit.service",
+    "unattended-upgrades.service",
+    "systemd-user-sessions.service",
+    "user@*.service",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Process,
@@ -238,7 +414,15 @@ pub enum Tier {
 }
 
 fn contains_ci(list: &[&str], name: &str) -> bool {
-    list.iter().any(|x| x.eq_ignore_ascii_case(name))
+    #[cfg(windows)]
+    {
+        list.iter().any(|x| x.eq_ignore_ascii_case(name))
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux 名单里有 kworker/* 这类内核线程通配符
+        list.iter().any(|x| wildcard_match(name, x))
+    }
 }
 
 pub fn tier_for(kind: Kind, name: &str, path: &str) -> Tier {
@@ -252,10 +436,21 @@ pub fn tier_for(kind: Kind, name: &str, path: &str) -> Tier {
                 Tier::Caution
             } else {
                 let lp = path.to_ascii_lowercase();
+                #[cfg(windows)]
                 if lp.contains(":\\windows\\") || lp.contains("\\windowsapps\\") {
                     Tier::Caution
                 } else {
                     Tier::Suggested
+                }
+                #[cfg(not(windows))]
+                {
+                    // Linux：/usr/lib/systemd、/lib/systemd 下的系统组件算谨慎档，
+                    // 其余（/usr/bin、/opt、用户目录）按第三方处理。
+                    if lp.contains("/systemd/") || lp.starts_with("/lib/systemd") {
+                        Tier::Caution
+                    } else {
+                        Tier::Suggested
+                    }
                 }
             }
         }
@@ -453,9 +648,8 @@ pub fn parse_service_rows(text: &str) -> Vec<SvcRowAgg> {
         if name.is_empty() {
             continue;
         }
-        let get = |i: Option<usize>| -> String {
-            i.and_then(|i| r.get(i)).cloned().unwrap_or_default()
-        };
+        let get =
+            |i: Option<usize>| -> String { i.and_then(|i| r.get(i)).cloned().unwrap_or_default() };
         out.push(SvcRowAgg {
             name,
             display: get(i_disp),
@@ -578,9 +772,19 @@ pub fn build_trim_plan(rows: &[SvcRowAgg], min_mb: f64, include_caution: bool) -
         if tier == Tier::Blocked {
             continue;
         }
+        #[allow(unused_variables)]
         let lp = r.path.to_ascii_lowercase();
+        #[cfg(windows)]
         let in_windows = lp.contains(":\\windows\\");
-        let tier = if in_windows { Tier::Caution } else { Tier::Suggested };
+        // Linux 没有「Windows 目录」这一档：systemd 单元都在 /usr/lib/systemd/system 下，
+        // 按路径分档会把所有服务都打成谨慎档。关键服务已由 CRITICAL_SERVICES 拦掉。
+        #[cfg(not(windows))]
+        let in_windows = false;
+        let tier = if in_windows {
+            Tier::Caution
+        } else {
+            Tier::Suggested
+        };
         if tier == Tier::Caution && !include_caution {
             continue;
         }
@@ -644,9 +848,11 @@ pub fn build_trim_plan(rows: &[SvcRowAgg], min_mb: f64, include_caution: bool) -
             Tier::Caution => 1,
             Tier::Blocked => 2,
         };
-        rank(a.tier)
-            .cmp(&rank(b.tier))
-            .then(b.mem_mb.partial_cmp(&a.mem_mb).unwrap_or(std::cmp::Ordering::Equal))
+        rank(a.tier).cmp(&rank(b.tier)).then(
+            b.mem_mb
+                .partial_cmp(&a.mem_mb)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     out
 }
@@ -662,7 +868,10 @@ pub fn build_feature_items(
 ) -> Vec<TrimItem> {
     let mut out = Vec::new();
     for sw in switches {
-        let state = states.get(sw.key).copied().unwrap_or(feature::SwitchState::Missing);
+        let state = states
+            .get(sw.key)
+            .copied()
+            .unwrap_or(feature::SwitchState::Missing);
         let ev = evidence.get(sw.key).copied().unwrap_or_default();
         if feature::feature_verdict(state, &ev) != feature::FeatureVerdict::Active {
             continue;
@@ -685,7 +894,11 @@ pub fn build_feature_items(
                 "功能开关开着，{} 个 {} 在跑（宿主 {}）· 关掉后下次开机不再拉起",
                 ev.instances,
                 sw.evidence_proc,
-                if sw.host_proc.is_empty() { "进程自身" } else { sw.host_proc }
+                if sw.host_proc.is_empty() {
+                    "进程自身"
+                } else {
+                    sw.host_proc
+                }
             ),
             startup_source: None,
             startup_name: String::new(),
@@ -1099,7 +1312,11 @@ pub fn build_plan(
         let by = protect_pattern(whitelist, Kind::Process, &name).unwrap_or_default();
         // 单实例才填 PID：多实例的进程项没有单一宿主，
         // 合计时按名字各算一次（由 plan_totals 的 host_pid == 0 分支处理）
-        let host_pid = if members.len() == 1 { members[0].pid } else { 0 };
+        let host_pid = if members.len() == 1 {
+            members[0].pid
+        } else {
+            0
+        };
         out.push(PlanItem {
             kind: Kind::Process,
             name: name.clone(),
@@ -1248,12 +1465,8 @@ pub fn build_reclaim_plan(
             continue;
         }
         let tier = tier_for(Kind::Process, &name, &path);
-        let chk = crate::feature::restart_check(
-            crate::feature::RestartKind::Process,
-            &name,
-            &path,
-            tier,
-        );
+        let chk =
+            crate::feature::restart_check(crate::feature::RestartKind::Process, &name, &path, tier);
         let by = protect_pattern(whitelist, Kind::Process, &name).unwrap_or_default();
         out.push(ReclaimItem {
             name,
@@ -1281,7 +1494,9 @@ pub fn build_reclaim_plan(
 }
 
 pub fn plan_actionable(plan: &[PlanItem], include_caution: bool) -> Vec<&PlanItem> {
-    plan.iter().filter(|p| p.actionable(include_caution)).collect()
+    plan.iter()
+        .filter(|p| p.actionable(include_caution))
+        .collect()
 }
 
 /// 把可处理项折成「真正能兑现的回收量」。
@@ -1339,7 +1554,8 @@ pub fn plan_rotation(run_names: &[String], keep: usize) -> Vec<String> {
         .collect()
 }
 
-pub fn tier_name(t: Tier) -> &'static str {    match t {
+pub fn tier_name(t: Tier) -> &'static str {
+    match t {
         Tier::Suggested => "suggested",
         Tier::Caution => "caution",
         Tier::Blocked => "blocked",
@@ -1368,6 +1584,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn critical_process_is_blocked_even_with_normal_path() {
         assert_eq!(
@@ -1385,15 +1602,24 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_component_is_caution() {
         assert_eq!(
-            tier_for(Kind::Process, "taskhostw", "C:\\Windows\\System32\\taskhostw.exe"),
+            tier_for(
+                Kind::Process,
+                "taskhostw",
+                "C:\\Windows\\System32\\taskhostw.exe"
+            ),
             Tier::Caution
         );
         // UWP 组件也在负责档
         assert_eq!(
-            tier_for(Kind::Process, "SearchHost", "C:\\Windows\\SystemApps\\x\\SearchHost.exe"),
+            tier_for(
+                Kind::Process,
+                "SearchHost",
+                "C:\\Windows\\SystemApps\\x\\SearchHost.exe"
+            ),
             Tier::Caution
         );
     }
@@ -1403,10 +1629,14 @@ mod tests {
         assert_eq!(tier_for(Kind::Process, "mystery", ""), Tier::Caution);
     }
 
+    #[cfg(windows)]
     #[test]
     fn critical_service_is_blocked() {
         assert_eq!(tier_for(Kind::Service, "RpcSs", ""), Tier::Blocked);
-        assert_eq!(tier_for(Kind::Service, "SensorService", ""), Tier::Suggested);
+        assert_eq!(
+            tier_for(Kind::Service, "SensorService", ""),
+            Tier::Suggested
+        );
     }
 
     #[test]
@@ -1483,13 +1713,32 @@ mod tests {
         assert_eq!(appx_from_path(r"C:\Windows\System32\svchost.exe"), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn trim_skips_manual_and_critical_but_flags_store_app() {
         let rows = vec![
-            svc_row("ClickToRunSvc", "Auto", 10, Some(52.3), r"C:\Program Files\Common Files\ClickToRun\x.exe"),
-            svc_row("PCManager Service Store", "Auto", 20, Some(141.0), r"C:\Program Files\WindowsApps\Microsoft.MicrosoftPCManager_3.23_x64__8we\a.exe"),
+            svc_row(
+                "ClickToRunSvc",
+                "Auto",
+                10,
+                Some(52.3),
+                r"C:\Program Files\Common Files\ClickToRun\x.exe",
+            ),
+            svc_row(
+                "PCManager Service Store",
+                "Auto",
+                20,
+                Some(141.0),
+                r"C:\Program Files\WindowsApps\Microsoft.MicrosoftPCManager_3.23_x64__8we\a.exe",
+            ),
             svc_row("ManualThing", "Manual", 30, Some(99.0), r"F:\x\y.exe"),
-            svc_row("DcomLaunch", "Auto", 40, Some(80.0), r"C:\Windows\System32\svchost.exe"),
+            svc_row(
+                "DcomLaunch",
+                "Auto",
+                40,
+                Some(80.0),
+                r"C:\Windows\System32\svchost.exe",
+            ),
         ];
         let plan = build_trim_plan(&rows, 5.0, false);
         let names: Vec<&str> = plan.iter().map(|i| i.name.as_str()).collect();
@@ -1565,7 +1814,10 @@ mod tests {
         );
         assert_eq!(plan.len(), 3);
         // 两个服务与宿主上的另一个服务共享内存 → 服务项可回收 0
-        assert!(plan.iter().filter(|p| p.kind == Kind::Service).all(|p| p.reclaim_mb == 0.0));
+        assert!(plan
+            .iter()
+            .filter(|p| p.kind == Kind::Service)
+            .all(|p| p.reclaim_mb == 0.0));
         let (n, mb) = plan_totals(&plan, true);
         assert_eq!(n, 3);
         assert_eq!(mb, 28.7);
@@ -1575,7 +1827,15 @@ mod tests {
     #[test]
     fn plan_reclaim_keeps_exclusive_host_memory() {
         let svcs = vec![live_svc("Solo", 900, 50.0)];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &[], &svcs, &[], &[], 0.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &svcs,
+            &[],
+            &[],
+            0.0,
+        );
         assert_eq!(plan.len(), 1);
         assert!(!plan[0].shared_host);
         assert_eq!(plan_totals(&plan, true).1, 50.0);
@@ -1785,11 +2045,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_aggregates_instances() {        let live = vec![
+    fn plan_aggregates_instances() {
+        let live = vec![
             lp("chrome", 1, 100.0, "C:\\Program Files\\chrome.exe"),
             lp("chrome", 2, 50.0, "C:\\Program Files\\chrome.exe"),
         ];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &live, &[], &[], &[], 1.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &[],
+            1.0,
+        );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].instances, 2);
         assert_eq!(plan[0].mem_mb, 150.0);
@@ -1802,7 +2071,15 @@ mod tests {
             lp_at("code", 10, 500.0, "F:\\VSCode\\Code.exe", 111),
             lp_at("code", 11, 300.0, "F:\\VSCode\\Code.exe", 222),
         ];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &live, &[], &[], &[], 1.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &[],
+            1.0,
+        );
         assert_eq!(
             plan[0].members,
             vec![
@@ -1839,6 +2116,7 @@ mod tests {
         assert_eq!(plan[0].base_instances, 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn reclaim_skips_unknown_and_blocks_critical() {
         let mut base = BTreeMap::new();
@@ -1891,8 +2169,8 @@ mod tests {
         let mut base = BTreeMap::new();
         base.insert("Spooler".to_string(), "Running".to_string());
         let live = vec![
-            ls("Spooler", "Running", "Auto", 0, 10.0),   // 基准就在跑
-            ls("WbioSrvc", "Stopped", "Auto", 0, 10.0),  // 没在跑
+            ls("Spooler", "Running", "Auto", 0, 10.0),  // 基准就在跑
+            ls("WbioSrvc", "Stopped", "Auto", 0, 10.0), // 没在跑
             ls("SensorService", "Running", "Manual", 0, 29.0),
         ];
         let plan = build_plan(&BTreeMap::new(), &base, &[], &live, &[], &[], 1.0);
@@ -1904,10 +2182,19 @@ mod tests {
     #[test]
     fn plan_auto_service_becomes_caution() {
         let live = vec![ls("CDPUserSvc_abc", "Running", "Auto", 0, 50.0)];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &[], &live, &[], &[], 1.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &live,
+            &[],
+            &[],
+            1.0,
+        );
         assert_eq!(plan[0].tier, Tier::Caution);
     }
 
+    #[cfg(windows)]
     #[test]
     fn plan_min_mb_only_filters_suggested() {
         let live = vec![
@@ -1915,7 +2202,15 @@ mod tests {
             lp("big", 2, 300.0, "D:\\tool\\big.exe"),
             lp("taskhostw", 3, 1.0, "C:\\Windows\\System32\\taskhostw.exe"),
         ];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &live, &[], &[], &[], 20.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &[],
+            20.0,
+        );
         let names: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
         assert!(!names.contains(&"tiny"));
         assert!(names.contains(&"big"));
@@ -1923,6 +2218,7 @@ mod tests {
         assert!(names.contains(&"taskhostw"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn plan_whitelist_and_totals() {
         let live = vec![
@@ -1931,7 +2227,15 @@ mod tests {
             lp("taskhostw", 3, 30.0, "C:\\Windows\\System32\\taskhostw.exe"),
         ];
         let wl = vec![protect_key(Kind::Process, "b")];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &live, &[], &[], &wl, 1.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &wl,
+            1.0,
+        );
         assert!(plan.iter().find(|p| p.name == "b").unwrap().protect);
         let (n, mb) = plan_totals(&plan, false);
         assert_eq!(n, 1);
@@ -1941,12 +2245,183 @@ mod tests {
         assert_eq!(mb2, 130.0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn blocked_items_are_never_actionable() {
         let live = vec![lp("lsass", 7, 40.0, "C:\\Windows\\System32\\lsass.exe")];
-        let plan = build_plan(&BTreeMap::new(), &BTreeMap::new(), &live, &[], &[], &[], 1.0);
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &[],
+            1.0,
+        );
         assert_eq!(plan[0].tier, Tier::Blocked);
         assert!(!plan[0].actionable(true));
         assert_eq!(plan_actionable(&plan, true).len(), 0);
+    }
+}
+
+/// Linux 的名单、路径与服务名与 Windows 完全不同，
+/// 关键/谨慎分档用 Linux 自己的样本各验证一遍。
+#[cfg(all(test, not(windows)))]
+mod linux_platform_tests {
+    use super::*;
+
+    fn agg(i: u32, ws: f64) -> ProcAgg {
+        ProcAgg {
+            instances: i,
+            ws_mb: ws,
+            priv_mb: ws / 2.0,
+            unknown: 0,
+        }
+    }
+
+    fn lp(name: &str, pid: u32, ws: f64, path: &str) -> LiveProc {
+        LiveProc {
+            name: name.into(),
+            pid,
+            ws_mb: ws,
+            priv_mb: ws / 2.0,
+            path: path.into(),
+            created: 0,
+            unknown: 0,
+        }
+    }
+
+    fn svc_row(name: &str, mode: &str, pid: u32, ws: Option<f64>, path: &str) -> SvcRowAgg {
+        SvcRowAgg {
+            name: name.into(),
+            display: name.into(),
+            state: "Running".into(),
+            start_mode: mode.into(),
+            pid,
+            host: "h".into(),
+            host_ws: ws,
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn linux_critical_process_is_blocked() {
+        assert_eq!(
+            tier_for(Kind::Process, "systemd", "/usr/lib/systemd/systemd"),
+            Tier::Blocked
+        );
+        // 内核线程按通配符拦
+        assert_eq!(tier_for(Kind::Process, "kworker/0:1", ""), Tier::Blocked);
+        assert_eq!(
+            tier_for(Kind::Process, "xfdesktop", "/usr/bin/xfdesktop"),
+            Tier::Blocked
+        );
+    }
+
+    #[test]
+    fn linux_systemd_component_is_caution() {
+        assert_eq!(
+            tier_for(
+                Kind::Process,
+                "some-helper",
+                "/usr/lib/systemd/systemd-helper"
+            ),
+            Tier::Caution
+        );
+        // /opt 下的第三方按建议档
+        assert_eq!(
+            tier_for(Kind::Process, "tool", "/opt/tool/tool"),
+            Tier::Suggested
+        );
+    }
+
+    #[test]
+    fn linux_critical_service_is_blocked() {
+        assert_eq!(
+            tier_for(Kind::Service, "systemd-journald.service", ""),
+            Tier::Blocked
+        );
+        assert_eq!(
+            tier_for(Kind::Service, "cups", "/opt/cups/cupsd"),
+            Tier::Suggested
+        );
+    }
+
+    #[test]
+    fn linux_trim_skips_manual_and_critical() {
+        let rows = vec![
+            svc_row("cups", "Auto", 10, Some(30.0), "/usr/sbin/cupsd"),
+            svc_row("foo.service", "Auto", 20, Some(25.0), "/opt/foo/foo"),
+            svc_row("manual-thing", "Manual", 30, Some(99.0), "/opt/x/x"),
+            svc_row(
+                "systemd-journald.service",
+                "Auto",
+                40,
+                Some(80.0),
+                "/usr/lib/systemd/systemd-journald",
+            ),
+        ];
+        let plan = build_trim_plan(&rows, 5.0, false);
+        let names: Vec<&str> = plan.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"cups"));
+        assert!(names.contains(&"foo.service"));
+        assert!(!names.contains(&"manual-thing"));
+        assert!(!names.contains(&"systemd-journald.service"));
+        assert!(plan.iter().all(|i| i.action == TrimAction::DisableService));
+    }
+
+    #[test]
+    fn linux_reclaim_blocks_systemd_and_allows_third_party() {
+        let mut base = BTreeMap::new();
+        base.insert("xfdesktop".to_string(), agg(1, 200.0));
+        base.insert("tool".to_string(), agg(1, 100.0));
+        let live = vec![
+            lp("xfdesktop", 1, 600.0, "/usr/bin/xfdesktop"),
+            lp("tool", 2, 300.0, "/opt/tool/tool"),
+        ];
+        let plan = build_reclaim_plan(&base, &live, &[], 10.0);
+        let desk = plan.iter().find(|p| p.name == "xfdesktop").unwrap();
+        assert!(!desk.allowed);
+        let tool = plan.iter().find(|p| p.name == "tool").unwrap();
+        assert!(tool.allowed);
+    }
+
+    #[test]
+    fn linux_plan_min_mb_and_protect() {
+        let live = vec![
+            lp("tiny", 1, 3.0, "/opt/tiny/tiny"),
+            lp("big", 2, 300.0, "/opt/big/big"),
+            lp("sys-helper", 3, 1.0, "/usr/lib/systemd/helper"),
+        ];
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &[],
+            20.0,
+        );
+        let names: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
+        assert!(!names.contains(&"tiny"));
+        assert!(names.contains(&"big"));
+        // 谨慎档不受 min_mb 影响
+        assert!(names.contains(&"sys-helper"));
+
+        let wl = vec![protect_key(Kind::Process, "big")];
+        let plan = build_plan(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+            &[],
+            &[],
+            &wl,
+            1.0,
+        );
+        assert!(plan.iter().find(|p| p.name == "big").unwrap().protect);
+        let (n, mb) = plan_totals(&plan, false);
+        assert_eq!(n, 1);
+        assert_eq!(mb, 3.0);
     }
 }

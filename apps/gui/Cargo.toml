@@ -12,11 +12,16 @@ path = "src/main.rs"
 
 [dependencies]
 membase-core.workspace = true
-membase-win = { workspace = true, features = ["preview"] }
 membase-cli.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 chrono.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+membase-win = { workspace = true, features = ["preview"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+membase-linux = { workspace = true, features = ["preview"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

@@ -8,13 +8,13 @@
 //!   0 成功 / 1 参数 / 2 没有布局或没有桌面 / 3 读写失败
 //!   4 动作执行失败 / 5 被拒绝（缺 --yes 之类）
 
+use crate::plat;
+use crate::plat::{actions, desktop::Desktop, repair, shellview::ShellView};
 use membase_core::layout::Layout;
 use membase_core::layout_store as store;
-use membase_win::{actions, desktop::Desktop, repair, shellview::ShellView};
 
 use crate::{
-    has_flag, want_json, EXIT_ACTION_FAILED, EXIT_IO, EXIT_NO_BASELINE, EXIT_REFUSED,
-    EXIT_USAGE,
+    has_flag, want_json, EXIT_ACTION_FAILED, EXIT_IO, EXIT_NO_BASELINE, EXIT_REFUSED, EXIT_USAGE,
 };
 
 /// 界面动作 → 命令行命令。GUI 的「命令行」页与按钮提示都读这张表，
@@ -320,20 +320,32 @@ pub fn cli_for(key: &str) -> Option<&'static str> {
 pub const LAYOUT_COMMANDS: &[(&str, &str, &str)] = &[
     ("list", "列出已保存的布局", "--json"),
     ("save", "保存当前桌面布局", "<名字> --json"),
-    ("restore", "恢复布局（默认演练）", "[名字] --execute --yes --json"),
+    (
+        "restore",
+        "恢复布局（默认演练）",
+        "[名字] --execute --yes --json",
+    ),
     ("diff", "只看差异，不动桌面", "[名字] --positions --json"),
     ("show", "查看布局内容", "[名字] --json"),
     ("delete", "删除布局", "<名字> --yes"),
     ("status", "桌面状态：图标数/自动排列/分辨率/缓存", "--json"),
     ("probe", "诊断 shell 官方接口是否可用", "--json"),
-    ("repair", "备份并清理系统布局缓存（默认演练）", "--execute --yes --json"),
+    (
+        "repair",
+        "备份并清理系统布局缓存（默认演练）",
+        "--execute --yes --json",
+    ),
     ("dir", "布局目录", "--open"),
     (
         "flags",
         "开关自动排列 / 对齐到网格 / 刷新重排",
         "[--snap-grid on|off] [--auto-arrange on|off] [--no-enum-refresh on|off]",
     ),
-    ("autostart", "登录后自动恢复布局（跑完即退，不常驻）", "on|off|status [名字]"),
+    (
+        "autostart",
+        "登录后自动恢复布局（跑完即退，不常驻）",
+        "on|off|status [名字]",
+    ),
 ];
 
 fn name_of(args: &[String]) -> Option<String> {
@@ -369,17 +381,14 @@ fn suffix(list: &[String], max: usize) -> String {
 }
 
 fn jstr_arr(list: &[String]) -> String {
-    let items: Vec<String> = list
-        .iter()
-        .map(|s| membase_core::bundle::jstr(s))
-        .collect();
+    let items: Vec<String> = list.iter().map(|s| membase_core::bundle::jstr(s)).collect();
     format!("[{}]", items.join(","))
 }
 
 /// 入口：`MemBase.exe layout <动词> [参数]`
 pub fn cmd_layout(args: &[String]) -> i32 {
     // 读桌面要 DPI 感知，走 shell 接口要 COM 套间；和 GUI 用同一份初始化
-    membase_win::init();
+    plat::init();
     let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     let r = match sub.as_str() {
@@ -425,12 +434,18 @@ pub fn layout_usage() -> String {
     s.push_str("  --positions          diff 时逐个打印当前坐标\n");
     s.push_str("  --open               dir 时顺便打开资源管理器\n");
     s.push_str("  --json               结构化输出\n");
-    s.push_str("  --wait <秒>          restore 时等 shell 接口就绪的上限（默认 5.6 秒，登录任务用 180）\n");
+    s.push_str(
+        "  --wait <秒>          restore 时等 shell 接口就绪的上限（默认 5.6 秒，登录任务用 180）\n",
+    );
     s.push_str("  --snap-grid on|off   flags 时开关「将图标与网格对齐」\n");
     s.push_str("  --auto-arrange on|off  flags 时开关「自动排列图标」\n");
-    s.push_str("  --no-enum-refresh on|off  flags 时开关「刷新时重新枚举」（关掉后按 F5 不重排）\n");
+    s.push_str(
+        "  --no-enum-refresh on|off  flags 时开关「刷新时重新枚举」（关掉后按 F5 不重排）\n",
+    );
     s.push_str("\n注意: 恢复依赖「自动排列图标」处于关闭状态，检测到会自动帮你关掉；\n");
-    s.push_str("      恢复会同时关掉 shell 的「刷新时重新枚举」，之后按 F5 不会再把图标打回原位。\n");
+    s.push_str(
+        "      恢复会同时关掉 shell 的「刷新时重新枚举」，之后按 F5 不会再把图标打回原位。\n",
+    );
     s.push_str("      想看 shell 官方接口能不能用，跑 MemBase.exe layout probe。");
     s
 }
@@ -561,12 +576,7 @@ fn layout_show(args: &[String]) -> i32 {
         );
         return 0;
     }
-    println!(
-        "[{}]  {}  {}",
-        data.name,
-        data.created,
-        data.screen_text()
-    );
+    println!("[{}]  {}  {}", data.name, data.created, data.screen_text());
     if let Some(d) = &data.display {
         println!("  显示器: {}", d.summary());
     }
@@ -635,8 +645,16 @@ fn layout_diff(args: &[String]) -> i32 {
 
     println!("布局 [{}]：{} 个图标", name, plan.total);
     println!("  需要移动  : {}", plan.to_move);
-    println!("  已消失    : {}{}", plan.missing.len(), fmt_suffix(&plan.missing, 6));
-    println!("  新增未记录: {}{}", plan.extra.len(), fmt_suffix(&plan.extra, 6));
+    println!(
+        "  已消失    : {}{}",
+        plan.missing.len(),
+        fmt_suffix(&plan.missing, 6)
+    );
+    println!(
+        "  新增未记录: {}{}",
+        plan.extra.len(),
+        fmt_suffix(&plan.extra, 6)
+    );
     if positions {
         let cur = actions::current_positions().unwrap_or_default();
         let now: std::collections::HashMap<String, (i32, i32)> = cur
@@ -760,9 +778,16 @@ fn layout_restore(args: &[String]) -> i32 {
         println!("[演练] 布局 [{}]，还没动桌面", name);
         for it in &data.icons {
             if let Some(&(cx, cy)) = now.get(&it.name.to_lowercase()) {
-                let flag = if (cx, cy) != (it.x, it.y) { "移动" } else { "不动" };
+                let flag = if (cx, cy) != (it.x, it.y) {
+                    "移动"
+                } else {
+                    "不动"
+                };
                 if flag == "移动" {
-                    println!("  [{}] {}: ({},{}) -> ({},{})", flag, it.name, cx, cy, it.x, it.y);
+                    println!(
+                        "  [{}] {}: ({},{}) -> ({},{})",
+                        flag, it.name, cx, cy, it.x, it.y
+                    );
                 }
             }
         }
@@ -826,7 +851,10 @@ fn layout_restore(args: &[String]) -> i32 {
             break;
         }
         round += 1;
-        eprintln!("[!] {} 秒后又有 {} 个图标被挪走，重摆一次（第 {} 次）", settle, drifted, round);
+        eprintln!(
+            "[!] {} 秒后又有 {} 个图标被挪走，重摆一次（第 {} 次）",
+            settle, drifted, round
+        );
         // 重试时不必再等满 180 秒（shell 已经在用了），30 秒足够
         match actions::restore_wait(&data, wait.min(std::time::Duration::from_secs(30))) {
             Ok(n) => r = n,
@@ -862,7 +890,10 @@ fn layout_restore(args: &[String]) -> i32 {
         }
         if r.display_changed {
             println!("  ⚠ 这份布局保存于另一套显示器配置：");
-            println!("    保存时 {}", r.saved_display.as_deref().unwrap_or("未知"));
+            println!(
+                "    保存时 {}",
+                r.saved_display.as_deref().unwrap_or("未知")
+            );
             println!(
                 "    现在   {}",
                 r.current_display.as_deref().unwrap_or("未知")
@@ -870,7 +901,11 @@ fn layout_restore(args: &[String]) -> i32 {
             println!("    坐标可能对不上，摆完看着不对就重新保存一份");
         }
         if !r.failed.is_empty() {
-            println!("  {} 个没摆到位:{}", r.failed.len(), fmt_suffix(&r.failed, 6));
+            println!(
+                "  {} 个没摆到位:{}",
+                r.failed.len(),
+                fmt_suffix(&r.failed, 6)
+            );
         }
         if !r.missing.is_empty() {
             println!(
@@ -889,17 +924,26 @@ fn layout_restore(args: &[String]) -> i32 {
             } else if r.used_shell_api {
                 "位置已摆好，但没能关掉系统的刷新重排：按 F5 仍会被重排"
             } else {
-                "shell 接口不可用，只改了 explorer 内存，刷新或重启会丢"
+                #[cfg(windows)]
+                let msg = "shell 接口不可用，只改了 explorer 内存，刷新或重启会丢";
+                #[cfg(target_os = "linux")]
+                let msg =
+                    "已直接写入 xfdesktop 的布局文件，刷新不会丢（下次登录由 xfdesktop 读取）";
+                msg
             }
         );
         if !r.used_shell_api {
+            #[cfg(windows)]
             println!("  提示：等资源管理器完全就绪后重试");
+            #[cfg(target_os = "linux")]
+            println!("  提示：桌面若没有立刻变化，运行 `xfdesktop --reload`");
         }
     }
     // shell 接口没就绪时只改了内存，刷新就白干 —— 返回非零，让计划任务按 RestartOnFailure 重试
     // 每次真正动手都记一行，出问题能直接看出「跑没跑、动了几个、开关设上没」
     if !want_json(args) {
-        let path = std::path::PathBuf::from(membase_core::default_root()).join("layout_restore.log");
+        let path =
+            std::path::PathBuf::from(membase_core::default_root()).join("layout_restore.log");
         let line = format!(
             "{}  layout={}  moved={}  restored={}  failed={}  missing={}  shell={}  guard={}
 ",
@@ -912,7 +956,11 @@ fn layout_restore(args: &[String]) -> i32 {
             r.used_shell_api,
             r.refresh_guard
         );
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
         }
@@ -930,10 +978,10 @@ fn layout_restore(args: &[String]) -> i32 {
 /// 登录后自动恢复布局：装一个计划任务，跑完就退出，不常驻、不占资源
 fn layout_autostart(args: &[String]) -> i32 {
     let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
-    let task = membase_win::task::LAYOUT_TASK;
+    let task = plat::task::LAYOUT_TASK;
 
     match sub.as_str() {
-        "off" | "disable" | "remove" => match membase_win::task::uninstall(task) {
+        "off" | "disable" | "remove" => match plat::task::uninstall(task) {
             Ok(()) => {
                 println!("已关闭「登录后自动恢复布局」");
                 0
@@ -944,7 +992,7 @@ fn layout_autostart(args: &[String]) -> i32 {
             }
         },
         "" | "status" => {
-            match membase_win::task::query_layout(task) {
+            match plat::task::query_layout(task) {
                 Some(name) => println!(
                     "登录自动恢复: 已开启 · 布局「{}」· 登录后 30 秒执行一次",
                     name
@@ -986,12 +1034,9 @@ fn layout_autostart(args: &[String]) -> i32 {
             let exe = if sibling.is_file() { sibling } else { me };
             let root = std::path::PathBuf::from(membase_core::default_root());
             let delay = 30u64;
-            match membase_win::task::install_layout(&exe, &root, &name, delay, task) {
+            match plat::task::install_layout(&exe, &root, &name, delay, task) {
                 Ok(copy) => {
-                    println!(
-                        "已安排：登录后第 {} 秒自动恢复到布局「{}」",
-                        delay, name
-                    );
+                    println!("已安排：登录后第 {} 秒自动恢复到布局「{}」", delay, name);
                     println!("  任务副本 {}", copy.display());
                     println!("  想取消：MemBase.exe layout autostart off");
                     0
@@ -1024,24 +1069,27 @@ fn layout_flags(args: &[String]) -> i32 {
     let mut i = 0;
     while i < args.len() {
         let key = args[i].to_lowercase();
-        let on = args.get(i + 1).map(|v| v.eq_ignore_ascii_case("on")).unwrap_or(false);
+        let on = args
+            .get(i + 1)
+            .map(|v| v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
         match key.as_str() {
             "--snap-grid" => {
-                mask |= membase_win::sys::FWF_SNAPTOGRID;
+                mask |= plat::sys::FWF_SNAPTOGRID;
                 if on {
-                    value |= membase_win::sys::FWF_SNAPTOGRID;
+                    value |= plat::sys::FWF_SNAPTOGRID;
                 }
             }
             "--auto-arrange" => {
-                mask |= membase_win::sys::FWF_AUTOARRANGE;
+                mask |= plat::sys::FWF_AUTOARRANGE;
                 if on {
-                    value |= membase_win::sys::FWF_AUTOARRANGE;
+                    value |= plat::sys::FWF_AUTOARRANGE;
                 }
             }
             "--no-enum-refresh" => {
-                mask |= membase_win::sys::FWF_NOENUMREFRESH;
+                mask |= plat::sys::FWF_NOENUMREFRESH;
                 if on {
-                    value |= membase_win::sys::FWF_NOENUMREFRESH;
+                    value |= plat::sys::FWF_NOENUMREFRESH;
                 }
             }
             _ => {
@@ -1055,7 +1103,9 @@ fn layout_flags(args: &[String]) -> i32 {
     if mask == 0 {
         println!(
             "当前 FFlags: {}",
-            before.map(|f| format!("0x{:08X}", f)).unwrap_or_else(|| "读不到".into())
+            before
+                .map(|f| format!("0x{:08X}", f))
+                .unwrap_or_else(|| "读不到".into())
         );
         println!("用法: MemBase.exe layout flags [--snap-grid on|off] [--auto-arrange on|off]");
         return 0;
@@ -1067,14 +1117,22 @@ fn layout_flags(args: &[String]) -> i32 {
         println!(
             "{{\"ok\":{},\"before\":{},\"after\":{}}}",
             ok,
-            before.map(|f| f.to_string()).unwrap_or_else(|| "null".into()),
-            after.map(|f| f.to_string()).unwrap_or_else(|| "null".into())
+            before
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "null".into()),
+            after
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "null".into())
         );
     } else {
         println!(
             "视图标志: {} -> {}",
-            before.map(|f| format!("0x{:08X}", f)).unwrap_or_else(|| "读不到".into()),
-            after.map(|f| format!("0x{:08X}", f)).unwrap_or_else(|| "读不到".into())
+            before
+                .map(|f| format!("0x{:08X}", f))
+                .unwrap_or_else(|| "读不到".into()),
+            after
+                .map(|f| format!("0x{:08X}", f))
+                .unwrap_or_else(|| "读不到".into())
         );
         if !ok {
             eprintln!("[x] 写入失败");
@@ -1094,7 +1152,10 @@ fn layout_delete(args: &[String]) -> i32 {
         return EXIT_NO_BASELINE;
     }
     if !has_flag(args, "--yes") {
-        eprintln!("[!] 删除不可撤销，请加 --yes 确认（布局文件: {}）", store::path_of(&name).display());
+        eprintln!(
+            "[!] 删除不可撤销，请加 --yes 确认（布局文件: {}）",
+            store::path_of(&name).display()
+        );
         return EXIT_REFUSED;
     }
     match store::delete(&name) {
@@ -1126,7 +1187,7 @@ fn layout_status(args: &[String]) -> i32 {
     };
     let count = d.count().unwrap_or(0);
     let arrange = d.auto_arrange();
-    let (sw, sh) = membase_win::sys::screen_size();
+    let (sw, sh) = plat::sys::screen_size();
     let pid = d.pid();
     let layouts = store::list().len();
     let cache = repair::describe_cache();
@@ -1151,7 +1212,7 @@ fn layout_status(args: &[String]) -> i32 {
         );
         return 0;
     }
-    println!("explorer pid      : {}", pid);
+    println!("桌面进程 pid      : {}", pid);
     println!("桌面图标数量      : {}", count);
     println!(
         "自动排列图标      : {}",
@@ -1164,16 +1225,23 @@ fn layout_status(args: &[String]) -> i32 {
     println!("主屏分辨率        : {}x{}", sw, sh);
     println!(
         "显示器配置        : {}",
-        membase_win::display::fingerprint().summary()
+        plat::display::fingerprint().summary()
     );
-    println!("shell 官方接口    : {}", if shell_ok { "可用（恢复能精确摆位）" } else { "不可用（只能改内存）" });
+    println!(
+        "shell 官方接口    : {}",
+        if shell_ok {
+            "可用（恢复能精确摆位）"
+        } else {
+            "不可用（只能改内存）"
+        }
+    );
     println!(
         "视图标志 FFlags   : {}",
         match view_flags {
             Some(f) => format!(
                 "0x{:08X}（刷新重排{}）",
                 f,
-                if f & membase_win::sys::FWF_NOENUMREFRESH != 0 {
+                if f & plat::sys::FWF_NOENUMREFRESH != 0 {
                     "已关闭"
                 } else {
                     "未关闭，按 F5 会把图标打回原位"
@@ -1184,8 +1252,15 @@ fn layout_status(args: &[String]) -> i32 {
     );
     println!(
         "视图模式 Mode     : {} · 自动排列 {}",
-        match view_mode { Some(m) => format!("0x{:08X}", m), None => "读不到".into() },
-        match view_auto { Some(true) => "开启", Some(false) => "关闭", None => "读不到" }
+        match view_mode {
+            Some(m) => format!("0x{:08X}", m),
+            None => "读不到".into(),
+        },
+        match view_auto {
+            Some(true) => "开启",
+            Some(false) => "关闭",
+            None => "读不到",
+        }
     );
     println!("布局目录          : {}", store::dir().display());
     println!("已存布局数量      : {}", layouts);
@@ -1317,7 +1392,7 @@ fn layout_repair(args: &[String]) -> i32 {
 fn layout_dir(args: &[String]) -> i32 {
     let dir = store::dir();
     if has_flag(args, "--open") {
-        membase_win::win::open_folder(&dir.to_string_lossy());
+        plat::win::open_folder(&dir.to_string_lossy());
     }
     if want_json(args) {
         println!(

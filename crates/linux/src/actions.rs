@@ -238,5 +238,9 @@ pub fn restore_wait(layout: &Layout, wait: std::time::Duration) -> Result<Restor
     result.moved = moved;
     result.failed = failed;
     result.rounds = rounds.max(1);
+    // 位置都写进 rc 了；xfdesktop 只在启动时读取网格，必须重启一次才看得见变化
+    if moved > 0 {
+        crate::desktop::reload_desktop_now();
+    }
     Ok(result)
 }

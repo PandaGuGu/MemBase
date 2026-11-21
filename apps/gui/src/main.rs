@@ -4641,7 +4641,7 @@ impl App {
                         // 与 `MemBase.exe theme set` 同一个实现，界面和命令不会各写各的
                         let _ = membase_cli::write_theme(self.dark);
                         self.status = format!(
-                            "外观已切到{}（同 CLI：MemBase.exe theme set {}）",
+                            "外观已切到{}（同 CLI：{CLI_EXE} theme set {}）",
                             if self.dark { "深色" } else { "浅色" },
                             if self.dark { "dark" } else { "light" }
                         );
@@ -4733,7 +4733,7 @@ impl App {
                         self.icons.invalidate();
                         self.icon_tex.clear();
                         self.status = format!(
-                            "已保存「{}」· {} 个图标 · 同 CLI：MemBase.exe layout save {}",
+                            "已保存「{}」· {} 个图标 · 同 CLI：{CLI_EXE} layout save {}",
                             name,
                             layout.icons.len(),
                             name
@@ -5224,8 +5224,11 @@ impl App {
                     "登录后第 30 秒自动把图标摆回选中布局（跑完就退出，不常驻）
 需要管理员权限
 同 CLI：{}",
-                    cli_map::cli_for("layout_autostart")
-                        .unwrap_or("MemBase.exe layout autostart on <名字>")
+                    cli_map::cli_for("layout_autostart").unwrap_or(if cfg!(windows) {
+                        "MemBase.exe layout autostart on <名字>"
+                    } else {
+                        "membase-cli layout autostart on <名字>"
+                    })
                 ))
             };
             if resp.clicked() {
@@ -5683,7 +5686,7 @@ impl App {
         );
         page_head(ui, "工具", &sub, |ui| {
             let r = ui.add(btn("刷新", 12.5, 64.0));
-            let r = r.on_hover_text("重新读显示器与息屏状态\n同 CLI：MemBase.exe screen status");
+            let r = r.on_hover_text("重新读显示器与息屏状态\n同 CLI：{CLI_EXE} screen status");
             if r.clicked() {
                 self.refresh_screen_status();
                 self.status = "已刷新工具页状态".into();
@@ -5760,7 +5763,7 @@ impl App {
                         self.bo_secs = hh * 3600 + mm * 60 + ss;
                         let _ = plat::screen::set_default_secs(self.bo_secs);
                         self.status = format!(
-                            "默认息屏时长已设为 {} · 同 CLI：MemBase.exe screen duration {}",
+                            "默认息屏时长已设为 {} · 同 CLI：{CLI_EXE} screen duration {}",
                             if self.bo_secs == 0 {
                                 "不定时".to_string()
                             } else {
@@ -5782,7 +5785,7 @@ impl App {
                         if ui
                             .add(btn_small(label, 64.0))
                             .on_hover_text(format!(
-                                "一键设为 {}\n同 CLI：MemBase.exe screen duration {}",
+                                "一键设为 {}\n同 CLI：{CLI_EXE} screen duration {}",
                                 label,
                                 plat::screen::fmt_hms(secs)
                             ))
@@ -5812,7 +5815,7 @@ impl App {
                     if self.bo_key != before {
                         let _ = plat::screen::set_exit_key(self.bo_key);
                         self.status = format!(
-                            "退出热键已改为 {} · 同 CLI：MemBase.exe screen key {}",
+                            "退出热键已改为 {} · 同 CLI：{CLI_EXE} screen key {}",
                             self.bo_key.label(),
                             self.bo_key.as_str()
                         );
@@ -6495,7 +6498,7 @@ impl eframe::App for App {
                         }
                     }
                     let cli = format!(
-                        "MemBase.exe trim --execute --yes{} --only {}",
+                        "{CLI_EXE} trim --execute --yes{} --only {}",
                         if self.include_caution {
                             " --include-caution"
                         } else {
@@ -7171,7 +7174,7 @@ impl eframe::App for App {
                             ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "等价命令：MemBase.exe layout save {}",
+                                    "等价命令：{CLI_EXE} layout save {}",
                                     if name.trim().is_empty() {
                                         "<名字>"
                                     } else {
